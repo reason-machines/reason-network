@@ -77,7 +77,7 @@ impl Daemon {
                 ),
                 Some(up) => up.waiting += 1,
                 None => {
-                    let cmd = dialog(&format!("{asker} asks"), &asked, &question).ok_or_else(|| {
+                    let cmd = dialog(&format!("{asker} asks"), &asked, &question, OPEN_SECS).ok_or_else(|| {
                         anyhow!(
                             "{} has no screen to ask {} on: ask them in your own session",
                             self.machine,
@@ -298,7 +298,7 @@ impl Drop for Waiting<'_> {
 
 /// The button on the first line (`approve` or `deny`); from a panel, how much of the request and of the question it
 /// showed (characters) on the next two, then the note. Anything else is no answer.
-fn parse(out: &str) -> (Answer, Option<(usize, usize)>) {
+pub(super) fn parse(out: &str) -> (Answer, Option<(usize, usize)>) {
     let mut lines = out.trim().splitn(4, '\n');
     let choice = lines.next().unwrap_or_default().trim().to_lowercase();
     // A panel (macOS, Windows) that doesn't say how much it showed showed none of it.
@@ -371,16 +371,16 @@ function run([title, request, question, secs, icon]) {
 }"#;
 
 #[cfg(target_os = "macos")]
-fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
+pub(super) fn dialog(title: &str, request: &str, question: &str, secs: u64) -> Option<Command> {
     let mut cmd = Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?);
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
-    cmd.args(["-l", "JavaScript", "-e", PANEL, title, request, question, &OPEN_SECS.to_string(), &icon]);
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, request, question, &secs.to_string(), &icon]);
     Some(cmd)
 }
 
 /// Text as the person should see it: without direction overrides, invisible spacers or tag characters, which could make
 /// what shows differ from what is there (joiners stay, for emoji and scripts that need them).
-fn plain(text: &str) -> String {
+pub(super) fn plain(text: &str) -> String {
     let hides = |c: &char| {
         matches!(c, '\u{61C}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}')
             || matches!(c, '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
@@ -417,14 +417,14 @@ fn icon() -> Option<std::path::PathBuf> {
 /// A notification with buttons: notify-send prints the one clicked, or nothing if it was closed or expired.
 /// (`--wait` and `--action` need libnotify 0.7.10, from 2021; with an older one asking fails, and says so.)
 #[cfg(all(unix, not(target_os = "macos")))]
-fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
+pub(super) fn dialog(title: &str, request: &str, question: &str, secs: u64) -> Option<Command> {
     use super::notify::{markup, notify_send_at};
     let body =
         if request.is_empty() { question.to_string() } else { format!("{request}\n\nYour agent asks: {question}") };
     let mut cmd =
         notify_send_at(asker_bin("notify-send", &["/usr/bin/notify-send", "/run/current-system/sw/bin/notify-send"])?)?;
     cmd.args(["--app-name=Reason Network", "--wait", "--action=approve=Approve", "--action=deny=Deny"])
-        .arg(format!("--expire-time={}", OPEN_SECS * 1000))
+        .arg(format!("--expire-time={}", secs * 1000))
         .args(["--".into(), markup(title), markup(&body)]);
     Some(cmd)
 }
@@ -432,7 +432,7 @@ fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
 /// The same panel as on macOS: shown on top without taking the keyboard (once clicked into, Return approves and Escape
 /// denies), the request first; prints the button, how much of the request and of the question showed, and the note.
 #[cfg(windows)]
-fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
+pub(super) fn dialog(title: &str, request: &str, question: &str, secs: u64) -> Option<Command> {
     const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -469,7 +469,7 @@ if ($script:choice) { "$($script:choice)`n$(& $chars $req $reqShown)`n$(& $chars
     let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
     let mut cmd = super::notify::powershell_at(powershell, PANEL);
     cmd.env("TINCAN_TITLE", title).env("TINCAN_REQUEST", request).env("TINCAN_QUESTION", question);
-    cmd.env("TINCAN_SECS", OPEN_SECS.to_string());
+    cmd.env("TINCAN_SECS", secs.to_string());
     Some(cmd)
 }
 

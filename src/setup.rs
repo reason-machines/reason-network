@@ -156,7 +156,7 @@ fn obj(v: &mut Value) -> Result<&mut Map<String, Value>> {
     Ok(v.as_object_mut().expect("checked above"))
 }
 
-/// Hook groups in the Claude Code style (`{matcher, hooks: [{type, command, ...}]}`), used by Codex and Gemini.
+/// Hook groups in the Claude Code style (`{matcher, hooks: [{type, command, ...}]}`), used by Claude Code, Codex and grok.
 /// Replaces any earlier groups of ours (or the upstream engine's) for `agent`, keeps everything else.
 fn merge_hook_groups(hooks: &mut Map<String, Value>, agent: &str, groups: Vec<(&str, Value)>, remove: bool) {
     let marker = format!(" hook {agent} ");
@@ -228,8 +228,11 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let Some(bin) = agent::find_bin("claude") else { return Ok(None) };
     let mut r = Report { agent: "Claude Code", lines: Vec::new(), notes: Vec::new() };
     // A settings file it can't read is left alone: the rest of the setup still goes ahead.
-    if let Err(e) = claude_allow_ask(remove, dry, &mut r) {
-        r.notes.push(format!("couldn't allow ask_user in Claude Code's settings ({e:#}): it asks once to allow it"));
+    if let Err(e) = claude_settings(exe, remove, dry, &mut r) {
+        r.notes.push(format!(
+            "couldn't update Claude Code's settings ({e:#}): it asks once to allow ask_user, and a call auto mode stops \
+             can't be allowed from a pop-up"
+        ));
     }
     let get = |name: &str| -> Result<(bool, bool)> {
         let out = Command::new(&bin).args(["mcp", "get", name]).stdin(std::process::Stdio::null()).output()?;
@@ -283,9 +286,10 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     Ok(Some(r))
 }
 
-/// `ask_user` only shows the person a pop-up, so it is allowed: it never waits on a prompt in a terminal nobody is
-/// watching. The other tools keep Claude Code's own permission prompts.
-fn claude_allow_ask(remove: bool, dry: bool, r: &mut Report) -> Result<()> {
+/// Claude Code's own settings. `ask_user` only shows the person a pop-up, so it is allowed: it never waits on a prompt in
+/// a terminal nobody is watching (the other tools keep Claude Code's own permission prompts). And two hooks let the
+/// person allow, from a pop-up, a call auto mode stopped (daemon/allow.rs).
+fn claude_settings(exe: &Path, remove: bool, dry: bool, r: &mut Report) -> Result<()> {
     let rule = format!("mcp__{AGENT_NAME}__ask_user");
     let path = paths::claude_dir().join("settings.json");
     let mut v = read_json(&path)?;
@@ -304,6 +308,18 @@ fn claude_allow_ask(remove: bool, dry: bool, r: &mut Report) -> Result<()> {
     }
     if perms.is_empty() {
         obj(&mut v)?.remove("permissions");
+    }
+    let group = |event: &str, timeout: u64| {
+        let command = shell_cmd(exe, &format!("hook {} {event}", agent::CLAUDE_CODE));
+        json!({ "matcher": "*", "hooks": [{ "type": "command", "command": command, "timeout": timeout }] })
+    };
+    // The pop-up stays up 9 minutes, within the hook's 10.
+    let groups = vec![("PermissionDenied", group("permission-denied", 600)), ("PreToolUse", group("pre-tool-use", 10))];
+    let root = obj(&mut v)?;
+    let hooks = obj(root.entry("hooks").or_insert_with(|| json!({})))?;
+    merge_hook_groups(hooks, agent::CLAUDE_CODE, groups, remove);
+    if hooks.is_empty() {
+        root.remove("hooks");
     }
     r.lines.push(changed(&path, write_json(&path, &v, dry)?));
     Ok(())

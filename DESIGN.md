@@ -215,6 +215,14 @@ Three tools, none of which an agent has to call unless it wants to message someo
   use only the system's own dialog programs, which keeps an agent from simply starting the engine with a stand-in that
   answers. That is a speed bump, not a guarantee: software that controls the approver's machine can still sign (the
   machine's key is a file there, and it could build its own engine).
+- **Auto mode's stops.** Claude Code's auto mode stops some calls (granting access, sending data out) unless the
+  person asked for them in the session itself; a tool's result, `ask_user`'s included, doesn't count. `setup` adds two
+  hooks to Claude Code's settings: when auto mode stops a call, `PermissionDenied` shows the person the exact call and
+  the reason (up to 600 characters, 200 in a Linux notification, nothing hidden or the call isn't offered), and if
+  they allow it, the agent is told it may retry; `PreToolUse` then lets that same call (same session, tool and input,
+  its description aside) through once, within 10 minutes. Only the pop-up records an allowance, in the daemon's
+  memory, so an agent can't write one; a call the panel couldn't show all of isn't allowed. A daemon that isn't
+  running allows nothing, and the hooks never start one.
 
 Agents never report what they are doing; Reason Network reads it from what they record anyway (`doing.rs`): the
 session's title (Claude Code's `ai-title` transcript entries, Codex's thread names in

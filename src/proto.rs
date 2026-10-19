@@ -134,6 +134,20 @@ pub enum Request {
         #[serde(default)]
         about: Option<String>,
     },
+    /// Claude Code's auto mode stopped a tool call in session `session`: asks this machine's person, with a pop-up,
+    /// whether it may run once, and waits for the answer (true: allowed; see `Allowed`).
+    AllowOnce {
+        session: String,
+        tool: String,
+        input: Value,
+        reason: String,
+    },
+    /// Whether the person allowed this exact call once (`AllowOnce`) and it hasn't run since; yes uses it up.
+    Allowed {
+        session: String,
+        tool: String,
+        input: Value,
+    },
     /// The client gave up on this session's `Inbox` or `Ask` wait (the agent cancelled it): end it, and push what it
     /// was waiting for the usual way.
     StopWaiting {

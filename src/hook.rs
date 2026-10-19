@@ -10,6 +10,9 @@ use std::{
 };
 
 pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: Option<String>, doing: Option<String>) {
+    if agent_name == agent::CLAUDE_CODE {
+        return auto_mode(event).await;
+    }
     let input = if session.is_none() { read_stdin(Duration::from_secs(3)) } else { String::new() };
     let link = Link::new(None);
     let Ok(Some((out, key, ids))) =
@@ -22,6 +25,41 @@ pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: 
     if writeln!(stdout, "{out}").and_then(|_| stdout.flush()).is_ok() && !ids.is_empty() {
         // Printed, so the agent has it: now it counts as read.
         let _ = tokio::time::timeout(Duration::from_secs(3), link.call::<Value>(Request::Delivered { key, ids })).await;
+    }
+}
+
+/// Claude Code's auto mode: a call it stopped can run once if the person allows it in a pop-up (daemon/allow.rs).
+/// `permission-denied` asks, and tells the agent it may retry; `pre-tool-use` lets that same call through.
+async fn auto_mode(event: &str) {
+    let input = read_stdin(Duration::from_secs(3));
+    let v: Value = serde_json::from_str(input.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
+    let (Some(session), Some(tool)) = (v["session_id"].as_str(), v["tool_name"].as_str()) else { return };
+    let (session, tool, input) = (session.to_string(), tool.to_string(), v["tool_input"].clone());
+    // Never starts a daemon: without one, nothing was allowed.
+    let link = Link::existing();
+    let decision = match event {
+        "pre-tool-use" => {
+            let allowed = link.call::<bool>(Request::Allowed { session, tool, input });
+            matches!(tokio::time::timeout(Duration::from_secs(2), allowed).await, Ok(Ok(true))).then(|| {
+                json!({ "hookEventName": "PreToolUse", "permissionDecision": "allow",
+                        "permissionDecisionReason": "its person allowed this call once, in a pop-up" })
+            })
+        }
+        "permission-denied" => {
+            let reason = v["reason"].as_str().unwrap_or_default().to_string();
+            // Without the classifier's verdict, Claude Code doesn't let the agent retry.
+            if reason.starts_with("Auto mode could not evaluate") || reason == "Classifier unavailable" {
+                return;
+            }
+            let asked = link.call::<bool>(Request::AllowOnce { session, tool, input, reason });
+            matches!(tokio::time::timeout(Duration::from_secs(590), asked).await, Ok(Ok(true)))
+                .then(|| json!({ "hookEventName": "PermissionDenied", "retry": true }))
+        }
+        _ => None,
+    };
+    if let Some(decision) = decision {
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "{}", json!({ "hookSpecificOutput": decision })).and_then(|_| stdout.flush());
     }
 }
 

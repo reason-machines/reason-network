@@ -2,6 +2,7 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod allow;
 mod ask;
 mod directory;
 mod mail;
@@ -113,6 +114,8 @@ pub struct Daemon {
     shown: Mutex<HashMap<String, Instant>>,
     /// Each session's `ask_user` question that is up, with its answer once there is one.
     asks: Mutex<HashMap<String, ask::Asking>>,
+    /// Calls the person allowed once from a pop-up after auto mode stopped them (allow.rs), and when.
+    allowed: Mutex<HashMap<String, Instant>>,
     /// When this daemon started: sessions live before it register again in the while after.
     started: Instant,
 }
@@ -195,6 +198,7 @@ impl Daemon {
             rate: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
+            allowed: Mutex::new(HashMap::new()),
             started: Instant::now(),
         })
     }
@@ -246,7 +250,7 @@ impl Daemon {
                     continue;
                 }
             };
-            let wait = matches!(f.body, Request::Inbox { .. } | Request::Ask { .. });
+            let wait = matches!(f.body, Request::Inbox { .. } | Request::Ask { .. } | Request::AllowOnce { .. });
             let (this, tx) = (self.clone(), tx.clone());
             // Each request runs on its own task: an inbox long-poll must not block the connection.
             let task = async move {
@@ -281,6 +285,10 @@ impl Daemon {
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
             Request::Ask { key, question, about } => json!(self.ask(key, question, about).await?),
+            Request::AllowOnce { session, tool, input, reason } => {
+                json!(self.allow_once(session, tool, input, reason).await?)
+            }
+            Request::Allowed { session, tool, input } => json!(self.allowed(&session, &tool, &input)),
             Request::StopWaiting { key } => {
                 self.stop_waiting(&key).await;
                 Value::Null
