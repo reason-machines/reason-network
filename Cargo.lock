@@ -2837,7 +2837,7 @@ dependencies = [
  "data-encoding",
  "deunicode",
  "futures-lite",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "iroh",
  "iroh-mdns-address-lookup",
  "libc",
