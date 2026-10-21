@@ -382,8 +382,10 @@ impl Store {
             "SELECT day, sent, received FROM counts
              WHERE day BETWEEN date(?1 / 1000, 'unixepoch', ?2) AND date(?1 / 1000, 'unixepoch', ?3) ORDER BY day",
         )?;
+        // SQLite integers are i64; a count is never negative.
+        let count = |r: &rusqlite::Row, i: usize| r.get::<_, i64>(i).map(|n| n.max(0) as u64);
         let rows = st.query_map(params![now, COUNTS_FROM, COUNTS_TO], |r| {
-            Ok(DayCount { day: r.get(0)?, sent: r.get(1)?, received: r.get(2)? })
+            Ok(DayCount { day: r.get(0)?, sent: count(r, 1)?, received: count(r, 2)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
