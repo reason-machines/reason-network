@@ -230,7 +230,7 @@ async fn endpoint(
         .secret_key(key.clone())
         .relay_mode(relay_mode);
     if let Some(p) = proxy {
-        b = b.proxy_url(p.into());
+        b = b.proxy_url(looked_up(p).await.into());
     }
     if lan && own {
         b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
@@ -238,6 +238,26 @@ async fn endpoint(
         b = b.address_lookup(MdnsAddressLookup::builder());
     }
     Ok(b.bind().await?)
+}
+
+/// An http proxy's name looked up the way curl and everything else on this machine looks it up (hosts file, the
+/// system's resolver). iroh would ask DNS servers itself, from an unconnected UDP socket, which some sandboxes refuse,
+/// and a name only the local network knows wouldn't come back from the public ones it falls back to. An https proxy
+/// keeps its name, which its certificate is for.
+async fn looked_up(proxy: RelayUrl) -> RelayUrl {
+    let (Some(host), Some(port)) = (proxy.host_str(), proxy.port_or_known_default()) else { return proxy };
+    if proxy.scheme() != "http" || host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return proxy;
+    }
+    let found = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.to_string(), port))).await;
+    // One address goes on: IPv4 if there is one (a name for this machine lists ::1 first, where a proxy often isn't).
+    let ips: Vec<std::net::IpAddr> = found.ok().and_then(|r| r.ok()).into_iter().flatten().map(|a| a.ip()).collect();
+    let Some(&ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first()) else { return proxy };
+    let mut url: <RelayUrl as std::ops::Deref>::Target = proxy.clone().into();
+    if url.set_ip_host(ip).is_err() {
+        return proxy;
+    }
+    url.into()
 }
 
 /// "directly", or "through the proxy at host:port" (where it is, not who signs in to it).
