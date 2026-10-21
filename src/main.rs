@@ -848,7 +848,6 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![me],
             features: vec![],
-            messages: vec![],
         };
         let l = LinkInfo { team: "vibes".into(), url: join_url("rn1-AAAA"), ticket: "rn1-AAAA".into() };
         assert!(team_value(&t, &l, None).unwrap_err().to_string().contains("restart the Reason Network daemon"));

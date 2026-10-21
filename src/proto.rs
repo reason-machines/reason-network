@@ -388,18 +388,6 @@ pub struct TeamInfo {
     /// for others. Older engines leave it out.
     #[serde(default)]
     pub features: Vec<String>,
-    /// How many messages sessions here sent, and how many reached mailboxes here, on each of the last seven days
-    /// (UTC) that had any: counts only, kept on this machine and sent nowhere. Older engines leave it out.
-    #[serde(default)]
-    pub messages: Vec<DayCount>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DayCount {
-    /// `YYYY-MM-DD`, UTC.
-    pub day: String,
-    pub sent: u64,
-    pub received: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,19 +481,16 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![],
             features: vec![],
-            messages: vec![DayCount { day: "2026-10-20".into(), sent: 3, received: 1 }],
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["team_id"], "00112233445566778899aabbccddeeff");
         assert_eq!((v["team_name"].as_str(), v["name"].as_str()), (Some("vibes"), Some("vibes")));
-        assert_eq!(v["messages"], serde_json::json!([{"day": "2026-10-20", "sent": 3, "received": 1}]));
         // A reply from a daemon before these fields still reads.
         let old: TeamInfo =
             serde_json::from_value(serde_json::json!({"name": "vibes", "relay": null, "person": "alex",
             "machine": "mbp", "machines": []}))
             .unwrap();
         assert_eq!((old.id.as_str(), old.name.as_str()), ("", "vibes"));
-        assert!(old.messages.is_empty());
     }
 
     #[test]

@@ -222,7 +222,6 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: Vec::new(),
             features: vec![crate::files::FEATURE.into()],
-            messages: Vec::new(),
         })
     }
 
@@ -335,7 +334,6 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: Vec::new(),
             features: vec![crate::files::FEATURE.into()],
-            messages: Vec::new(),
         };
         {
             let mut g = self.inner.lock().unwrap();
@@ -475,7 +473,6 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: self.machines(),
             features: vec![crate::files::FEATURE.into()],
-            messages: self.inner.lock().unwrap().store.counts(util::now_ms()).unwrap_or_default(),
         })
     }
 
