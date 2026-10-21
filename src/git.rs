@@ -10,7 +10,12 @@ pub struct GitInfo {
 
 pub fn lookup(cwd: &str) -> GitInfo {
     let run = |args: &[&str]| {
-        let out = Command::new("git").arg("-C").arg(cwd).args(args).stderr(Stdio::null()).output().ok()?;
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(cwd).args(args).stderr(Stdio::null());
+        // CREATE_NO_WINDOW: `reason-network mcp` started by an agent without a console would flash one per lookup.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        let out = cmd.output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (out.status.success() && !s.is_empty()).then_some(s)
     };
