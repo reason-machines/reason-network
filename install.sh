@@ -69,7 +69,9 @@ else
   got="$(sha256sum "$tmp/reason-network.tar.gz" | cut -d' ' -f1)"
 fi
 [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch; not installing"
-tar -xzf "$tmp/reason-network.tar.gz" -C "$tmp"
+# As whoever runs this owns it, not as the archive says (releases up to v0.12.3 say 1001): as root, tar otherwise gives it
+# to that owner, which a restricted root (in a user namespace) can't.
+tar --no-same-owner -xzf "$tmp/reason-network.tar.gz" -C "$tmp"
 "$tmp/reason-network" --version >/dev/null 2>&1 || die "the downloaded binary doesn't run here; not installing"
 # macOS knows a program by its code signature when it asks whether it may reach the local network. A build signed by
 # a developer team keeps that answer across updates; an unsigned one is a new program every time. So a signed
