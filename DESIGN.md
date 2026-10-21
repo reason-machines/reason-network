@@ -408,6 +408,10 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
   don't, Reason Network still works over the internet.
 - **Windows asks to let Reason Network through the firewall:** allow it for direct and LAN connections. If you don't,
   Reason Network still works, through a relay.
+- **The internet is reachable only through an HTTP proxy:** set `HTTPS_PROXY` (or `ALL_PROXY`) where the daemon runs.
+  Relay connections then go through the proxy (CONNECT to port 443), and teammates are reached through a relay, never
+  directly. A login service doesn't see your shell's variables: give them to it too (on Linux,
+  `systemctl --user set-environment`).
 - **Codex sessions don't show up until they use a Reason Network tool:** Codex hasn't been told to trust the hooks yet;
   run `/hooks` in Codex.
 - Logs: `~/.reason/network/daemon.log`.

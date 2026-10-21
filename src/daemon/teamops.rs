@@ -257,8 +257,11 @@ impl Daemon {
             }
         }
         let res = self.join_with(invite_text, &person, proof).await;
-        if res.is_err() && solo {
-            let _ = self.start_net().await;
+        if let Err(e) = &res {
+            log(&format!("couldn't join: {e:#}"));
+            if solo {
+                let _ = self.start_net().await;
+            }
         }
         res
     }

@@ -143,6 +143,9 @@ pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endp
         // n0's relays) and this machine find each other, and what four-word codes need.
         let relays = crate::relays::current_or_fetch().await;
         let mut b = Endpoint::builder(presets::N0).secret_key(key).relay_mode(RelayMode::custom(relays));
+        if let Some(p) = proxy() {
+            b = b.proxy_url(p.into());
+        }
         if lan {
             b = b.address_lookup(MdnsAddressLookup::builder());
         }
@@ -153,6 +156,9 @@ pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endp
     let url: RelayUrl =
         url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?;
     let mut b = Endpoint::builder(presets::Minimal).secret_key(key.clone()).relay_mode(RelayMode::custom([url]));
+    if let Some(p) = proxy() {
+        b = b.proxy_url(p.into());
+    }
     if lan {
         b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
     }
@@ -164,11 +170,53 @@ pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endp
 pub async fn check_relay(key: SecretKey, url: &str) -> Result<()> {
     let endpoint = bind(key, Some(url), false).await?;
     let reached = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await.is_ok();
+    let why = off_relay(&endpoint);
     endpoint.close().await;
     if !reached {
-        bail!("couldn't reach relay {url} from this machine: is it running, and is the address right?");
+        let why = why.map(|w| format!(" ({w})")).unwrap_or_default();
+        bail!("couldn't reach relay {url} from this machine{why}: is it running, and is the address right?");
     }
     Ok(())
+}
+
+/// The HTTP proxy that relay connections go through, picked as curl picks one for an https address: `https_proxy`,
+/// `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` (a bare `host:port` is an http one). A machine whose only way out is such a
+/// proxy reaches its relay, and teammates through it; direct paths are UDP, which it doesn't carry.
+fn proxy() -> Option<RelayUrl> {
+    proxy_in(|name| std::env::var(name).ok())
+}
+
+fn proxy_in(var: impl Fn(&str) -> Option<String>) -> Option<RelayUrl> {
+    ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"].into_iter().find_map(|name| {
+        let v = var(name)?;
+        let v = v.trim();
+        let url: RelayUrl = if v.contains("://") { v.parse() } else { format!("http://{v}").parse() }.ok()?;
+        (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
+    })
+}
+
+/// Why this machine isn't on its relay, if it isn't (and then no teammate is reached through one either).
+fn off_relay(endpoint: &Endpoint) -> Option<String> {
+    let status = endpoint.home_relay_status().get();
+    if status.iter().any(|s| s.is_connected()) {
+        return None;
+    }
+    let mut why = status
+        .iter()
+        .find_map(|s| s.last_error().map(|e| format!("{}: {e}", s.url())))
+        .unwrap_or_else(|| "no answer".into());
+    match proxy() {
+        // Where the proxy is, not who signs in to it.
+        Some(p) => {
+            why += &format!(
+                ", through the proxy at {}:{}",
+                p.host_str().unwrap_or("?"),
+                p.port_or_known_default().unwrap_or(0)
+            )
+        }
+        None => why += "; if this computer reaches the internet only through a proxy, set HTTPS_PROXY",
+    }
+    Some(why)
 }
 
 /// mDNS, minus the relay a neighbour advertises: a teammate still on n0's relays (it missed a switch, or runs an older
@@ -270,10 +318,11 @@ pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest
             }
             Err(_) => {
                 unreachable = true;
-                last = Some(if named > 1 {
-                    anyhow!("couldn't reach any machine on this link (are they online?)")
-                } else {
-                    anyhow!("couldn't reach the machine that made the invite (is it online?)")
+                last = Some(match off_relay(endpoint) {
+                    // Not that they're offline: this computer got nowhere.
+                    Some(why) => anyhow!("this computer couldn't reach a relay ({why})"),
+                    None if named > 1 => anyhow!("couldn't reach any machine on this link (are they online?)"),
+                    None => anyhow!("couldn't reach the machine that made the invite (is it online?)"),
                 });
             }
         }
@@ -809,6 +858,26 @@ fn tidy_presence(mut p: Presence) -> Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relays_go_through_the_proxy_curl_would_use() {
+        let pick = |vars: &[(&str, &str)]| {
+            proxy_in(|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())).map(|u| u.to_string())
+        };
+        assert_eq!(pick(&[]), None);
+        assert_eq!(pick(&[("HTTPS_PROXY", "http://proxy.corp:3128")]).as_deref(), Some("http://proxy.corp:3128/"));
+        assert_eq!(
+            pick(&[("ALL_PROXY", "proxy.corp:3128")]).as_deref(),
+            Some("http://proxy.corp:3128/"),
+            "bare host:port"
+        );
+        let both = [("ALL_PROXY", "http://all:1"), ("https_proxy", "http://https:2")];
+        assert_eq!(pick(&both).as_deref(), Some("http://https:2/"), "https_proxy first");
+        // Plain-http traffic's proxy isn't the relays' (as with curl); SOCKS isn't one iroh speaks.
+        assert_eq!(pick(&[("HTTP_PROXY", "http://proxy.corp:3128")]), None);
+        assert_eq!(pick(&[("ALL_PROXY", "socks5://proxy.corp:1080")]), None);
+        assert_eq!(pick(&[("https_proxy", " ")]), None);
+    }
 
     #[test]
     fn a_teammates_presence_cant_open_a_frame() {
