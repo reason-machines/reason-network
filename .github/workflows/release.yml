@@ -51,7 +51,8 @@ jobs:
           $name = "reason-network-${{ matrix.target }}.zip"
           New-Item -ItemType Directory dist | Out-Null
           Compress-Archive target/${{ matrix.target }}/release/reason-network.exe dist/$name
-          "$((Get-FileHash dist/$name -Algorithm SHA256).Hash.ToLower())  $name" | Out-File -Encoding ascii dist/$name.sha256
+          # One LF-terminated line, as shasum writes it (Out-File would end it in CRLF, which `shasum -c` refuses).
+          Set-Content -NoNewline -Encoding ascii dist/$name.sha256 "$((Get-FileHash dist/$name -Algorithm SHA256).Hash.ToLower())  $name`n"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reason-network-${{ matrix.target }}

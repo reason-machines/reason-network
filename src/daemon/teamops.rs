@@ -49,19 +49,36 @@ impl Daemon {
         }
     }
 
-    /// The network again, on the way to the relays that gets through now (see `net::route_loop`).
-    pub(crate) async fn restart_net(self: &Arc<Self>) {
-        let old = self.net.write().unwrap().take();
-        if let Some(net) = old {
-            net.shutdown().await;
+    /// The network again, on the way to the relays that gets through now (see `net::route_loop`), if `net` is still
+    /// the one running: not if it was replaced or stopped meanwhile (a join under way).
+    pub(crate) async fn restart_net(self: &Arc<Self>, net: &Arc<Net>) {
+        let _one = self.net_lock.lock().await;
+        if !self.net().is_some_and(|n| Arc::ptr_eq(&n, net)) {
+            return;
         }
-        if let Err(e) = self.start_net().await {
+        if let Err(e) = self.start_net_now().await {
             log(&format!("network not started: {e:#}"));
         }
     }
 
     pub(super) async fn start_net(self: &Arc<Self>) -> Result<()> {
+        let _one = self.net_lock.lock().await;
+        self.start_net_now().await
+    }
+
+    /// Stops the network, if one runs (with `net_lock` held).
+    async fn stop_net_now(&self) {
+        let old = self.net.write().unwrap().take();
+        if let Some(net) = old {
+            net.shutdown().await;
+        }
+    }
+
+    /// Starts the team's network in place of the one running, if any (with `net_lock` held). Invite codes made here
+    /// that are still good are listened for on it.
+    async fn start_net_now(self: &Arc<Self>) -> Result<()> {
         let team = self.team_state().ok_or_else(|| anyhow!("not in a team"))?;
+        self.stop_net_now().await;
         let relay = team.meta.body.relay.as_deref();
         let endpoint = net::bind(self.key.clone(), relay, self.cfg.lan()).await?;
         // Last known presence of each machine, so `who --all` shows offline teammates after a restart.
@@ -262,10 +279,8 @@ impl Daemon {
             }
             // A team of one that nobody joined: switching loses nothing. It stays until the join succeeds.
             solo = true;
-            let old = self.net.write().unwrap().take();
-            if let Some(net) = old {
-                net.shutdown().await;
-            }
+            let _one = self.net_lock.lock().await;
+            self.stop_net_now().await;
         }
         let res = self.join_with(invite_text, &person, proof).await;
         if let Err(e) = &res {
@@ -397,6 +412,8 @@ impl Daemon {
     /// Makes an invite: a code (this machine listens for it until it is used or expires) and the equivalent
     /// long ticket (which any teammate's machine can redeem).
     pub(super) async fn invite(&self, me: bool, hours: u64) -> Result<InviteInfo> {
+        // Made on the network that runs once a swap under way is done, and listened for there.
+        let _one = self.net_lock.lock().await;
         let net =
             self.net().ok_or_else(|| anyhow!("not connected to a team yet (run `{CLI} init` or `{CLI} join`)"))?;
         net.online(Duration::from_secs(5)).await;

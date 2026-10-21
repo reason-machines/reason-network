@@ -108,6 +108,9 @@ pub struct Daemon {
     arrived: Notify,
     git_cache: Mutex<HashMap<String, (Instant, GitInfo)>>,
     net: RwLock<Option<Arc<Net>>>,
+    /// Held while the network starts, stops or is swapped, and while an invite is made: one at a time, so two networks
+    /// never run on this machine's key, and an invite isn't made on one that is going away.
+    net_lock: tokio::sync::Mutex<()>,
     /// Recent message times per sender, for the rate limit.
     rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// When a notification from each sender was last shown here.
@@ -206,6 +209,7 @@ impl Daemon {
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
             net: RwLock::new(None),
+            net_lock: tokio::sync::Mutex::new(()),
             rate: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),

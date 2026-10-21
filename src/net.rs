@@ -124,6 +124,8 @@ pub struct Net {
     relays: Vec<RelayUrl>,
     /// The proxy the relays are reached through, or none for directly.
     proxy: Option<RelayUrl>,
+    /// The proxy's address as looked up for the endpoint.
+    at: Option<RelayUrl>,
     router: Mutex<Option<Router>>,
     /// Endpoints listening for joins on behalf of invite codes, by their (code-derived) id.
     invites: Mutex<HashMap<EndpointId, Router>>,
@@ -153,32 +155,60 @@ pub async fn relays_for(relay: Option<&str>) -> Result<Vec<RelayUrl>> {
     })
 }
 
-/// Where the way to the relays that last got through is kept: present when that was the proxy.
+/// The relays last reached through the proxy, one per line: those are tried that way first.
 fn route_file() -> std::path::PathBuf {
     crate::paths::home().join("relay-proxy")
 }
 
-/// The proxy to reach `relays` through: one is set (see [`proxy_for`]) and it is what last got through. Otherwise
-/// relays are reached directly, as without a proxy: a proxy variable can be stale (a VPN's, a debugging proxy's) while
-/// the internet is right there.
-fn route(relays: &[RelayUrl]) -> Option<RelayUrl> {
-    route_file().exists().then(|| proxy_for(relays)).flatten()
+fn kept(file: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-fn keep_route(proxy: &Option<RelayUrl>) {
-    let r = match proxy {
-        Some(_) => std::fs::write(route_file(), "the relays last answered through the proxy\n"),
-        None => std::fs::remove_file(route_file())
-            .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
-    };
-    if let Err(e) = r {
+/// Whether `relays` were last reached through the proxy.
+fn proxied(file: &std::path::Path, relays: &[RelayUrl]) -> bool {
+    let kept = kept(file);
+    relays.iter().any(|r| kept.iter().any(|k| k == r.as_str()))
+}
+
+/// The proxy to reach `relays` through: one is set (see [`proxy_for`]) and it is what last got through to them.
+/// Otherwise relays are reached directly, as without a proxy: a proxy variable can be stale (a VPN's, a debugging
+/// proxy's) while the internet is right there.
+fn route(relays: &[RelayUrl]) -> Option<RelayUrl> {
+    proxied(&route_file(), relays).then(|| proxy_for(relays)).flatten()
+}
+
+/// Keeps how `relays` were reached: through `proxy`, or directly. Other relays' entries (another team's own relay, or
+/// the default ones) stay as they are.
+fn keep_route(proxy: &Option<RelayUrl>, relays: &[RelayUrl]) {
+    if let Err(e) = keep_in(&route_file(), proxy.is_some(), relays) {
         log(&format!("couldn't keep the way to the relays: {e}"));
     }
 }
 
+fn keep_in(file: &std::path::Path, proxied: bool, relays: &[RelayUrl]) -> std::io::Result<()> {
+    let mut kept = kept(file);
+    kept.retain(|k| !relays.iter().any(|r| r.as_str() == k));
+    if proxied {
+        kept.extend(relays.iter().map(|r| r.to_string()));
+    }
+    if !kept.is_empty() {
+        return std::fs::write(file, kept.join("\n") + "\n");
+    }
+    std::fs::remove_file(file).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+}
+
+/// An endpoint, with how it reaches its relays: `proxy` as set (none: directly), and `at`, the proxy's address as
+/// looked up for it.
+pub struct Bound {
+    pub endpoint: Endpoint,
+    proxy: Option<RelayUrl>,
+    at: Option<RelayUrl>,
+}
+
 /// An endpoint on the team's own relay (`relay`) or the default ones, the way that last got through, at once. A
 /// running network that stays off its relays tries the other way itself (see `route_loop`).
-pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endpoint> {
+pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Bound> {
     let relays = relays_for(relay).await?;
     endpoint(&key, &relays, relay.is_some(), lan, route(&relays)).await
 }
@@ -189,7 +219,7 @@ pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Res
     let relays = relays_for(relay).await?;
     let own = relay.is_some();
     let first = route(&relays);
-    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone()).await?;
+    let endpoint = self::endpoint(&key, &relays, own, lan, first.clone()).await?.endpoint;
     let Some(proxy) = proxy_for(&relays) else { return Ok((endpoint, relays)) };
     if tokio::time::timeout(FIRST_WAY, endpoint.online()).await.is_ok() {
         return Ok((endpoint, relays));
@@ -201,15 +231,18 @@ pub async fn bind_settled(key: SecretKey, relay: Option<&str>, lan: bool) -> Res
         return Ok((endpoint, relays));
     }
     endpoint.close().await;
-    keep_route(&other);
+    keep_route(&other, &relays);
     log(&format!("on a relay {}", way(&other)));
-    Ok((self::endpoint(&key, &relays, own, lan, other).await?, relays))
+    Ok((self::endpoint(&key, &relays, own, lan, other).await?.endpoint, relays))
 }
 
 /// Whether a relay answers the `proxy` way, asked by a throwaway endpoint that publishes nothing (this machine's own
 /// stays as it is).
 async fn reaches(relays: &[RelayUrl], proxy: &Option<RelayUrl>) -> bool {
-    let Ok(probe) = endpoint(&SecretKey::generate(), relays, true, false, proxy.clone()).await else { return false };
+    let Ok(Bound { endpoint: probe, .. }) = endpoint(&SecretKey::generate(), relays, true, false, proxy.clone()).await
+    else {
+        return false;
+    };
     let reached = tokio::time::timeout(OTHER_WAY, probe.online()).await.is_ok();
     probe.close().await;
     reached
@@ -221,7 +254,7 @@ async fn endpoint(
     own: bool,
     lan: bool,
     proxy: Option<RelayUrl>,
-) -> Result<Endpoint> {
+) -> Result<Bound> {
     // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on n0's
     // relays) and this machine find each other, and what four-word codes need. The team's own relay and nothing of
     // n0's: none of its relays, no publishing or looking up addresses in its DNS; teammates are dialed through it.
@@ -229,15 +262,19 @@ async fn endpoint(
     let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
         .secret_key(key.clone())
         .relay_mode(relay_mode);
-    if let Some(p) = proxy {
-        b = b.proxy_url(looked_up(p).await.into());
+    let at = match &proxy {
+        Some(p) => Some(looked_up(p.clone()).await),
+        None => None,
+    };
+    if let Some(at) = &at {
+        b = b.proxy_url(at.clone().into());
     }
     if lan && own {
         b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
     } else if lan {
         b = b.address_lookup(MdnsAddressLookup::builder());
     }
-    Ok(b.bind().await?)
+    Ok(Bound { endpoint: b.bind().await?, proxy, at })
 }
 
 /// An http proxy's name looked up the way curl and everything else on this machine looks it up (hosts file, the
@@ -249,7 +286,8 @@ async fn looked_up(proxy: RelayUrl) -> RelayUrl {
     if proxy.scheme() != "http" || host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
         return proxy;
     }
-    let found = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.to_string(), port))).await;
+    // Bounded: a resolver that hangs mustn't hold up the network's start (the name is then left to iroh).
+    let found = tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host((host.to_string(), port))).await;
     // One address goes on: IPv4 if there is one (a name for this machine lists ::1 first, where a proxy often isn't).
     let ips: Vec<std::net::IpAddr> = found.ok().and_then(|r| r.ok()).into_iter().flatten().map(|a| a.ip()).collect();
     let Some(&ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first()) else { return proxy };
@@ -365,16 +403,32 @@ async fn route_loop(net: Weak<Net>) {
             wait = FIRST_WAY;
             continue;
         };
-        let other = if this.proxy.is_some() { None } else { Some(proxy) };
-        if !reaches(&this.relays, &other).await || on() || this.endpoint.is_closed() {
-            wait = (wait * 2).min(Duration::from_secs(60));
+        // Through the proxy, its name may stand for another address by now: the same way, looked up afresh.
+        let fresh = match &this.proxy {
+            Some(p) => Some(looked_up(p.clone()).await).filter(|at| Some(at) != this.at.as_ref()),
+            None => None,
+        };
+        let (other, note) = match fresh {
+            Some(at) if reaches(&this.relays, &Some(at.clone())).await => {
+                (this.proxy.clone(), format!("{}, looked up again", way(&Some(at))))
+            }
+            _ => {
+                let other = if this.proxy.is_some() { None } else { Some(proxy) };
+                let note = way(&other);
+                if !reaches(&this.relays, &other).await {
+                    wait = (wait * 2).min(Duration::from_secs(60));
+                    continue;
+                }
+                (other, note)
+            }
+        };
+        if on() || this.endpoint.is_closed() {
             continue;
         }
-        log(&format!("no relay {} ({}), but {}: switching", way(&this.proxy), unreached(&this.endpoint), way(&other)));
-        keep_route(&other);
+        log(&format!("no relay {} ({}), but {note}: switching", way(&this.proxy), unreached(&this.endpoint)));
+        keep_route(&other, &this.relays);
         let Some(daemon) = this.daemon.upgrade() else { return };
-        drop(this);
-        daemon.restart_net().await;
+        daemon.restart_net(&this).await;
         return;
     }
 }
@@ -638,11 +692,12 @@ impl ProtocolHandler for JoinProto {
 impl Net {
     pub fn start(
         daemon: &Arc<Daemon>,
-        endpoint: Endpoint,
+        bound: Bound,
         relay: Option<&str>,
         remote: HashMap<EndpointId, Remote>,
     ) -> Arc<Net> {
         let relays: Vec<RelayUrl> = relay.map_or_else(crate::relays::current, |u| u.parse().into_iter().collect());
+        let Bound { endpoint, proxy, at } = bound;
         let net = Arc::new_cyclic(|weak: &Weak<Net>| Net {
             me: endpoint.id(),
             router: Mutex::new(Some(
@@ -653,8 +708,9 @@ impl Net {
             )),
             invites: Default::default(),
             endpoint,
-            relays: relays.clone(),
-            proxy: route(&relays),
+            relays,
+            proxy,
+            at,
             daemon: Arc::downgrade(daemon),
             links: Default::default(),
             // Saved by an older build, maybe, which tidied less.
@@ -711,7 +767,7 @@ impl Net {
         relay: Option<&str>,
         lan: bool,
     ) -> Result<()> {
-        let endpoint = bind(key, relay, lan).await?;
+        let endpoint = bind(key, relay, lan).await?.endpoint;
         let id = endpoint.id();
         let router = Router::builder(endpoint).accept(JOIN_ALPN, JoinProto(Arc::downgrade(self), Some(id))).spawn();
         self.invites.lock().unwrap().insert(id, router);
@@ -1048,6 +1104,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_way_to_relays_is_kept_for_those_relays_only() {
+        let file = std::env::temp_dir().join(format!("reason-network-route-{}", ulid::Ulid::generate()));
+        let url = |u: &str| -> RelayUrl { u.parse().unwrap() };
+        let default = [url("https://relay-sfo1.example.com"), url("https://relay-fra1.example.com")];
+        let own = [url("https://relay.team.example.com")];
+        assert!(!proxied(&file, &default), "nothing kept: directly");
+        keep_in(&file, true, &own).unwrap();
+        assert!(proxied(&file, &own) && !proxied(&file, &default), "a team relay's way isn't the default relays'");
+        keep_in(&file, true, &default).unwrap();
+        assert!(proxied(&file, &default) && proxied(&file, &[url("https://relay-sfo1.example.com")]));
+        assert!(proxied(&file, &[url("https://relay-new.example.com"), default[1].clone()]), "a list that grew");
+        keep_in(&file, false, &default).unwrap();
+        assert!(!proxied(&file, &default) && proxied(&file, &own), "directly again, for those relays only");
+        keep_in(&file, false, &own).unwrap();
+        assert!(!file.exists(), "nothing left to keep");
+        std::fs::write(&file, "the relays last answered through the proxy\n").unwrap();
+        assert!(!proxied(&file, &default), "an earlier build's file names no relay");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
     fn relays_go_through_the_proxy_curl_would_use() {
         let relay = ["relay-fra1.compute.reasonmachines.com"];
         let pick = |vars: &[(&str, &str)]| {
@@ -1185,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_only_this_machine_says_so() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap();
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
@@ -1204,7 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn a_link_naming_this_machine_and_offline_ones_says_to_ask_an_online_teammate() {
         let key = SecretKey::generate();
-        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap();
+        let endpoint = bind(key.clone(), Some("https://relay.example.com"), false).await.unwrap().endpoint;
         let req = JoinRequest {
             team: String::new(),
             secret: String::new(),
