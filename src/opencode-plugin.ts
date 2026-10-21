@@ -6,9 +6,13 @@ import { execFile } from "node:child_process"
 
 const ENGINE = "__ENGINE_EXE__"
 
+// windowsHide: opencode's background server has no console on Windows, so each call (a poll every few seconds per
+// idle session) would open a console window of its own that closes at once.
 const run = (args: string[], cwd: string) =>
   new Promise<string>((resolve) =>
-    execFile(ENGINE, args, { cwd, timeout: 10_000 }, (err, out) => resolve(err ? "" : String(out).trim())),
+    execFile(ENGINE, args, { cwd, timeout: 10_000, windowsHide: true }, (err, out) =>
+      resolve(err ? "" : String(out).trim()),
+    ),
   )
 
 // What both plugin formats share; `prompt` puts a teammate's message into a session.

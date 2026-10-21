@@ -13,10 +13,14 @@ export default function (pi: ExtensionAPI) {
   let delivering = false
   let timer: ReturnType<typeof setInterval> | undefined
 
+  // windowsHide: on Windows a pi without a console (started by an editor or a GUI) would flash a window per call.
   const hook = (args: string[]) =>
     new Promise<string>((resolve) =>
-      execFile(ENGINE, ["hook", "pi", ...args, "--session", id], { cwd, timeout: 10_000 }, (err, out) =>
-        resolve(err ? "" : String(out).trim()),
+      execFile(
+        ENGINE,
+        ["hook", "pi", ...args, "--session", id],
+        { cwd, timeout: 10_000, windowsHide: true },
+        (err, out) => resolve(err ? "" : String(out).trim()),
       ),
     )
   // Mid-run, only what should interrupt it ("post-tool-use"); once idle, everything ("poll").
