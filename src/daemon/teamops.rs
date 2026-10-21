@@ -49,6 +49,17 @@ impl Daemon {
         }
     }
 
+    /// The network again, on the way to the relays that gets through now (see `net::route_loop`).
+    pub(crate) async fn restart_net(self: &Arc<Self>) {
+        let old = self.net.write().unwrap().take();
+        if let Some(net) = old {
+            net.shutdown().await;
+        }
+        if let Err(e) = self.start_net().await {
+            log(&format!("network not started: {e:#}"));
+        }
+    }
+
     pub(super) async fn start_net(self: &Arc<Self>) -> Result<()> {
         let team = self.team_state().ok_or_else(|| anyhow!("not in a team"))?;
         let relay = team.meta.body.relay.as_deref();
@@ -283,7 +294,7 @@ impl Daemon {
             }
             None => bail!("that's not an invite code (four words, like plum-tiger-lake-orbit)"),
         };
-        let endpoint = net::bind(self.key.clone(), relay.as_deref(), self.cfg.lan()).await?;
+        let (endpoint, relays) = net::bind_settled(self.key.clone(), relay.as_deref(), self.cfg.lan()).await?;
         let req = JoinRequest {
             team: team.clone(),
             secret,
@@ -297,10 +308,10 @@ impl Daemon {
         // may be theirs, not found yet). Else any machine of this build lets it in on its proof, which builds before
         // proofs don't take.
         let same_account = |r: &Result<_>| matches!(r, Err(e) if e.to_string().contains(team::SAME_ACCOUNT));
-        let mut tried = net::join(&endpoint, &peers, &req).await;
+        let mut tried = net::join(&endpoint, &relays, &peers, &req).await;
         if same_account(&tried.result) && tried.unreachable {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let again = net::join(&endpoint, &peers, &req).await;
+            let again = net::join(&endpoint, &relays, &peers, &req).await;
             if again.result.is_ok() {
                 tried = again;
             }
@@ -308,7 +319,10 @@ impl Daemon {
         let res = match tried.result {
             Err(e) if e.to_string().contains(team::SAME_ACCOUNT) => {
                 let any = JoinRequest { owner_only: false, ..req };
-                net::join(&endpoint, &peers, &any).await.result.map_err(|again| if taken(&again) { e } else { again })
+                net::join(&endpoint, &relays, &peers, &any)
+                    .await
+                    .result
+                    .map_err(|again| if taken(&again) { e } else { again })
             }
             r => r,
         };

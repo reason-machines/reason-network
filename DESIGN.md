@@ -409,8 +409,8 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
 - **Windows asks to let Reason Network through the firewall:** allow it for direct and LAN connections. If you don't,
   Reason Network still works, through a relay.
 - **The internet is reachable only through an HTTP proxy:** set `HTTPS_PROXY` (or `ALL_PROXY`) where the daemon runs.
-  Relays are tried directly first; when none answers within a few seconds, through the proxy (CONNECT to port 443,
-  skipped for hosts in `NO_PROXY`). Teammates are then reached through a relay, never directly. A login service
+  Relays are tried directly first; while none answers, the proxy is tried every so often (CONNECT to port 443, skipped
+  for hosts in `NO_PROXY`), and the way that got through is kept for the next start. Teammates are then reached through a relay, never directly. A login service
   doesn't see your shell's variables: give them to it too (Linux: `systemctl --user set-environment HTTPS_PROXY=…`;
   macOS: `launchctl setenv HTTPS_PROXY …`; Windows: set it as a user environment variable, e.g. `setx HTTPS_PROXY …`,
   and sign out and in). Proxy credentials in the URL are sent base64url-encoded, so a proxy may reject ones whose
