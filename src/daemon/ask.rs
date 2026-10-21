@@ -521,6 +521,25 @@ if ($script:choice) { "$($script:choice)`n$(& $chars $req $reqShown)`n$(& $chars
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_late_answer_reaches_the_session_but_isnt_counted_as_a_message() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let reg = crate::proto::SessionReg {
+            key: "codex:1".into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: crate::proto::Tier::Pull,
+            name: None,
+        };
+        let address = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
+        d.answer_later("codex:1", "ship it?", &Answer::Approved(String::new()));
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.unread(&address).unwrap()[0].body.contains("ship it?"));
+        assert_eq!(g.store.counts(util::now_ms()).unwrap(), []);
+    }
+
     #[test]
     fn what_shows_is_what_is_there() {
         // A direction override can't turn text around, nor a spacer or tag character hide in it; joiners stay.

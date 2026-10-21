@@ -212,6 +212,7 @@ impl Daemon {
                 // Counting never stops a message. One to another machine counts once that machine takes it.
                 if here && state != "refused" {
                     let _ = g.store.count(now, Counted::Sent);
+                    let _ = g.store.count(now, Counted::Received);
                 }
                 if notify && here && state != "refused" {
                     note = format!("{note}; {}", self.notify(&msg).1);
@@ -527,7 +528,10 @@ impl Daemon {
             }
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
-            g.store.insert(&mut msg, held)?;
+            // Counted once, when it is new here; a held one once approved.
+            if g.store.insert(&mut msg, held)? && !held {
+                let _ = g.store.count(util::now_ms(), Counted::Received);
+            }
             let (state, note) = match key {
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
@@ -716,6 +720,26 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
     use serde::Deserialize;
+
+    #[tokio::test]
+    async fn a_message_between_sessions_here_counts_as_sent_and_received_once() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let reg = |key: &str, cwd: &str| SessionReg {
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: cwd.into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        d.register(Some(1), reg("codex:1", "/work/api"), crate::git::GitInfo::default()).unwrap();
+        let to = d.register(Some(2), reg("codex:2", "/work/web"), crate::git::GitInfo::default()).unwrap().address;
+        let res = d.send("codex:1".into(), &to, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        let days = d.inner.lock().unwrap().store.counts(util::now_ms()).unwrap();
+        assert_eq!(days.iter().map(|d| (d.sent, d.received)).collect::<Vec<_>>(), [(1, 1)]);
+    }
 
     #[test]
     fn a_peers_message_id_is_a_ulid_as_written() {

@@ -30,7 +30,7 @@ struct Kept {
 }
 
 /// What [`Store::count`] counts: a message a session here sent, once the receiving machine took it, or one that reached
-/// a mailbox here.
+/// a mailbox here (counted by whoever stores it, or once approved if it was held).
 #[derive(Clone, Copy)]
 pub enum Counted {
     Sent,
@@ -191,24 +191,19 @@ impl Store {
                 held
             ],
         );
-        let new = match (n, saved, kept) {
+        match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
                 m.files = files::located(&dir, &k.files);
-                n == 1
+                Ok(n == 1)
             }
-            (Ok(n), ..) => n == 1,
+            (Ok(n), ..) => Ok(n == 1),
             (Err(e), dir, _) => {
                 if let Some(dir) = dir {
                     let _ = std::fs::remove_dir_all(dir);
                 }
-                return Err(e.into());
+                Err(e.into())
             }
-        };
-        // Counting never stops a message. A held one counts once approved.
-        if new && !held {
-            let _ = self.count(crate::util::now_ms(), Counted::Received);
         }
-        Ok(new)
     }
 
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
@@ -657,10 +652,11 @@ mod tests {
         store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
         assert_eq!(totals(&store), (1, 0));
         store.settle_held(&["01HELD".into()], true).unwrap();
-        store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
+        assert!(!store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap());
+        assert_eq!(totals(&store), (1, 1));
+        // Storing one that isn't held counts nothing: the caller counts it if it is a message.
         store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
-        store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
-        assert_eq!(totals(&store), (1, 2));
+        assert_eq!(totals(&store), (1, 1));
         std::fs::remove_dir_all(&inbox).unwrap();
     }
 
