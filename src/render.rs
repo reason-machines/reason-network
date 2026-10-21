@@ -529,10 +529,11 @@ mod tests {
         ] {
             assert!(defang(fake).starts_with('['), "{fake:?} -> {:?}", defang(fake));
         }
-        // A body of brackets takes no longer than any other.
+        // A body of brackets takes no longer than any other: well under a second in a debug build, where judging each
+        // bracket on all that follows it takes minutes. The bound leaves room for a loaded machine.
         let t = std::time::Instant::now();
         assert!(defang(&"<".repeat(1 << 16)).starts_with('['));
-        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
         // Everything else stays as written.
         for text in [
             "Deploy is done \u{2014} see 2010\u{2013}2015",

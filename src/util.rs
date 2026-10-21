@@ -160,12 +160,28 @@ pub fn tilde(path: &str) -> String {
 
 /// Takes an exclusive lock on `path` (waiting for it if `wait`) and writes our pid into it. `None` means
 /// someone else holds it.
-pub fn lock(path: &Path, wait: bool) -> std::io::Result<Option<File>> {
+pub fn lock(path: &Path, wait: bool) -> std::io::Result<Option<Lock>> {
     use std::io::Write;
-    let Some(mut f) = acquire(path, wait)? else { return Ok(None) };
-    f.set_len(0)?;
-    write!(f, "{}", std::process::id())?;
-    Ok(Some(f))
+    let Some(file) = acquire(path, wait)? else { return Ok(None) };
+    let mut lock = Lock { file };
+    lock.file.set_len(0)?;
+    write!(lock.file, "{}", std::process::id())?;
+    Ok(Some(lock))
+}
+
+/// A lock from `lock`, held until dropped.
+pub struct Lock {
+    file: File,
+}
+
+/// Let go of on drop, not when the file closes: a process another thread is starting shares the file until it runs
+/// its program, and the lock with it.
+#[cfg(unix)]
+impl Drop for Lock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 #[cfg(unix)]
@@ -217,8 +233,10 @@ fn acquire(path: &Path, wait: bool) -> std::io::Result<Option<File>> {
 #[cfg(unix)]
 pub fn locked(path: &Path) -> bool {
     use std::os::fd::AsRawFd;
-    let Ok(f) = File::open(path) else { return false };
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+    let Ok(file) = File::open(path) else { return false };
+    // As a `Lock`, so the shared lock we may take here lasts only this instant.
+    let f = Lock { file };
+    unsafe { libc::flock(f.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
 }
 
 #[cfg(windows)]
