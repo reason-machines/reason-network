@@ -41,7 +41,8 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          tar -czf dist/reason-network-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release reason-network
+          # Owned by root (0:0), not the runner's user: tar run as root otherwise tries to give the file to that user.
+          tar --owner=0 --group=0 --numeric-owner -czf dist/reason-network-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release reason-network
           cd dist && shasum -a 256 reason-network-${{ matrix.target }}.tar.gz > reason-network-${{ matrix.target }}.tar.gz.sha256
       - name: Package (Windows)
         if: runner.os == 'Windows'
