@@ -416,6 +416,7 @@ mod tests {
             machine: "mbp".into(),
             machines: Vec::new(),
             features: Vec::new(),
+            messages: Vec::new(),
         };
         assert_eq!(team(&t), "team vibes · relay: Reason's (the default)\n");
         t.relay = Some("https://relay.example.com".into());

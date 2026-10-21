@@ -4,7 +4,7 @@
 
 use crate::{
     files,
-    proto::{Attachment, Message, Tier},
+    proto::{Attachment, DayCount, Message, Tier},
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -28,6 +28,16 @@ struct Kept {
     bytes: usize,
     files: Vec<Attachment>,
 }
+
+/// What [`Store::count`] counts: a message a session here sent, or one that reached a mailbox here.
+#[derive(Clone, Copy)]
+pub enum Counted {
+    Sent,
+    Received,
+}
+
+/// Message counts are kept for today and the six days before it (an SQLite date modifier).
+const COUNTS_SINCE: &str = "-6 days";
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
@@ -84,6 +94,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
+CREATE TABLE IF NOT EXISTS counts (
+    day TEXT PRIMARY KEY,
+    sent INTEGER NOT NULL DEFAULT 0,
+    received INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 const MESSAGE_COLS: &str =
@@ -331,6 +346,35 @@ impl Store {
         Ok(())
     }
 
+    /// Adds one to today's count (by UTC day). Only numbers are kept, and only for a week.
+    pub fn count(&self, now: i64, what: Counted) -> Result<()> {
+        let col = match what {
+            Counted::Sent => "sent",
+            Counted::Received => "received",
+        };
+        self.db.execute(
+            &format!(
+                "INSERT INTO counts (day, {col}) VALUES (date(?1 / 1000, 'unixepoch'), 1)
+                 ON CONFLICT (day) DO UPDATE SET {col} = {col} + 1"
+            ),
+            [now],
+        )?;
+        self.db
+            .execute("DELETE FROM counts WHERE day < date(?1 / 1000, 'unixepoch', ?2)", params![now, COUNTS_SINCE])?;
+        Ok(())
+    }
+
+    /// The days kept that had messages, oldest first.
+    pub fn counts(&self, now: i64) -> Result<Vec<DayCount>> {
+        let mut st = self.db.prepare_cached(
+            "SELECT day, sent, received FROM counts WHERE day >= date(?1 / 1000, 'unixepoch', ?2) ORDER BY day",
+        )?;
+        let rows = st.query_map(params![now, COUNTS_SINCE], |r| {
+            Ok(DayCount { day: r.get(0)?, sent: r.get(1)?, received: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).optional()?)
     }
@@ -507,6 +551,42 @@ mod tests {
             let bytes = std::fs::read(dir.join(f)).unwrap_or_default();
             assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()), "{f} still holds it");
         }
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn messages_are_counted_by_day_for_a_week_and_kept_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("reason-network-counts-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("network.db");
+        let day = 86_400_000;
+        let oct20 = 1_792_454_400_000; // 2026-10-20T00:00:00Z
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert_eq!(store.counts(oct20).unwrap(), []);
+        for (at, what) in [
+            (oct20 - 7 * day, Counted::Sent),
+            (oct20 - 6 * day, Counted::Received),
+            (oct20 - 1, Counted::Sent),
+            (oct20, Counted::Sent),
+            (oct20 + day - 1, Counted::Sent),
+            (oct20 + 5, Counted::Received),
+        ] {
+            store.count(at, what).unwrap();
+        }
+        drop(store);
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        let count = |day: &str, sent, received| DayCount { day: day.into(), sent, received };
+        assert_eq!(
+            store.counts(oct20 + 1).unwrap(),
+            [count("2026-10-14", 0, 1), count("2026-10-19", 1, 0), count("2026-10-20", 2, 1)]
+        );
+        // The next day, the oldest goes.
+        store.count(oct20 + day, Counted::Received).unwrap();
+        assert_eq!(
+            store.counts(oct20 + day).unwrap(),
+            [count("2026-10-19", 1, 0), count("2026-10-20", 2, 1), count("2026-10-21", 0, 1)]
+        );
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
