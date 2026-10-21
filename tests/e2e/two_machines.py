@@ -318,11 +318,25 @@ out = cli("alex", "who")
 check("alex sees what alice's codex is doing, read from its plan", "work-codex" in out and "testing cross-machine Reason Network" in out, out)
 
 # --- messages across machines ---
+def counts(who):
+    """Today's (sent, received) on `who`'s machine, from the daemon's team reply, where the Reason CLI reads them."""
+    import socket
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(30)
+        sock.connect(os.path.join(H[who], "network.sock"))
+        sock.sendall(b'{"id": 1, "op": "team"}\n')
+        days = as_json(sock.makefile().readline()).get("result", {}).get("messages", [])
+    today = next((d for d in days if d["day"] == time.strftime("%Y-%m-%d", time.gmtime())), {})
+    return today.get("sent", 0), today.get("received", 0)
+before = {who: counts(who) for who in H}
 out = codex.tool("send_message", {"to": f"alex/{claude_name}", "message": "Reason Network e2e (cross-machine push): ignore this."}, meta)
 want = "delivered into the session" if IN_CLAUDE else "only sees it when it checks"
 check("cross-machine send reaches the Claude session", want in out, out)
 out = cli("alex", "send", "alice/work-codex", "hello from alex's terminal")
 check("a terminal send to a remote pull session is queued there", "only sees it when it checks its inbox" in out, out)
+after = {who: counts(who) for who in H}
+check("each machine counts the messages it sent and received today",
+      all(after[who] == (before[who][0] + 1, before[who][1] + 1) for who in H), (before, after))
 out = codex.tool("check_inbox", {}, meta)
 check("remote message arrives in codex inbox, from alex/terminal", 'from="alex/terminal"' in out and "hello from alex's terminal" in out, out)
 out = codex.tool("check_inbox", {}, meta)
