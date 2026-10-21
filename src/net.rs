@@ -137,32 +137,76 @@ pub struct Net {
     next_link: AtomicU64,
 }
 
+/// How long a relay gets to answer one way (directly, or through the proxy) before the other is tried.
+const FIRST_WAY: Duration = Duration::from_secs(5);
+const OTHER_WAY: Duration = Duration::from_secs(10);
+/// The proxy got this machine onto a relay when going direct didn't: try it first from then on.
+static PROXIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An endpoint on the team's own relay (`relay`) or the default ones. Direct first: a proxy variable can be stale (a
+/// VPN's, a debugging proxy's) while the internet is right there. With a proxy set (see [`proxy_for`]) and no relay
+/// answering directly, the proxy is tried; if neither way answers, it is the first way, which may yet.
 pub async fn bind(key: SecretKey, relay: Option<&str>, lan: bool) -> Result<Endpoint> {
-    let Some(url) = relay else {
+    let relays = match relay {
         // The default relays, with n0's address lookup still: that is how a teammate on an older Reason Network (on
         // n0's relays) and this machine find each other, and what four-word codes need.
-        let relays = crate::relays::current_or_fetch().await;
-        let mut b = Endpoint::builder(presets::N0).secret_key(key).relay_mode(RelayMode::custom(relays));
-        if let Some(p) = proxy() {
-            b = b.proxy_url(p.into());
+        None => crate::relays::current_or_fetch().await,
+        Some(url) => {
+            vec![url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?]
         }
-        if lan {
-            b = b.address_lookup(MdnsAddressLookup::builder());
-        }
-        return Ok(b.bind().await?);
     };
+    let own = relay.is_some();
+    let Some(proxy) = proxy_for(&relays) else { return endpoint(&key, &relays, own, lan, None).await };
+    let ways = if PROXIED.load(Ordering::Relaxed) { [Some(proxy), None] } else { [None, Some(proxy)] };
+    let first = endpoint(&key, &relays, own, lan, ways[0].clone()).await?;
+    if tokio::time::timeout(FIRST_WAY, first.online()).await.is_ok() {
+        return Ok(first);
+    }
+    log(&format!("no relay {} ({}): trying {}", way(&ways[0]), unreached(&first), way(&ways[1])));
+    first.close().await;
+    let other = endpoint(&key, &relays, own, lan, ways[1].clone()).await?;
+    if tokio::time::timeout(OTHER_WAY, other.online()).await.is_ok() {
+        PROXIED.store(ways[1].is_some(), Ordering::Relaxed);
+        log(&format!("on a relay {}", way(&ways[1])));
+        return Ok(other);
+    }
+    log(&format!("no relay {} either ({})", way(&ways[1]), unreached(&other)));
+    other.close().await;
+    endpoint(&key, &relays, own, lan, ways[0].clone()).await
+}
+
+async fn endpoint(
+    key: &SecretKey,
+    relays: &[RelayUrl],
+    own: bool,
+    lan: bool,
+    proxy: Option<RelayUrl>,
+) -> Result<Endpoint> {
     // The team's own relay and nothing of n0's: none of its relays, no publishing or looking up addresses in its DNS.
     // Teammates are dialed through the relay instead.
-    let url: RelayUrl =
-        url.parse().map_err(|_| anyhow!("not a relay url: {url} (expected e.g. https://relay.example.com)"))?;
-    let mut b = Endpoint::builder(presets::Minimal).secret_key(key.clone()).relay_mode(RelayMode::custom([url]));
-    if let Some(p) = proxy() {
+    let relay_mode = RelayMode::custom(relays.to_vec());
+    let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
+        .secret_key(key.clone())
+        .relay_mode(relay_mode);
+    if let Some(p) = proxy {
         b = b.proxy_url(p.into());
     }
-    if lan {
+    if lan && own {
         b = b.address_lookup(NoRelays(MdnsAddressLookup::builder().build(key.public())?));
+    } else if lan {
+        b = b.address_lookup(MdnsAddressLookup::builder());
     }
     Ok(b.bind().await?)
+}
+
+/// "directly", or "through the proxy at host:port" (where it is, not who signs in to it).
+fn way(proxy: &Option<RelayUrl>) -> String {
+    match proxy {
+        Some(p) => {
+            format!("through the proxy at {}:{}", p.host_str().unwrap_or("?"), p.port_or_known_default().unwrap_or(0))
+        }
+        None => "directly".into(),
+    }
 }
 
 /// Makes sure this machine reaches `url` as a relay. Nothing falls back to n0's, so a mistyped or unreachable relay
@@ -179,44 +223,98 @@ pub async fn check_relay(key: SecretKey, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// The HTTP proxy that relay connections go through, picked as curl picks one for an https address: `https_proxy`,
-/// `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` (a bare `host:port` is an http one). A machine whose only way out is such a
-/// proxy reaches its relay, and teammates through it; direct paths are UDP, which it doesn't carry.
-fn proxy() -> Option<RelayUrl> {
-    proxy_in(|name| std::env::var(name).ok())
+/// The HTTP proxy relay connections may go through, picked as curl picks one for an https address: the first of
+/// `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` that is set (a bare `host:port` is an http one; SOCKS, which
+/// iroh doesn't speak, is none), unless `no_proxy` / `NO_PROXY` covers every relay in `relays`. Relay connections are
+/// TLS on 443 and go through it with CONNECT; direct paths are UDP, which it doesn't carry, so a machine whose only way
+/// out is the proxy reaches teammates through a relay.
+fn proxy_for(relays: &[RelayUrl]) -> Option<RelayUrl> {
+    let hosts: Vec<&str> = relays.iter().filter_map(|u| u.host_str()).collect();
+    proxy_in(|name| std::env::var(name).ok(), &hosts)
 }
 
-fn proxy_in(var: impl Fn(&str) -> Option<String>) -> Option<RelayUrl> {
-    ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"].into_iter().find_map(|name| {
-        let v = var(name)?;
-        let v = v.trim();
-        let url: RelayUrl = if v.contains("://") { v.parse() } else { format!("http://{v}").parse() }.ok()?;
-        (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
-    })
+fn proxy_in(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<RelayUrl> {
+    let set = |names: [&str; 2]| names.into_iter().find_map(|n| var(n).filter(|v| !v.trim().is_empty()));
+    let v = set(["https_proxy", "HTTPS_PROXY"]).or_else(|| set(["all_proxy", "ALL_PROXY"]))?;
+    let v = v.trim();
+    let url: RelayUrl = if v.contains("://") { v.parse() } else { format!("http://{v}").parse() }.ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let no_proxy = set(["no_proxy", "NO_PROXY"]).unwrap_or_default();
+    hosts.iter().any(|h| !no_proxy_covers(&no_proxy, h)).then_some(url)
 }
 
-/// Why this machine isn't on its relay, if it isn't (and then no teammate is reached through one either).
+/// Whether `no_proxy` (comma- or space-separated: `*`, hosts, `.domain` or `domain` for it and everything under it)
+/// keeps `host` off the proxy, as curl reads it. Loopback is always off it.
+fn no_proxy_covers(no_proxy: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    no_proxy.split([',', ' ']).map(|e| e.trim().trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase()).any(
+        |e| {
+            e == "*"
+                || (!e.is_empty()
+                    && (host == e || host.strip_suffix(e.as_str()).is_some_and(|rest| rest.ends_with('.'))))
+        },
+    )
+}
+
+/// The relays' last error, or that none answered. The CLI reads "closed" in a daemon's error as the daemon going
+/// down mid-request (and asks again), so the words passed on here never say it.
+fn unreached(endpoint: &Endpoint) -> String {
+    let why = endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .find_map(|s| s.last_error().map(|e| format!("{}: {e}", s.url())))
+        .unwrap_or_else(|| "no answer".into());
+    why.replace("closed", "ended").replace("Closed", "Ended")
+}
+
+/// Why this machine isn't on a relay, if it isn't (and then no teammate is reached through one either).
 fn off_relay(endpoint: &Endpoint) -> Option<String> {
     let status = endpoint.home_relay_status().get();
     if status.iter().any(|s| s.is_connected()) {
         return None;
     }
-    let mut why = status
-        .iter()
-        .find_map(|s| s.last_error().map(|e| format!("{}: {e}", s.url())))
-        .unwrap_or_else(|| "no answer".into());
-    match proxy() {
-        // Where the proxy is, not who signs in to it.
-        Some(p) => {
-            why += &format!(
-                ", through the proxy at {}:{}",
-                p.host_str().unwrap_or("?"),
-                p.port_or_known_default().unwrap_or(0)
-            )
-        }
-        None => why += "; if this computer reaches the internet only through a proxy, set HTTPS_PROXY",
+    // Before one is picked, the relays it would pick from.
+    let mut relays: Vec<RelayUrl> = status.iter().map(|s| s.url().clone()).collect();
+    if relays.is_empty() {
+        relays = crate::relays::current();
     }
-    Some(why)
+    let hint = match proxy_for(&relays) {
+        Some(p) => format!(", directly or {}", way(&Some(p))),
+        None => "; if this computer reaches the internet only through a proxy, set HTTPS_PROXY".into(),
+    };
+    Some(unreached(endpoint) + &hint)
+}
+
+/// Says in the log when this machine gets onto a relay, and when it can't or loses it, and why.
+async fn log_relay(endpoint: Endpoint) {
+    let mut status = endpoint.home_relay_status();
+    let mut was = None;
+    loop {
+        let now = status.get();
+        let up = now.iter().find(|s| s.is_connected()).map(|s| s.url().to_string());
+        if let Some(url) = &up
+            && was != Some(true)
+        {
+            log(&format!("on relay {url}"));
+            was = Some(true);
+        } else if up.is_none() && was != Some(false) && now.iter().any(|s| s.last_error().is_some()) {
+            log(&format!("relay unreachable: {}", unreached(&endpoint)));
+            was = Some(false);
+        }
+        tokio::select! {
+            r = status.updated() => if r.is_err() { return },
+            _ = endpoint.closed() => return,
+        }
+    }
 }
 
 /// mDNS, minus the relay a neighbour advertises: a teammate still on n0's relays (it missed a switch, or runs an older
@@ -319,7 +417,7 @@ pub async fn join(endpoint: &Endpoint, peers: &[EndpointAddr], req: &JoinRequest
             Err(_) => {
                 unreachable = true;
                 last = Some(match off_relay(endpoint) {
-                    // Not that they're offline: this computer got nowhere.
+                    // Not that they're offline: this computer got nowhere. (No "closed" in these: see `unreached`.)
                     Some(why) => anyhow!("this computer couldn't reach a relay ({why})"),
                     None if named > 1 => anyhow!("couldn't reach any machine on this link (are they online?)"),
                     None => anyhow!("couldn't reach the machine that made the invite (is it online?)"),
@@ -482,6 +580,7 @@ impl Net {
             changed: Notify::new(),
             next_link: AtomicU64::new(1),
         });
+        tokio::spawn(log_relay(net.endpoint.clone()));
         tokio::spawn(net.clone().dial_loop());
         tokio::spawn(net.clone().presence_loop());
         net
@@ -861,22 +960,53 @@ mod tests {
 
     #[test]
     fn relays_go_through_the_proxy_curl_would_use() {
+        let relay = ["relay-fra1.compute.reasonmachines.com"];
         let pick = |vars: &[(&str, &str)]| {
-            proxy_in(|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())).map(|u| u.to_string())
+            proxy_in(|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string()), &relay)
+                .map(|u| u.to_string())
         };
         assert_eq!(pick(&[]), None);
         assert_eq!(pick(&[("HTTPS_PROXY", "http://proxy.corp:3128")]).as_deref(), Some("http://proxy.corp:3128/"));
-        assert_eq!(
-            pick(&[("ALL_PROXY", "proxy.corp:3128")]).as_deref(),
-            Some("http://proxy.corp:3128/"),
-            "bare host:port"
-        );
+        assert_eq!(pick(&[("ALL_PROXY", "proxy.corp:3128")]).as_deref(), Some("http://proxy.corp:3128/"), "host:port");
         let both = [("ALL_PROXY", "http://all:1"), ("https_proxy", "http://https:2")];
         assert_eq!(pick(&both).as_deref(), Some("http://https:2/"), "https_proxy first");
-        // Plain-http traffic's proxy isn't the relays' (as with curl); SOCKS isn't one iroh speaks.
+        assert_eq!(
+            pick(&[("https_proxy", " "), ("ALL_PROXY", "http://all:1")]).as_deref(),
+            Some("http://all:1/"),
+            "empty"
+        );
+        // Plain-http traffic's proxy isn't the relays' (as with curl); SOCKS isn't one iroh speaks, and the first set
+        // variable decides: no falling through to the next.
         assert_eq!(pick(&[("HTTP_PROXY", "http://proxy.corp:3128")]), None);
         assert_eq!(pick(&[("ALL_PROXY", "socks5://proxy.corp:1080")]), None);
-        assert_eq!(pick(&[("https_proxy", " ")]), None);
+        assert_eq!(pick(&[("https_proxy", "socks5://proxy.corp:1080"), ("ALL_PROXY", "http://all:1")]), None);
+        // no_proxy: hosts, domains with or without a dot, `*`; loopback never goes through it.
+        let p = ("HTTPS_PROXY", "http://proxy.corp:3128");
+        for np in [
+            "*",
+            "reasonmachines.com",
+            ".reasonmachines.com",
+            "localhost, .compute.reasonmachines.com",
+            "relay-fra1.compute.reasonmachines.com",
+            "RELAY-FRA1.compute.reasonmachines.com.",
+        ] {
+            assert_eq!(pick(&[p, ("no_proxy", np)]), None, "{np}");
+        }
+        for np in ["localhost,127.0.0.1", "machines.com", "fra1.compute", "other.example.com", ""] {
+            assert!(pick(&[p, ("NO_PROXY", np)]).is_some(), "{np}");
+        }
+        assert!(no_proxy_covers("", "localhost") && no_proxy_covers("", "127.0.0.1") && no_proxy_covers("", "[::1]"));
+        // Over several relays, the proxy is kept unless no_proxy covers them all.
+        let two = ["relay.example.com", "relay-sfo1.compute.reasonmachines.com"];
+        let get = |np: &'static str| {
+            move |n: &str| match n {
+                "HTTPS_PROXY" => Some("http://proxy.corp:3128".to_string()),
+                "NO_PROXY" => Some(np.to_string()),
+                _ => None,
+            }
+        };
+        assert!(proxy_in(get("example.com"), &two).is_some());
+        assert!(proxy_in(get("example.com,reasonmachines.com"), &two).is_none());
     }
 
     #[test]
