@@ -29,7 +29,7 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
-toml = "0.9"
+toml = "1.1"
 toml_edit = "0.25"
 ulid = "1"
 
