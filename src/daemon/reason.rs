@@ -208,7 +208,7 @@ mod tests {
 
     impl Stub {
         fn new(narrow_err: &str, plain_err: Option<&str>) -> Stub {
-            let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::new()));
+            let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::generate()));
             std::fs::create_dir_all(&dir).unwrap();
             let (bin, calls) = (dir.join("reason"), dir.join("calls"));
             let plain = match plain_err {

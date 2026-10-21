@@ -241,7 +241,7 @@ impl Daemon {
             return log(&format!("{key} had gone before {} answered its question", self.person));
         };
         let mut msg = Message {
-            id: Ulid::new().to_string(),
+            id: Ulid::generate().to_string(),
             from: format!("{}/terminal", self.person),
             from_agent: None,
             from_repo: None,

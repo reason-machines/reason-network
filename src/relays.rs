@@ -164,7 +164,7 @@ async fn refresh_in(home: &Path, url: &str) -> Result<()> {
     if std::fs::read(cache(home)).ok().as_deref() == Some(doc.as_slice()) {
         return Ok(());
     }
-    let tmp = home.join(format!("relays.json.{}.tmp", ulid::Ulid::new()));
+    let tmp = home.join(format!("relays.json.{}.tmp", ulid::Ulid::generate()));
     std::fs::write(&tmp, &doc)?;
     std::fs::rename(&tmp, cache(home))?;
     Ok(())
@@ -248,7 +248,7 @@ mod tests {
     }
 
     fn home() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("reason-network-relays-{}", ulid::Ulid::new()));
+        let d = std::env::temp_dir().join(format!("reason-network-relays-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

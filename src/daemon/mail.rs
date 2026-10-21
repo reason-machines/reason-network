@@ -135,7 +135,7 @@ impl Daemon {
             }
             if own {
                 let msg = Message {
-                    id: Ulid::new().to_string(),
+                    id: Ulid::generate().to_string(),
                     from: from_addr.clone(),
                     from_agent: from_agent.clone(),
                     from_repo: from_repo.clone(),
@@ -170,7 +170,7 @@ impl Daemon {
             let targets = if own { Vec::new() } else { self.resolve(&g, &remotes, to, Some(&exclude))? };
             for t in targets {
                 let mut msg = Message {
-                    id: Ulid::new().to_string(),
+                    id: Ulid::generate().to_string(),
                     from: from_addr.clone(),
                     from_agent: from_agent.clone(),
                     from_repo: from_repo.clone(),
@@ -758,7 +758,7 @@ mod tests {
             approval: None,
             files: Vec::new(),
         };
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         assert!(clean(msg(&id)).is_ok());
         for bad in [id.to_lowercase(), "CON".into(), "01ALICEMSG".into(), format!("{id}0"), String::new()] {
             assert!(clean(msg(&bad)).is_err(), "{bad}");

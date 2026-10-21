@@ -161,7 +161,7 @@ impl Store {
             return Ok(false);
         }
         let mut kept = (!m.files.is_empty()).then(|| Kept {
-            dir: ulid::Ulid::new().to_string(),
+            dir: ulid::Ulid::generate().to_string(),
             bytes: files::size(&m.files),
             files: m.files.iter().map(|f| Attachment { path: None, ..f.clone() }).collect(),
         });
@@ -545,7 +545,7 @@ mod tests {
     #[cfg(unix)]
     fn the_database_is_this_users_and_keeps_nothing_it_deleted() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("reason-network-store-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("reason-network-store-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("network.db");
         // A database made before, with the default mode.
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn messages_are_counted_by_day_for_a_week_and_kept_across_restarts() {
-        let dir = std::env::temp_dir().join(format!("reason-network-counts-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("reason-network-counts-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("network.db");
         let day = 86_400_000;
@@ -713,7 +713,7 @@ mod tests {
     }
 
     fn temp_inbox() -> PathBuf {
-        std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::new()))
+        std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()))
     }
 
     fn file(name: &str, content: &str) -> Attachment {

@@ -458,7 +458,7 @@ mod tests {
     }
 
     fn temp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("reason-network-files-{}", ulid::Ulid::new()));
+        let d = std::env::temp_dir().join(format!("reason-network-files-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -575,7 +575,8 @@ mod tests {
     #[test]
     fn an_agent_sends_only_from_its_own_folder_everywhere() {
         // Not in the temp folder: on Windows that is under %LOCALAPPDATA%, which is out of reach (see `Confine`).
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("files-test-{}", ulid::Ulid::new()));
+        let d =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("files-test-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&d).unwrap();
         let (home, repo, state) = (d.join("home"), d.join("home").join("src").join("api"), d.join("state"));
         for dir in [repo.join("docs"), repo.join(".github"), home.join(".ssh"), state.clone()] {
@@ -671,7 +672,8 @@ mod tests {
     #[test]
     fn an_agent_sends_nothing_from_a_folder_that_is_off() {
         // Not in the temp folder, which on Windows is out of reach anyway (see the test above).
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("files-test-{}", ulid::Ulid::new()));
+        let d =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("files-test-{}", ulid::Ulid::generate()));
         let (home, repo, state) = (d.join("home"), d.join("home").join("work"), d.join("state"));
         std::fs::create_dir_all(repo.join("private")).unwrap();
         std::fs::create_dir_all(&state).unwrap();

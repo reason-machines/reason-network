@@ -309,7 +309,7 @@ mod tests {
     }
 
     fn temp() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("reason-network-folders-{}", ulid::Ulid::new()));
+        let d = std::env::temp_dir().join(format!("reason-network-folders-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(d.join("real").join("personal").join("sub")).unwrap();
         std::fs::create_dir_all(d.join("x")).unwrap();
         d
