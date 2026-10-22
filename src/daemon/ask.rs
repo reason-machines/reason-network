@@ -245,7 +245,7 @@ impl Daemon {
         let Ok(said) = self.said(answer) else { return };
         let mut g = self.inner.lock().unwrap();
         let Some(to) = g.live.get(key).map(|l| self.addr(&l.name)) else {
-            return log(&format!("{key} had gone before {} answered its question", self.person));
+            return log(&format!("a session had gone before {} answered its question", self.person));
         };
         let mut msg = Message {
             id: Ulid::generate().to_string(),

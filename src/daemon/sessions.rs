@@ -126,7 +126,7 @@ impl Daemon {
         let address = self.addr(&name);
         let pending: Vec<Message> = g.pending(&address)?;
         let wake: Vec<Message> = pending.iter().filter(|m| m.wake).cloned().collect();
-        log(&format!("session {address} ({key}) registered"));
+        log(&format!("session {address} registered"));
         Ok((Registered { name, address, unread: pending.len() as u32 }, (key, wake)))
     }
 
@@ -177,7 +177,7 @@ impl Daemon {
             l.attached = true;
             let r = remembered(l, util::now_ms());
             if let Err(e) = g.store.upsert_session(&r, &self.person) {
-                log(&format!("remembering {key}: {e:#}"));
+                log(&format!("remembering {}: {e:#}", self.addr(&r.name)));
             }
         }
     }
@@ -201,7 +201,7 @@ impl Daemon {
             && r.key != key
             && r.kept()
         {
-            log(&format!("{} lapsed: {key} takes the name", self.addr(name)));
+            log(&format!("{} lapsed: a new session takes the name", self.addr(name)));
             g.store.forget_session(&r, &self.person)?;
         }
         Ok(())
@@ -307,7 +307,7 @@ impl Daemon {
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
-                log(&format!("session {} ({key}) ended", self.addr(&l.name)));
+                log(&format!("session {} ended", self.addr(&l.name)));
                 self.presence_changed();
             }
             return Ok(HookReply::default());
@@ -425,7 +425,7 @@ impl Daemon {
             }
             if let Some(l) = g.live.remove(&key) {
                 let _ = g.store.touch_session(&l.name, now);
-                log(&format!("session {} ({key}) left", self.addr(&l.name)));
+                log(&format!("session {} left", self.addr(&l.name)));
                 self.presence_changed();
             }
         }

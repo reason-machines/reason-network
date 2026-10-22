@@ -230,6 +230,11 @@ impl Daemon {
         format!("{}/{name}", self.person)
     }
 
+    /// A session, as the log names it: by its address. Its key carries its agent's session id, which stays out of it.
+    fn logged(&self, g: &Inner, key: &str) -> String {
+        g.live.get(key).map_or_else(|| "a session that has gone".into(), |l| self.addr(&l.name))
+    }
+
     fn net(&self) -> Option<Arc<Net>> {
         self.net.read().unwrap().clone()
     }

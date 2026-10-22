@@ -180,7 +180,7 @@ impl Daemon {
                 name: if named { c.label() } else { None },
             };
             if let Err(e) = self.register(None, reg, git) {
-                super::log(&format!("adding Claude session {id}: {e:#}"));
+                super::log(&format!("adding the Claude session of process {}: {e:#}", c.pid));
             }
         }
         // Seen alive just now (it goes when its process does).

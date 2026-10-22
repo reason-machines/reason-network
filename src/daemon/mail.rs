@@ -408,8 +408,8 @@ impl Daemon {
                 Ok(Ok(())) => {
                     let _ = g.store.mark_read(&ids, util::now_ms());
                 }
-                Ok(Err(e)) => log(&format!("delivering to Claude session {key}: {e}")),
-                Err(e) => log(&format!("delivering to Claude session {key}: {e}")),
+                Ok(Err(e)) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
+                Err(e) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
             }
         });
     }
@@ -468,9 +468,10 @@ impl Daemon {
                 }
                 // Reason has no hooks to fall back on: its sync pushes again, backing off (15 s doubling to 30 min).
                 Err(why) if bin == "reason" => {
+                    let who = this.logged(&g, &key);
                     if let Some(l) = g.live.get_mut(&key) {
                         if l.retry.is_none() {
-                            log(&format!("{bin} delivery to {key} failed ({why}); retrying with backoff"));
+                            log(&format!("{bin} delivery to {who} failed ({why}); retrying with backoff"));
                         }
                         let wait =
                             l.retry.map_or(Duration::from_secs(15), |(_, w)| (w * 2).min(Duration::from_secs(1800)));
@@ -478,7 +479,7 @@ impl Daemon {
                     }
                 }
                 Err(why) => {
-                    log(&format!("{bin} delivery to {key} failed ({why}); falling back to hooks"));
+                    log(&format!("{bin} delivery to {} failed ({why}); falling back to hooks", this.logged(&g, &key)));
                     // Hooks (or check_inbox) show it instead; tell senders the truth from now on.
                     if let Some(l) = g.live.get_mut(&key) {
                         l.push_failed = true;

@@ -309,7 +309,7 @@ out = run("who", "clear-proj")
 log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
 check("a headless Claude run from it is a session of its own, not its parent's conversation",
       "clear-proj-claude-3" in out and "clear-proj-claude-2" in out and "clear-proj-claude-3 ended" not in log
-      and "alex/clear-proj-claude-3 (claude-code:inner) registered" in log, out + log[-800:])
+      and "session alex/clear-proj-claude-3 registered" in log, out + log[-800:])
 hc.kill()
 cc.kill()
 claude_proc.kill()
