@@ -243,6 +243,12 @@ pub fn from_terminal(from: &str) -> bool {
     without_machine(from).ends_with("/terminal")
 }
 
+/// How a message from `address`, from machine `machine`, shows on another machine: a person's terminal with that
+/// machine, as each machine has its own (the address a reply to it goes to, and that its sender's receipt names).
+pub fn shown_from(address: &str, machine: &str) -> String {
+    if from_terminal(address) { format!("{address}@{machine}") } else { address.to_string() }
+}
+
 /// An address without the `@<machine>` it may name.
 pub fn without_machine(address: &str) -> &str {
     address.split_once('@').map_or(address, |(a, _)| a)

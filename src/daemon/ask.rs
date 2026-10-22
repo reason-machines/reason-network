@@ -230,6 +230,7 @@ impl Daemon {
             doing: None,
             name: Some("terminal".into()),
             dirs: Vec::new(),
+            keep: false,
         };
         if let Err(e) = self.hook(call).await {
             log(&format!("couldn't register {}/terminal: {e:#}", self.person));

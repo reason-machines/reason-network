@@ -74,6 +74,11 @@ pub struct HookCall {
     /// What the session is doing, from agents that say so themselves (the opencode plugin).
     #[serde(default)]
     pub doing: Option<String>,
+    /// One of the person's own mailboxes, kept for good: a name they gave with `reason network listen --as` (the
+    /// terminal always is one). Other `cli` sessions, such as the Reason CLI's one-off ask sessions, are sessions like
+    /// any other. Older clients leave it out.
+    #[serde(default)]
+    pub keep: bool,
     /// The session's name, for sessions that pick one (`reason network listen --as`).
     #[serde(default)]
     pub name: Option<String>,

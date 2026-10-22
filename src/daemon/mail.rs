@@ -84,7 +84,7 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
                          looks like a loop. Check with your user before continuing.";
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
-/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then it waits for
+/// it was last seen, unless it is one of the person's own mailboxes (`terminal`, `listen --as`), which are kept. Until then it waits for
 /// that session, when the session can come back to its name (see [`Remembered::kept`]); else a new session that takes
 /// the name gets it.
 fn offline_note(r: Option<&Remembered>, now: i64) -> String {
@@ -94,7 +94,7 @@ fn offline_note(r: Option<&Remembered>, now: i64) -> String {
     let who = if r.kept() { BACK } else { NAME };
     let seen = util::ago(r.last_seen, now);
     let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
-    if r.agent == "cli" {
+    if r.mailbox {
         format!("queued: last seen {seen} ago; {who}")
     } else if forgotten <= now {
         format!("queued: last seen {seen} ago; unread mail may be dropped any time; {who}")
@@ -217,6 +217,8 @@ impl Daemon {
                     files: files.clone(),
                 };
                 res.ids.push(msg.id.clone());
+                // The receipt names it as its answer will show here: a teammate's terminal with its machine.
+                let shown = t.shown_address();
                 let here = !matches!(t, Target::Remote { .. });
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
@@ -251,7 +253,7 @@ impl Daemon {
                 if notify && here && state != "refused" {
                     note = format!("{note}; {}", self.notify(&msg).1);
                 }
-                res.recipients.push(Recipient { address: msg.to.clone(), state, note });
+                res.recipients.push(Recipient { address: shown, state, note });
             }
         }
         self.arrived.notify_waiters();
@@ -586,9 +588,7 @@ impl Daemon {
                 return Ok(("refused".into(), note));
             }
             // Each machine has its own terminal: replies go back to the one this came from.
-            if render::from_terminal(&msg.from) {
-                msg.from = format!("{}@{machine}", msg.from);
-            }
+            msg.from = render::shown_from(&msg.from, &machine);
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
             // Held for a session whose name is kept, it is that session's: it goes when the session does.
@@ -790,6 +790,7 @@ mod tests {
     use crate::team::TeamState;
     use iroh::SecretKey;
     use serde::Deserialize;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn a_message_between_sessions_here_counts_as_sent_and_received_once() {
@@ -846,6 +847,7 @@ mod tests {
             tier: Tier::Pull,
             last_seen: 0,
             attached: true,
+            mailbox: agent == "cli",
         };
         // A conversation its agent gave an id waits for it, whoever takes the name meanwhile.
         let back = "it reaches that session when it's back";
@@ -943,6 +945,34 @@ mod tests {
             text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
             "{text}"
         );
+        // Asked the other way: a message to `bob/terminal` names it in its receipt as Bob's answer will show here, so a
+        // reply with no `reply_to` matches it (the Reason CLI and server match answers that way).
+        let mut terminal = d.row("terminal", "cli", "/", None);
+        terminal.tier = Tier::Pull;
+        let remotes = HashMap::from([(
+            bob.public(),
+            crate::net::Remote {
+                presence: crate::net::Presence { sessions: vec![terminal], ..Default::default() },
+                last_seen: util::now_ms(),
+                online: true,
+            },
+        )]);
+        let g = d.inner.lock().unwrap();
+        let targets = d.resolve(&g, &remotes, "bob/terminal", None).unwrap();
+        assert_eq!(targets.iter().map(|t| t.shown_address()).collect::<Vec<_>>(), [got[0].from.clone()]);
+        // A teammate's session goes by its name alone, there and here.
+        let mut web = d.row("web-codex", "codex", "/", None);
+        web.tier = Tier::Pull;
+        let remotes = HashMap::from([(
+            bob.public(),
+            crate::net::Remote {
+                presence: crate::net::Presence { sessions: vec![web], ..Default::default() },
+                last_seen: util::now_ms(),
+                online: true,
+            },
+        )]);
+        let targets = d.resolve(&g, &remotes, "bob/web-codex", None).unwrap();
+        assert_eq!(targets.iter().map(|t| t.shown_address()).collect::<Vec<_>>(), ["bob/web-codex"]);
     }
 
     #[tokio::test]

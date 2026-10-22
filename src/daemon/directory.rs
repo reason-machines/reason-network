@@ -36,6 +36,14 @@ impl Target {
             Target::Session { address, .. } | Target::Remote { address, .. } => address.clone(),
         }
     }
+
+    /// Its address as a message from it shows here, which a receipt names: a teammate's terminal with its machine.
+    pub(super) fn shown_address(&self) -> String {
+        match self {
+            Target::Session { address, .. } => address.clone(),
+            Target::Remote { address, machine_name, .. } => crate::render::shown_from(address, machine_name),
+        }
+    }
 }
 
 /// Something an address can match.
@@ -192,7 +200,7 @@ impl Daemon {
         }
     }
 
-    fn row(&self, name: &str, agent: &str, cwd: &str, git: Option<&GitInfo>) -> SessionInfo {
+    pub(super) fn row(&self, name: &str, agent: &str, cwd: &str, git: Option<&GitInfo>) -> SessionInfo {
         SessionInfo {
             address: self.addr(name),
             name: name.to_string(),
@@ -667,6 +675,7 @@ mod tests {
                 tier: Tier::Push,
                 last_seen: util::now_ms(),
                 attached: true,
+                mailbox: false,
             };
             d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         }

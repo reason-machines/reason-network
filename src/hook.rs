@@ -96,6 +96,7 @@ async fn handle(
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
+        keep: false,
     });
     let reply: HookReply = link.call(req).await.ok()?;
     if off {

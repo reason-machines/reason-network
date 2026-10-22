@@ -119,6 +119,7 @@ impl Daemon {
                     stop_gen: 0,
                     attached,
                     mcp_push,
+                    mailbox: key == TERMINAL,
                 },
             );
             self.presence_changed();
@@ -173,7 +174,7 @@ impl Daemon {
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
     /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
     pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
-        r.kept() && (r.agent == "cli" || now - r.last_seen <= FORGET_MS || !self.forgetting(now))
+        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting(now))
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
@@ -205,6 +206,19 @@ impl Daemon {
                 self.presence_changed();
             }
         }
+    }
+
+    /// Marks a live session as one of the person's own mailboxes, kept for good.
+    fn mailbox(&self, key: &str, now: i64) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        let g = &mut *g;
+        if let Some(l) = g.live.get_mut(key)
+            && !l.mailbox
+        {
+            l.mailbox = true;
+            g.store.upsert_session(&remembered(l, now), &self.person)?;
+        }
+        Ok(())
     }
 
     /// Before `key` takes `name`: a session that kept the name until it lapsed is forgotten, with the mail it never
@@ -289,7 +303,7 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs } = h;
+        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
@@ -343,6 +357,10 @@ impl Daemon {
                 name,
             };
             self.register_quiet(None, reg, git)?;
+        }
+        // A name the person gave with `listen --as`: one of their own mailboxes from now on.
+        if keep && agent == "cli" {
+            self.mailbox(&key, now)?;
         }
 
         let mut g = self.inner.lock().unwrap();
@@ -493,6 +511,7 @@ fn remembered(l: &Live, now: i64) -> Remembered {
         tier: l.reg.tier,
         last_seen: now,
         attached: l.attached,
+        mailbox: l.mailbox,
     }
 }
 
@@ -620,10 +639,15 @@ mod tests {
         }
     }
 
-    /// Registers a session through an MCP server of its own, as Claude Code runs one per session.
+    /// Registers a session through an MCP server of its own, as Claude Code runs one per session; a `cli` one as
+    /// `listen --as` does, as one of the person's own mailboxes.
     fn join(d: &Daemon, reg: SessionReg) -> Registered {
-        let conn = conn_of(&reg.key);
-        d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap().0
+        let (conn, key, cli) = (conn_of(&reg.key), reg.key.clone(), reg.agent == "cli");
+        let r = d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap().0;
+        if cli {
+            d.mailbox(&key, util::now_ms()).unwrap();
+        }
+        r
     }
 
     /// The connection of the MCP server `join` registers a session through.
@@ -715,6 +739,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            keep: false,
         };
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
@@ -799,6 +824,48 @@ mod tests {
         assert_eq!((r.name.as_str(), r.unread), ("review", 1));
     }
 
+    #[tokio::test]
+    async fn the_reason_clis_one_off_ask_sessions_are_sessions_like_any_other() {
+        let mut d = super::super::test_daemon(Default::default());
+        settled(&mut d);
+        let d = Arc::new(d);
+        let cli = |id: &str, keep: bool| HookCall {
+            agent: "cli".into(),
+            event: "stop".into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: Some(id.into()),
+            dirs: Vec::new(),
+            keep,
+        };
+        // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
+        d.hook(cli("ask-1a2b3c", false)).await.unwrap();
+        d.hook(cli("review", true)).await.unwrap();
+        for key in ["cli:ask-1a2b3c", "cli:review"] {
+            leave(&d, key, 2 * DAY);
+        }
+        mail(&d, "m1", "ask-1a2b3c");
+        mail(&d, "m2", "review");
+        // Neither is named to the person's other machines (each machine has its own).
+        assert!(d.presence_of(Vec::new()).kept.is_empty());
+        // A day on, the ask session is forgotten with its mail, as any session is; the mailbox stays, mail and all.
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.prune(&mut g);
+            assert!(g.store.session_by_key("cli:ask-1a2b3c").unwrap().is_none());
+            assert_eq!(g.store.unread_count(&d.addr("ask-1a2b3c")).unwrap(), 0);
+            assert!(g.store.session_by_key("cli:review").unwrap().is_some_and(|r| r.mailbox));
+            assert_eq!(g.store.unread_count(&d.addr("review")).unwrap(), 1);
+        }
+        // The terminal is always one of the person's own mailboxes, whoever registers it.
+        d.hook(cli("terminal", false)).await.unwrap();
+        assert!(d.inner.lock().unwrap().store.session_by_key(TERMINAL).unwrap().is_some_and(|r| r.mailbox));
+    }
+
     #[test]
     fn a_session_known_only_by_its_process_leaves_its_name_and_mail_to_the_next_in_its_place() {
         let d = super::super::test_daemon(Default::default());
@@ -828,6 +895,7 @@ mod tests {
             tier: Tier::Push,
             last_seen: util::now_ms() - 3_600_000,
             attached: true,
+            mailbox: false,
         };
         {
             let g = d.inner.lock().unwrap();
@@ -873,6 +941,7 @@ mod tests {
             tier: Tier::Push,
             last_seen: util::now_ms(),
             attached: true,
+            mailbox: false,
         };
         g.store.upsert_session(&r, &d.person).unwrap();
         assert!(g.store.session_by_name("api-claude").unwrap().is_none());
@@ -928,6 +997,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            keep: false,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
         assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
@@ -959,6 +1029,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            keep: false,
         }
     }
 
@@ -1199,6 +1270,7 @@ mod tests {
             doing: None,
             name: Some("terminal".into()),
             dirs: Vec::new(),
+            keep: false,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
@@ -1221,6 +1293,7 @@ mod tests {
             tier: Tier::Push,
             last_seen: util::now_ms(),
             attached: true,
+            mailbox: false,
         };
         d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         assert_eq!(join(&d, claude("old")).name, "api-claude");
@@ -1268,6 +1341,7 @@ mod tests {
                     tier: Tier::Pull,
                     last_seen: now - 1_000 * (120 - i),
                     attached: true,
+                    mailbox: false,
                 };
                 g.store.upsert_session(&r, &d.person).unwrap();
             }
@@ -1371,6 +1445,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
+            keep: false,
         };
         // Working in /work/api, with /work/private open too.
         let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();

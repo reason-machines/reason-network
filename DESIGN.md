@@ -80,9 +80,11 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
   them.
 - The person's own mailboxes (`listen --as <name>`, `terminal`) are kept for good, on their own machine. `listen --as`
   a name that is kept for another session gets the next free one, and the name it asked for as soon as that is free
-  again (with the mail from the other).
+  again (with the mail from the other). Other `cli` sessions, such as the Reason CLI's one-off ask sessions, are
+  sessions like any other: forgotten a day after they were last seen.
 - Each machine has its own `terminal`: another machine's never makes it take a suffix. A teammate's machine shows a
-  message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine. On one of your machines
+  message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine, and the receipt of a
+  message to it names it that way too, so an answer with no `reply_to` matches what was asked. On one of your machines
   that has its own, `<you>/terminal` alone is that one; anywhere else, with two of yours on, it is ambiguous and the
   error names each `@<machine>`, as for any two sessions of one name. An engine from before this shows the message as
   from `<you>/terminal`, and couldn't tell two apart: while any machine in the team may be one (its presence lacks the

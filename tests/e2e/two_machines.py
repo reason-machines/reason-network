@@ -396,10 +396,21 @@ out = codex.tool("send_message", {"to": "alex/*", "message": "x", "notify": True
 check("notify doesn't go to groups", "not a group" in out, out)
 # No waiting for presence: the terminal that just messaged alice can be answered at once.
 out = codex.tool("send_message", {"to": "alex/terminal", "message": "codex here: replying to your terminal"}, meta)
-check("an agent can reply at once to a terminal that just messaged it", "→ alex/terminal: queued" in out or "→ alex/terminal: delivered" in out, out)
+check("an agent can reply at once to a terminal that just messaged it", "→ alex/terminal@laptop: queued" in out or "→ alex/terminal@laptop: delivered" in out, out)
 time.sleep(1)
 out = cli("alex", "listen", "--as", "terminal", "--wait", "5")
 check("…and `reason network listen --as terminal` shows the reply", "replying to your terminal" in out and 'from="alice/work-codex"' in out, out)
+# An ask of a teammate's terminal, answered there with no reply_to: the ask's receipt names the terminal as the answer
+# comes from, which is how the Reason CLI tells the answer.
+out = codex.tool("send_message", {"to": "alex/terminal", "message": "codex here: ok to ship? (e2e test, ignore)"}, meta)
+asked = re.search(r"→ (\S+): ", out)
+check("a teammate's terminal is named in the receipt with its machine", asked is not None and asked.group(1) == "alex/terminal@laptop", out)
+cli("alex", "listen", "--as", "terminal", "--wait", "5")
+cli("alex", "send", "alice/work-codex", "--from", "alex/terminal", "yes, ship it")
+time.sleep(1)
+out = codex.tool("check_inbox", {}, meta)
+answer = re.search(r'from="([^"]+)"[^>]*>\s*yes, ship it', out)
+check("…and the answer comes from exactly that address", answer is not None and asked is not None and answer.group(1) == asked.group(1), out)
 cli("alice", "listen", "--as", "fresh", "--wait", "0")
 cli("alice", "send", "alex/terminal", "--from", "alice/fresh", "first words from a new session")
 out = cli("alex", "send", "alice/fresh", "answered at once")

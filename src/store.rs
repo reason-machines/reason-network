@@ -1,5 +1,5 @@
 //! SQLite: messages, and the sessions this machine has seen: live ones, ones gone for less than a day, and the
-//! person's own mailboxes (`cli`, such as `terminal`). Files that came with messages are saved in the inbox folder, one
+//! person's own mailboxes (`terminal`, `listen --as` names). Files that came with messages are saved in the inbox folder, one
 //! folder per message, and go with their message.
 
 use crate::{
@@ -60,6 +60,8 @@ pub struct Remembered {
     pub last_seen: i64,
     /// Whether it could ever be reached beyond its own hooks (see `Live::attached`).
     pub attached: bool,
+    /// One of the person's own mailboxes (`terminal`, a `listen --as` name): kept for good, never forgotten.
+    pub mailbox: bool,
 }
 
 impl Remembered {
@@ -109,7 +111,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     doing TEXT,
     tier TEXT NOT NULL,
     last_seen INTEGER NOT NULL,
-    attached INTEGER NOT NULL DEFAULT 1
+    attached INTEGER NOT NULL DEFAULT 1,
+    mailbox INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
 CREATE TABLE IF NOT EXISTS counts (
@@ -121,7 +124,7 @@ CREATE TABLE IF NOT EXISTS counts (
 
 const MESSAGE_COLS: &str =
     "id, sender, sender_agent, sender_repo, recipient, via, reply_to, body, wake, sent_at, approval, files";
-const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached";
+const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox";
 
 impl Store {
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
@@ -154,6 +157,19 @@ impl Store {
         // remembered from before count as reachable, so their names stay theirs.
         if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'attached'")?.exists([])? {
             db.execute("ALTER TABLE sessions ADD COLUMN attached INTEGER NOT NULL DEFAULT 1", [])?;
+        }
+        // Added when the person's own mailboxes were told from other `cli` sessions. Before, every `cli` session was
+        // kept for good; of those remembered, the Reason CLI's one-off ask sessions (`ask-` and six hex digits, as it
+        // names them) are sessions like any other from now on.
+        if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'mailbox'")?.exists([])? {
+            let tx = db.unchecked_transaction()?;
+            tx.execute("ALTER TABLE sessions ADD COLUMN mailbox INTEGER NOT NULL DEFAULT 0", [])?;
+            tx.execute(
+                "UPDATE sessions SET mailbox = 1 WHERE agent = 'cli'
+                 AND NOT (length(name) = 10 AND name GLOB 'ask-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]')",
+                [],
+            )?;
+            tx.commit()?;
         }
         Ok(Store { db, inbox })
     }
@@ -467,12 +483,25 @@ impl Store {
         // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
             &format!(
-                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT (name) DO UPDATE SET key = ?2, agent = ?3, cwd = ?4, repo = ?5, branch = ?6,
                  doing = ?7, tier = ?8, last_seen = ?9,
-                 attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END"
+                 attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END,
+                 mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END"
             ),
-            params![s.name, s.key, s.agent, s.cwd, s.repo, s.branch, s.doing, s.tier.as_str(), s.last_seen, s.attached],
+            params![
+                s.name,
+                s.key,
+                s.agent,
+                s.cwd,
+                s.repo,
+                s.branch,
+                s.doing,
+                s.tier.as_str(),
+                s.last_seen,
+                s.attached,
+                s.mailbox
+            ],
         )?;
         Ok(())
     }
@@ -482,12 +511,12 @@ impl Store {
         Ok(())
     }
 
-    /// Forgets the sessions not seen since `before`, other than `live` ones and the person's own mailboxes (`cli`), and
+    /// Forgets the sessions not seen since `before`, other than `live` ones and the person's own mailboxes (`mailbox`), and
     /// deletes the mail they never read, so a session that takes the name later doesn't get it (see `forget_session`).
     pub fn forget_sessions(&self, before: i64, live: &HashSet<&str>, person: &str) -> Result<()> {
         let mut st = self
             .db
-            .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND agent != 'cli'"))?;
+            .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND mailbox = 0"))?;
         let gone: Vec<Remembered> = st.query_map([before], remembered)?.collect::<rusqlite::Result<_>>()?;
         for r in gone.iter().filter(|r| !live.contains(r.name.as_str())) {
             self.forget_session(r, person)?;
@@ -578,6 +607,7 @@ fn remembered(r: &Row) -> rusqlite::Result<Remembered> {
         tier: Tier::parse(&r.get::<_, String>(7)?),
         last_seen: r.get(8)?,
         attached: r.get(9)?,
+        mailbox: r.get(10)?,
     })
 }
 
@@ -712,6 +742,7 @@ mod tests {
         let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
         let day = 86_400_000;
         let session = |name: &str, agent: &str, last_seen: i64| Remembered {
+            mailbox: agent == "cli",
             name: name.into(),
             key: name.into(),
             agent: agent.into(),
@@ -776,6 +807,7 @@ mod tests {
             tier: Tier::Push,
             last_seen,
             attached: true,
+            mailbox: false,
         };
         // As older engines could: the same session under two names, mail waiting under each.
         for (name, seen) in [("api-claude", 1), ("api-claude-2", 2)] {
@@ -784,7 +816,7 @@ mod tests {
                 .db
                 .execute(
                     &format!(
-                        "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, 1)"
+                        "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, 1, 0)"
                     ),
                     params![s.name, s.key, s.agent, s.cwd, s.tier.as_str(), s.last_seen],
                 )
@@ -821,6 +853,40 @@ mod tests {
             approval: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_store_from_before_keeps_the_persons_mailboxes_but_not_the_clis_ask_sessions() {
+        let dir = std::env::temp_dir().join(format!("reason-network-mailbox-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("network.db");
+        {
+            // The sessions table as 0.12.7 left it.
+            let old = Connection::open(&db).unwrap();
+            old.execute_batch(
+                "CREATE TABLE sessions (name TEXT PRIMARY KEY, key TEXT NOT NULL, agent TEXT NOT NULL, cwd TEXT NOT NULL,
+                 repo TEXT, branch TEXT, doing TEXT, tier TEXT NOT NULL, last_seen INTEGER NOT NULL,
+                 attached INTEGER NOT NULL DEFAULT 1);
+                 INSERT INTO sessions (name, key, agent, cwd, tier, last_seen) VALUES
+                 ('terminal', 'cli:terminal', 'cli', '~', 'pull', 0),
+                 ('review', 'cli:review', 'cli', '~', 'pull', 0),
+                 ('ask-1a2b3c', 'cli:ask-1a2b3c', 'cli', '~', 'pull', 0),
+                 ('ask-lunch', 'cli:ask-lunch', 'cli', '~', 'pull', 0),
+                 ('api-claude', 'claude-code:a', 'claude-code', '~', 'push', 0);",
+            )
+            .unwrap();
+        }
+        let mailboxes = |store: &Store| -> Vec<String> {
+            store.sessions().unwrap().into_iter().filter(|s| s.mailbox).map(|s| s.name).collect()
+        };
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert_eq!(mailboxes(&store), ["ask-lunch", "review", "terminal"]);
+        drop(store);
+        // Opened again, nothing changes.
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert_eq!(mailboxes(&store), ["ask-lunch", "review", "terminal"]);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn temp_inbox() -> PathBuf {
@@ -990,6 +1056,7 @@ mod tests {
             tier: Tier::Push,
             last_seen: 0,
             attached: true,
+            mailbox: false,
         };
         store.upsert_session(&session("gone"), "lars").unwrap();
         store.upsert_session(&session("api"), "lars").unwrap();
