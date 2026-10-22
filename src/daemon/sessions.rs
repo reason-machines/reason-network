@@ -68,6 +68,18 @@ impl Daemon {
         if g.off.contains_key(&key) {
             bail!(OFF_HERE);
         }
+        // An agent with an MCP server per session is in one conversation at a time: the one its server registers now
+        // ends any other it served (Claude Code's `/clear`, which runs no new server). Also when the new one is known
+        // already, from its hooks or Claude Code's registry.
+        if conn.is_some() && !agent::multiplexed(&reg.agent) {
+            let before: Vec<String> = g
+                .live
+                .iter()
+                .filter(|(k, l)| l.conn == conn && l.reg.agent == reg.agent && **k != key)
+                .map(|(k, _)| k.clone())
+                .collect();
+            self.moved_on(g, before, &key, now);
+        }
         if let Some(l) = g.live.get_mut(&key) {
             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
             if conn.is_some() {
@@ -166,6 +178,17 @@ impl Daemon {
             let r = remembered(l, util::now_ms());
             if let Err(e) = g.store.upsert_session(&r, &self.person) {
                 log(&format!("remembering {key}: {e:#}"));
+            }
+        }
+    }
+
+    /// Ends sessions whose agent is in conversation `key` now: they are offline from here on, their names kept for them.
+    pub(super) fn moved_on(&self, g: &mut Inner, keys: Vec<String>, key: &str, now: i64) {
+        for k in keys {
+            if let Some(l) = g.live.remove(&k) {
+                let _ = g.store.touch_session(&l.name, now);
+                log(&format!("session {} ({k}) ended: its agent moved on to {key}", self.addr(&l.name)));
+                self.presence_changed();
             }
         }
     }
@@ -580,8 +603,15 @@ mod tests {
         }
     }
 
+    /// Registers a session through an MCP server of its own, as Claude Code runs one per session.
     fn join(d: &Daemon, reg: SessionReg) -> Registered {
-        d.register_quiet(Some(1), reg, GitInfo::default()).unwrap().0
+        let conn = conn_of(&reg.key);
+        d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap().0
+    }
+
+    /// The connection of the MCP server `join` registers a session through.
+    fn conn_of(key: &str) -> u64 {
+        key.bytes().fold(7, |h: u64, b| h.wrapping_mul(31).wrapping_add(b.into()))
     }
 
     /// Takes a session here offline, last seen `ago` before now.
@@ -672,7 +702,7 @@ mod tests {
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
         d.hook(call("a")).await.unwrap();
-        d.drop_conn(1);
+        d.drop_conn(conn_of("claude-code:a"));
         d.hook(HookCall { event: "end".into(), ..call("a") }).await.unwrap();
         mail(&d, "m1", "api-claude");
         assert_eq!(d.hook(call("b")).await.unwrap().address, Some(d.addr("api-claude-2")));
@@ -1203,6 +1233,53 @@ mod tests {
         let g = d.inner.lock().unwrap();
         assert_eq!(g.live.keys().collect::<Vec<_>>(), ["codex:2"]);
         assert!(g.store.session_by_key("codex:1").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_new_conversation_from_the_same_mcp_server_ends_the_one_before() {
+        let d = super::super::test_daemon(Default::default());
+        let reg = |key: &str, agent: &str| SessionReg {
+            key: key.into(),
+            agent: agent.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        // Claude Code's `/clear`: its MCP server now registers the new conversation.
+        assert_eq!(
+            d.register_quiet(Some(1), reg("claude-code:a", "claude-code"), GitInfo::default()).unwrap().0.name,
+            "api-claude"
+        );
+        d.register_quiet(Some(2), reg("claude-code:other", "claude-code"), GitInfo::default()).unwrap();
+        let (r, _) = d.register_quiet(Some(1), reg("claude-code:b", "claude-code"), GitInfo::default()).unwrap();
+        // The cleared conversation keeps its name: `/resume` can bring it back.
+        assert_eq!(r.name, "api-claude-3");
+        assert!(d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap().unwrap().kept());
+        let live = |d: &Daemon| {
+            let mut k: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(live(&d), ["claude-code:b", "claude-code:other"]);
+        // The registry scan can register the new conversation before the server's next call does: its call then still
+        // ends the one before.
+        d.register_quiet(
+            None,
+            SessionReg { tier: Tier::Push, ..reg("claude-code:c", "claude-code") },
+            GitInfo::default(),
+        )
+        .unwrap();
+        d.register_quiet(Some(1), reg("claude-code:c", "claude-code"), GitInfo::default()).unwrap();
+        assert_eq!(live(&d), ["claude-code:c", "claude-code:other"]);
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live["claude-code:c"].conn, Some(1));
+        drop(g);
+        // One shared MCP server serves many sessions at once.
+        d.register_quiet(Some(3), reg("codex:1", "codex"), GitInfo::default()).unwrap();
+        d.register_quiet(Some(3), reg("codex:2", "codex"), GitInfo::default()).unwrap();
+        assert_eq!(live(&d), ["claude-code:c", "claude-code:other", "codex:1", "codex:2"]);
     }
 
     #[tokio::test]

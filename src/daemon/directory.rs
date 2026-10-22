@@ -70,29 +70,8 @@ impl Daemon {
         if claude::wired() {
             let now = util::now_ms();
             for c in &claude {
-                let Some(id) = &c.session_id else { continue };
-                let key = format!("{}:{id}", agent::CLAUDE_CODE);
-                if !self.inner.lock().unwrap().live.contains_key(&key) {
-                    let cwd = c.cwd.clone().unwrap_or_else(|| "/".into());
-                    let git = gits.get(&cwd).cloned().unwrap_or_default();
-                    let named = matches!(c.name_source.as_deref(), Some("user" | "peer" | "hook" | "auto"));
-                    let reg = SessionReg {
-                        key: key.clone(),
-                        agent: agent::CLAUDE_CODE.into(),
-                        cwd,
-                        agent_session_id: Some(id.clone()),
-                        pid: Some(c.pid),
-                        tier: Tier::Push,
-                        name: if named { c.label() } else { None },
-                    };
-                    if let Err(e) = self.register(None, reg, git) {
-                        super::log(&format!("adding Claude session {id}: {e:#}"));
-                    }
-                }
-                // Seen alive just now (it goes when its process does).
-                if let Some(l) = self.inner.lock().unwrap().live.get_mut(&key) {
-                    l.last_hook = Some(now);
-                }
+                let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
+                self.claude_seen(c, git, now);
             }
         }
         // A Claude Code session someone renamed goes by that name here too.
@@ -171,6 +150,43 @@ impl Daemon {
             }
         }
         Ok(rows)
+    }
+
+    /// A live Claude Code session in Claude Code's own registry: on the team, and the conversation its process is in.
+    fn claude_seen(self: &Arc<Self>, c: &ClaudeSession, git: GitInfo, now: i64) {
+        let Some(id) = &c.session_id else { return };
+        let key = format!("{}:{id}", agent::CLAUDE_CODE);
+        // Its process is in this conversation now: after `/clear`, the one it was in has ended, though its MCP server
+        // (which the registration names by this process) hasn't said so; until then mail for it would go to this one.
+        {
+            let mut g = self.inner.lock().unwrap();
+            let before: Vec<String> = g
+                .live
+                .iter()
+                .filter(|(k, l)| l.reg.agent == agent::CLAUDE_CODE && l.reg.pid == Some(c.pid) && **k != key)
+                .map(|(k, _)| k.clone())
+                .collect();
+            self.moved_on(&mut g, before, &key, now);
+        }
+        if !self.inner.lock().unwrap().live.contains_key(&key) {
+            let named = matches!(c.name_source.as_deref(), Some("user" | "peer" | "hook" | "auto"));
+            let reg = SessionReg {
+                key: key.clone(),
+                agent: agent::CLAUDE_CODE.into(),
+                cwd: c.cwd.clone().unwrap_or_else(|| "/".into()),
+                agent_session_id: Some(id.clone()),
+                pid: Some(c.pid),
+                tier: Tier::Push,
+                name: if named { c.label() } else { None },
+            };
+            if let Err(e) = self.register(None, reg, git) {
+                super::log(&format!("adding Claude session {id}: {e:#}"));
+            }
+        }
+        // Seen alive just now (it goes when its process does).
+        if let Some(l) = self.inner.lock().unwrap().live.get_mut(&key) {
+            l.last_hook = Some(now);
+        }
     }
 
     fn row(&self, name: &str, agent: &str, cwd: &str, git: Option<&GitInfo>) -> SessionInfo {
@@ -478,6 +494,52 @@ fn claude_match(c: &ClaudeSession, reg: &SessionReg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn after_clear_the_registry_ends_the_cleared_conversation_before_any_tool_call() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        // A live process, standing in for Claude Code's.
+        let pid = std::process::id();
+        let reg = |key: &str, agent: &str, cwd: &str, conn: u64| {
+            let reg = SessionReg {
+                key: key.into(),
+                agent: agent.into(),
+                cwd: cwd.into(),
+                agent_session_id: None,
+                pid: Some(pid),
+                tier: Tier::Push,
+                name: None,
+            };
+            d.register(Some(conn), reg, GitInfo::default()).unwrap().name
+        };
+        // A Claude Code session, registered by its MCP server under its process; and another agent run from it.
+        assert_eq!(reg("claude-code:before", agent::CLAUDE_CODE, "/work/api", 1), "api-claude");
+        reg("codex:1", "codex", "/work/web", 2);
+        // `/clear`: Claude Code's registry names the new conversation; its MCP server hasn't made a call since.
+        let entry: ClaudeSession = serde_json::from_value(serde_json::json!({
+            "pid": pid, "sessionId": "after", "cwd": "/work/api", "kind": "interactive"
+        }))
+        .unwrap();
+        d.claude_seen(&entry, GitInfo::default(), util::now_ms());
+        let mut live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+        live.sort();
+        // Another agent's session from that process stays.
+        assert_eq!(live, ["claude-code:after", "codex:1"]);
+        // Mail for the cleared conversation waits for it; the new one, api-claude-2, gets none of it.
+        let res = d
+            .send("codex:1".into(), "api-claude", "for the old one", None, true, false, None, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        assert!(
+            res.recipients[0].note.ends_with("it reaches that session when it's back"),
+            "{}",
+            res.recipients[0].note
+        );
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live["claude-code:after"].name, "api-claude-2");
+        assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+    }
 
     #[test]
     fn each_machine_answers_for_its_own_terminal() {

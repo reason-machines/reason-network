@@ -82,8 +82,15 @@ pub fn multiplexed(agent: &str) -> bool {
 }
 
 /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
+/// Claude Code's is read from its session registry first: `/clear` starts a new conversation in the same process, and
+/// the variable it gave us at start still names the old one.
 pub fn env_session_id(agent: &str) -> Option<String> {
     if let Some(id) = crate::paths::env_var("SESSION").ok().filter(|s| !s.is_empty()) {
+        return Some(id);
+    }
+    if agent == CLAUDE_CODE
+        && let Some(id) = claude_pid().and_then(|pid| registry_session_id(&paths::claude_sessions(), pid))
+    {
         return Some(id);
     }
     let var = match agent {
@@ -200,6 +207,73 @@ pub fn agent_pid() -> u32 {
     std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()).unwrap_or_else(util::parent_pid)
 }
 
+/// The Claude Code process we run under, if any: the nearest of our ancestors with an entry in its session registry (a
+/// shell or a launcher can sit between), else `CLAUDE_PID` when Claude Code sets it. Kept once found: it is the same for
+/// our whole life. Not found, it is looked for again after a while (Claude Code may not have written its entry yet), not
+/// on every call: each look can run `ps` for each ancestor.
+pub fn claude_pid() -> Option<u32> {
+    static PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static MISSED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if let Some(pid) = PID.get() {
+        return Some(*pid);
+    }
+    if MISSED.lock().unwrap().is_some_and(|t| t.elapsed() < LOOK_AGAIN) {
+        return None;
+    }
+    let dir = paths::claude_sessions();
+    let found = registry_ancestor(util::parent_pid(), |p| dir.join(format!("{p}.json")).is_file(), parent_of)
+        .or_else(|| std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()));
+    match found {
+        Some(pid) => {
+            let _ = PID.set(pid);
+        }
+        None => *MISSED.lock().unwrap() = Some(std::time::Instant::now()),
+    }
+    found
+}
+
+/// How long `claude_pid` goes by not having found the Claude process before it looks again.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The nearest of `pid` and its ancestors (a few levels up) that `has_entry`.
+fn registry_ancestor(
+    mut pid: u32,
+    has_entry: impl Fn(u32) -> bool,
+    parent: impl Fn(u32) -> Option<u32>,
+) -> Option<u32> {
+    for _ in 0..5 {
+        if has_entry(pid) {
+            return Some(pid);
+        }
+        match parent(pid) {
+            Some(p) if p > 1 && p != pid => pid = p,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// A process's parent: from `/proc` on Linux, else as `ps` (or Windows) says.
+fn parent_of(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    return stat_parent(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?);
+    #[cfg(not(target_os = "linux"))]
+    return util::process(pid).map(|(parent, _)| parent);
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line: `<pid> (<name>) <state> <ppid> …`, where the name can hold spaces and
+/// parentheses of its own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_parent(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The conversation Claude Code process `pid` is in now, from its registry entry.
+fn registry_session_id(dir: &Path, pid: u32) -> Option<String> {
+    let s: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?).ok()?;
+    s["sessionId"].as_str().filter(|id| !id.is_empty()).map(str::to_string)
+}
+
 /// The inbox socket of the Claude Code session that spawned us. Posting a `user` frame there puts the text in
 /// the conversation between tool calls, or starts a turn if the session is idle.
 #[derive(Debug, Clone)]
@@ -214,7 +288,7 @@ pub fn claude_socket() -> Option<ClaudeSocket> {
         return Some(ClaudeSocket { path: path.into(), token });
     }
     // Not exported to this process: fall back to the session's registry entry.
-    let pid = agent_pid();
+    let pid = claude_pid().unwrap_or_else(agent_pid);
     let file = paths::claude_sessions().join(format!("{pid}.json"));
     let s: Value = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
     let path = s["messagingSocketPath"].as_str()?;
@@ -262,6 +336,45 @@ mod tests {
         assert_eq!(from_client_name("not-zcode"), None);
         assert_eq!(from_client_name("claude-ai"), Some("claude-desktop"));
         assert_eq!(from_client_name("example-client"), None);
+    }
+
+    #[test]
+    fn claude_codes_registry_names_the_conversation_its_process_is_in_now() {
+        let dir = std::env::temp_dir().join(format!("reason-network-claude-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // After `/clear`, the same process is in a new conversation.
+        std::fs::write(dir.join("4242.json"), r#"{"pid":4242,"sessionId":"after-clear","kind":"interactive"}"#)
+            .unwrap();
+        std::fs::write(dir.join("4343.json"), r#"{"pid":4343,"sessionId":""}"#).unwrap();
+        assert_eq!(registry_session_id(&dir, 4242).as_deref(), Some("after-clear"));
+        assert_eq!(registry_session_id(&dir, 4343), None);
+        assert_eq!(registry_session_id(&dir, 4444), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_claude_process_is_the_nearest_ancestor_with_a_registry_entry() {
+        // 900 (us) ← 800 (a shell) ← 700 (Claude Code, with an entry) ← 600 (another Claude Code, with one) ← 1.
+        let parent = |p: u32| match p {
+            900 => Some(800),
+            800 => Some(700),
+            700 => Some(600),
+            600 => Some(1),
+            _ => None,
+        };
+        assert_eq!(registry_ancestor(900, |p| p == 700 || p == 600, parent), Some(700));
+        assert_eq!(registry_ancestor(900, |p| p == 600, parent), Some(600));
+        assert_eq!(registry_ancestor(900, |_| false, parent), None);
+        // Not past init, nor round a loop.
+        assert_eq!(registry_ancestor(900, |p| p == 1, parent), None);
+        assert_eq!(registry_ancestor(5, |_| false, |_| Some(5)), None);
+    }
+
+    #[test]
+    fn a_parent_is_read_from_proc_stat() {
+        assert_eq!(stat_parent("4242 (claude) S 4100 4242 4100 0 -1 4194560"), Some(4100));
+        assert_eq!(stat_parent("4242 (node (my) ) app) R 77 1 1"), Some(77));
+        assert_eq!(stat_parent("garbage"), None);
     }
 
     #[test]

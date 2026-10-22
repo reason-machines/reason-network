@@ -60,7 +60,7 @@ impl Link {
 
     pub async fn register(self: &Arc<Self>, reg: SessionReg) -> Result<Registered> {
         let r = self.call(Request::Register { session: reg.clone() }).await?;
-        self.regs.lock().unwrap().insert(reg.key.clone(), reg);
+        remember(&mut self.regs.lock().unwrap(), reg);
         Ok(r)
     }
 
@@ -246,8 +246,39 @@ fn detach(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| cmd.creation_flags(flags).spawn())
 }
 
+/// Remembers a registration, to make again after a reconnect. An agent with an MCP server per session is in one
+/// conversation at a time: a new one (Claude Code's `/clear`) replaces the one before, which must not come back.
+fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
+    if !crate::agent::multiplexed(&reg.agent) {
+        regs.retain(|_, r| r.agent != reg.agent);
+    }
+    regs.insert(reg.key.clone(), reg);
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reconnect_registers_only_the_conversation_a_server_is_in_now() {
+        let reg = |key: &str, agent: &str| crate::proto::SessionReg {
+            key: key.into(),
+            agent: agent.into(),
+            cwd: "/".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: crate::proto::Tier::Pull,
+            name: None,
+        };
+        let mut regs = super::HashMap::new();
+        super::remember(&mut regs, reg("claude-code:before-clear", "claude-code"));
+        super::remember(&mut regs, reg("claude-code:after-clear", "claude-code"));
+        // A shared server (Codex's) serves several at once.
+        super::remember(&mut regs, reg("codex:1", "codex"));
+        super::remember(&mut regs, reg("codex:2", "codex"));
+        let mut keys: Vec<&String> = regs.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["claude-code:after-clear", "codex:1", "codex:2"]);
+    }
+
     #[test]
     fn a_daemon_runs_only_while_it_holds_the_lock() {
         let dir = std::env::temp_dir().join(format!("reason-network-lock-{}", std::process::id()));
