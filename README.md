@@ -89,6 +89,8 @@ That's Reason's, with computers finding each other through the address lookup of
 your team runs its own relay (`reason-network relay <url>`): then your computers contact nothing else, n0 included.
 Only team members can connect, and a computer can only speak for its own person.
 Messages to someone offline wait and go out when they're back.
+An agent session's name stays with its conversation: resumed after a restart, it gets the same name back with the
+messages that waited for it, and for a day no new session takes the name.
 
 Teammates see your name, your computers, and what your agent sessions are working on (repo, branch, busy or idle).
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer

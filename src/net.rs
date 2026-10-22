@@ -60,6 +60,10 @@ pub struct Presence {
     pub sessions: Vec<SessionInfo>,
     /// Names of this machine's offline sessions, so mail for them can be queued here.
     pub known: Vec<String>,
+    /// Of those, the ones kept for their own sessions (conversations that can come back to them): the person's other
+    /// machines give none of them to a new session. Older engines leave it out, and ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<String>,
     /// What this machine's engine takes beyond what every version does (`files`). Older engines leave it out, and
     /// ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1094,6 +1098,13 @@ fn tidy_presence(mut p: Presence) -> Presence {
         .map(|n| util::slug(n).chars().take(64).collect())
         .filter(|n: &String| !n.is_empty())
         .collect();
+    p.kept = p
+        .kept
+        .iter()
+        .take(100)
+        .map(|n| util::slug(n).chars().take(64).collect())
+        .filter(|n: &String| !n.is_empty())
+        .collect();
     p.features.truncate(20);
     p.features.iter_mut().for_each(|f| *f = util::slug(f).chars().take(32).collect());
     p
@@ -1194,7 +1205,7 @@ mod tests {
             unread: 0,
             is_me: false,
         };
-        let p = tidy_presence(Presence { sessions: vec![s], known: vec![], features: vec![] });
+        let p = tidy_presence(Presence { sessions: vec![s], ..Default::default() });
         let d = crate::proto::Directory {
             team: None,
             person: "alex".into(),
@@ -1345,5 +1356,29 @@ mod tests {
         let older: Presence = serde_json::from_str(r#"{"sessions":[],"known":[]}"#).unwrap();
         assert!(!older.has("files"));
         assert!(tidy_presence(Presence { features: vec!["files".into()], ..Default::default() }).has("files"));
+    }
+
+    #[test]
+    fn presence_says_which_names_are_kept_and_older_engines_read_it_as_before() {
+        let new = Presence { known: vec!["api-claude".into()], kept: vec!["api-claude".into()], ..Default::default() };
+        let wire = serde_json::to_string(&Wire::Presence { presence: new }).unwrap();
+        #[derive(Deserialize)]
+        struct OlderPresence {
+            known: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum OlderWire {
+            Presence { presence: OlderPresence },
+        }
+        let OlderWire::Presence { presence } = serde_json::from_str(&wire).unwrap();
+        assert_eq!(presence.known, ["api-claude"]);
+        // An older engine keeps no names from new sessions on the person's other machines; nothing is sent when none are.
+        let older: Presence = serde_json::from_str(r#"{"sessions":[],"known":["api-claude"]}"#).unwrap();
+        assert!(older.kept.is_empty());
+        assert!(!serde_json::to_string(&older).unwrap().contains("kept"));
+        // Kept names are names like any other a teammate's machine sends.
+        let p = tidy_presence(Presence { kept: vec!["<API Claude>".into(), "!!".into()], ..Default::default() });
+        assert_eq!(p.kept, ["api-claude"]);
     }
 }

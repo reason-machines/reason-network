@@ -60,6 +60,15 @@ pub struct Remembered {
     pub last_seen: i64,
 }
 
+impl Remembered {
+    /// Whether the name stays this session's while it is offline: it is an agent's conversation, by the id its agent
+    /// gave it (`<agent>:<id>`), so the same conversation can come back to it, or one of the person's own mailboxes
+    /// (`cli:<name>`). A session known only by its process (`proc:<pid>`) has nothing that could come back.
+    pub fn kept(&self) -> bool {
+        !self.key.starts_with("proc:")
+    }
+}
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS messages (
@@ -436,7 +445,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_session(&self, s: &Remembered) -> Result<()> {
+    /// Remembers a session under its name. A session has one name: if it had another before (its own was taken by a
+    /// live session meanwhile), that one goes, and its unread mail comes along to the new one.
+    pub fn upsert_session(&self, s: &Remembered, person: &str) -> Result<()> {
+        let before: Vec<String> = {
+            let mut st = self.db.prepare_cached("SELECT name FROM sessions WHERE key = ?1 AND name != ?2")?;
+            st.query_map(params![s.key, s.name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for old in before {
+            self.rename(&old, &s.name, &format!("{person}/{old}"), &format!("{person}/{}", s.name))?;
+        }
         self.db.execute(
             &format!(
                 "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -460,18 +478,24 @@ impl Store {
         let mut st = self.db.prepare_cached("SELECT name FROM sessions WHERE last_seen < ?1 AND agent != 'cli'")?;
         let gone: Vec<String> = st.query_map([before], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         for name in gone.iter().filter(|n| !live.contains(n.as_str())) {
-            let unread = "FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0";
-            let to = format!("{person}/{name}");
-            let mut cols = self.db.prepare_cached(&format!("SELECT files {unread} AND files IS NOT NULL"))?;
-            let cols: Vec<String> = cols.query_map([&to], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-            self.db.execute(&format!("DELETE {unread}"), [&to])?;
-            for kept in cols.iter().filter_map(|c| serde_json::from_str::<Kept>(c).ok()) {
-                if let Some(dir) = self.dir(&kept) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            }
-            self.db.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+            self.forget_session(name, person)?;
         }
+        Ok(())
+    }
+
+    /// Forgets one session, with the mail it never read and that mail's files (mail held for the person stays).
+    pub fn forget_session(&self, name: &str, person: &str) -> Result<()> {
+        let unread = "FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0";
+        let to = format!("{person}/{name}");
+        let mut cols = self.db.prepare_cached(&format!("SELECT files {unread} AND files IS NOT NULL"))?;
+        let cols: Vec<String> = cols.query_map([&to], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        self.db.execute(&format!("DELETE {unread}"), [&to])?;
+        for kept in cols.iter().filter_map(|c| serde_json::from_str::<Kept>(c).ok()) {
+            if let Some(dir) = self.dir(&kept) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        self.db.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
         Ok(())
     }
 
@@ -684,7 +708,7 @@ mod tests {
             session("still-up", "claude-code", 0),
             session("terminal", "cli", 0),
         ] {
-            store.upsert_session(&s).unwrap();
+            store.upsert_session(&s, "lars").unwrap();
         }
         let to = |id: &str, name: &str| Message {
             id: id.into(),
@@ -712,6 +736,64 @@ mod tests {
         assert_eq!(store.unread_count("lars/recent").unwrap(), 1);
         assert_eq!(store.unread_count("lars/terminal").unwrap(), 1);
         assert_eq!(store.held().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_session_has_one_name_and_one_an_older_engine_left_under_two_is_folded_into_its_latest() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = |name: &str, last_seen: i64| Remembered {
+            name: name.into(),
+            key: "claude-code:a".into(),
+            agent: "claude-code".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen,
+        };
+        // As older engines could: the same session under two names, mail waiting under each.
+        for (name, seen) in [("api-claude", 1), ("api-claude-2", 2)] {
+            let s = session(name, seen);
+            store
+                .db
+                .execute(
+                    &format!("INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)"),
+                    params![s.name, s.key, s.agent, s.cwd, s.tier.as_str(), s.last_seen],
+                )
+                .unwrap();
+        }
+        for (id, name) in [("1", "api-claude"), ("2", "api-claude-2")] {
+            store.insert(&mut message(id, &format!("lars/{name}")), false).unwrap();
+        }
+        assert_eq!(store.session_by_key("claude-code:a").unwrap().unwrap().name, "api-claude-2");
+        store.upsert_session(&session("api-claude-2", 3), "lars").unwrap();
+        let names: Vec<String> = store.sessions().unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["api-claude-2"]);
+        assert_eq!(store.unread_count("lars/api-claude-2").unwrap(), 2);
+        // Under a new name, the old one goes, and its mail comes along.
+        store.upsert_session(&session("auth", 4), "lars").unwrap();
+        let names: Vec<String> = store.sessions().unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["auth"]);
+        assert_eq!(store.unread_count("lars/auth").unwrap(), 2);
+    }
+
+    fn message(id: &str, to: &str) -> Message {
+        Message {
+            id: id.into(),
+            from: "sven/claude".into(),
+            from_agent: None,
+            from_repo: None,
+            to: to.into(),
+            via: None,
+            reply_to: None,
+            body: "hi".into(),
+            wake: false,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        }
     }
 
     fn temp_inbox() -> PathBuf {
@@ -881,8 +963,8 @@ mod tests {
             tier: Tier::Push,
             last_seen: 0,
         };
-        store.upsert_session(&session("gone")).unwrap();
-        store.upsert_session(&session("api")).unwrap();
+        store.upsert_session(&session("gone"), "lars").unwrap();
+        store.upsert_session(&session("api"), "lars").unwrap();
         let mut gone = with_files("01GONE", "lars/gone");
         store.insert(&mut gone, false).unwrap();
         let mut stored = HashMap::new();

@@ -54,8 +54,29 @@ The groups (`alice/*`, `repo:`, `*`, with or without `@machine`) are for a perso
 one session.
 
 Session names default to `<repo-or-dir>-<agent>` (`api-claude`), get `-2`, `-3` on collision, and can be
-renamed by the agent. A new session in the same place with the same agent **inherits a stale name and its
-unread mail**, so "tell the api agent X" survives restarts (idea from agentbus).
+renamed by the agent.
+
+**A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
+conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table.
+
+- The same conversation coming back (the agent restarted or resumed it, or the daemon restarted) gets its name back,
+  with the mail that waited for it, whichever sessions register first.
+- While it is offline, its name is **kept**: a new session, on this machine or another of the person's, gets the next
+  free name, also when it asks for that one (`listen --as`, a Claude Code session's own name), and a rename into it is
+  refused (`'api-claude' belongs to a session that is offline (last seen 3h ago); pick another name`).
+- The name lapses when its session would be forgotten (below: a day after it was last seen, never in the hours after the
+  daemon starts). Then it is free again, without that session's unread mail, which is dropped as the sender was told:
+  mail is never another conversation's. A conversation back after that is a new session.
+- A conversation whose name a live session has when it comes back (only an older engine on another of the person's
+  machines gives a kept name out) gets a new name, and its waiting mail moves to it.
+- The person's own mailboxes (`listen --as <name>`, `terminal`) are kept for good, on their own machine: each machine
+  has its own `terminal`.
+- Names are kept per machine: the same conversation turning up on another machine is a new session there, and mail
+  queued for it stays where it was.
+- A session whose agent gives it no id (`proc:<pid>`, one per MCP process: DeepSeek Harness, ZCode, and MCP clients
+  such as Claude Desktop, Zed or Amp) can't come back, so its name isn't kept: a new session in the same place with the
+  same agent takes the stale name and its unread mail, so "tell the api agent X" survives restarts (idea from
+  agentbus).
 
 ## Architecture
 
@@ -164,7 +185,9 @@ machine asked is that old, nothing tells the joiner it's the same account, and t
 **Presence and directory.** Daemons keep a connection to every online member (full mesh; fine to ~50
 machines). On connect they exchange roster heads (anti-entropy) and full presence. On any local change a
 daemon pushes `Presence{machine, seq, sessions[], human_status}` to all peers. A dropped connection marks
-that machine offline (sessions shown with last-seen).
+that machine offline (sessions shown with last-seen). Presence also names the machine's offline sessions (`known`, so
+mail for them is queued there) and, of those, the ones whose names are kept (`kept`, which the person's other machines
+give to no new session; older engines leave it out and ignore it).
 
 **Messages.** `Envelope{id: ulid, from, to, reply_to, thread, body, sent_at}` sent directly to each target
 machine on ALPN `tincan/1`, length-prefixed JSON frames. The receiver persists, then acks with
@@ -172,7 +195,10 @@ machine on ALPN `tincan/1`, length-prefixed JSON frames. The receiver persists, 
 outbox and retries when the target machine comes back. Mail for an offline session waits in the target
 machine's mailbox under the session name, for a day: a session gone longer is forgotten, with the mail it never
 read (not the person's own `listen` mailboxes, such as `terminal`, nor mail held for them; and nothing in the
-hours after the daemon starts, while live sessions register again).
+hours after the daemon starts, while live sessions register again). Until then the mail waits for that session, and the
+sender is told so ("…; it reaches that session when it's back"); for a session whose agent gives it no id, a new session
+that takes the name gets it, and the note says that instead. Live sessions are marked seen every 10 minutes, so a
+daemon that stops without seeing them go keeps their names from then.
 
 **Files.** A message can carry small text files (`files: [{name, content}]`, at most 10, 256 KB each, 512 KB in all;
 UTF-8 with no control characters but tab and line ends), inside the same envelope, so they are as authenticated as its
@@ -207,6 +233,25 @@ session connection also receives pushed `deliver` events for its sessions.
 2. Env: `CLAUDE_CODE_SESSION_ID` (Claude), `COPILOT_AGENT_SESSION_ID` (Copilot), `GROK_SESSION_ID` (Grok).
 3. Hook stdin `session_id` (`SessionStart`), correlated to the MCP process by agent PID ancestry.
 4. Fallback: one session per MCP process.
+
+The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each agent's id comes from:
+
+| Agent | Id | From |
+|---|---|---|
+| Claude Code | session id | `CLAUDE_CODE_SESSION_ID`, hooks' `session_id`, `~/.claude/sessions/<pid>.json` |
+| Codex | thread id | `_meta.sessionId` / `threadId`, `CODEX_THREAD_ID`, hooks' `session_id` |
+| opencode | session id | `_meta["ai.opencode/sessionID"]`, `OPENCODE_SESSION_ID`, the plugin's `--session` |
+| pi | session id | the extension's `REASON_NETWORK_SESSION` and `--session` |
+| Cursor | conversation id | hooks' `conversation_id` (its shared MCP server takes the session its hooks registered) |
+| Gemini CLI | session id | `GEMINI_SESSION_ID`, hooks' `session_id` |
+| Copilot CLI | session id | `COPILOT_AGENT_SESSION_ID`, hooks' `sessionId` |
+| Grok CLI | session id | `GROK_SESSION_ID`, hooks' `session_id` |
+| Reason | session id | `reason session list` |
+| `listen --as <name>`, `terminal` | the name | `cli:<name>` |
+| DeepSeek Harness, ZCode, other MCP clients | none | `proc:<pid>` (`REASON_NETWORK_SESSION`, when set, gives one) |
+
+A conversation keeps its name across a resume as long as its agent keeps the id (Claude Code does unless told to fork
+the session; `/clear` starts a new one).
 
 Agent kind comes from MCP `clientInfo.name` plus env (`CLAUDECODE`, `CODEX_*`, `GEMINI_CLI`,
 `CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`, `GROK_SESSION_ID`).

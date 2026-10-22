@@ -5,7 +5,16 @@
 //! don't show them a second time.
 
 use super::{Daemon, Inner, directory::Target, log};
-use crate::{agent, claude, config::Policy, files, proto::*, render, store::Counted, team::Signed, util};
+use crate::{
+    agent, claude,
+    config::Policy,
+    files,
+    proto::*,
+    render,
+    store::{Counted, Remembered},
+    team::Signed,
+    util,
+};
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
@@ -75,20 +84,23 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
                          looks like a loop. Check with your user before continuing.";
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
-/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then, a new session
-/// that takes the name gets the mail.
-fn offline_note(r: Option<&crate::store::Remembered>, now: i64) -> String {
+/// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then it waits for
+/// that session, when the session can come back to its name (see [`Remembered::kept`]); else a new session that takes
+/// the name gets it.
+fn offline_note(r: Option<&Remembered>, now: i64) -> String {
     const NAME: &str = "a new session that takes this name gets the mail";
+    const BACK: &str = "it reaches that session when it's back";
     let Some(r) = r else { return format!("queued: the session is offline; {NAME}") };
+    let who = if r.kept() { BACK } else { NAME };
     let seen = util::ago(r.last_seen, now);
     let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
     if r.agent == "cli" {
-        format!("queued: last seen {seen} ago; {NAME}")
+        format!("queued: last seen {seen} ago; {who}")
     } else if forgotten <= now {
-        format!("queued: last seen {seen} ago; unread mail may be dropped any time; {NAME}")
+        format!("queued: last seen {seen} ago; unread mail may be dropped any time; {who}")
     } else {
         let left = util::ago(now, forgotten);
-        format!("queued: last seen {seen} ago; unread mail is dropped after about {left} if it stays offline; {NAME}")
+        format!("queued: last seen {seen} ago; unread mail is dropped after about {left} if it stays offline; {who}")
     }
 }
 
@@ -788,9 +800,9 @@ mod tests {
 
     #[test]
     fn queued_mail_says_when_it_may_be_dropped_and_who_gets_it() {
-        let seen = |agent: &str| crate::store::Remembered {
+        let seen = |key: &str, agent: &str| Remembered {
             name: "api-codex".into(),
-            key: "codex:1".into(),
+            key: key.into(),
             agent: agent.into(),
             cwd: "/work/api".into(),
             repo: None,
@@ -799,17 +811,24 @@ mod tests {
             tier: Tier::Pull,
             last_seen: 0,
         };
-        let name = "a new session that takes this name gets the mail";
+        // A conversation its agent gave an id waits for it, whoever takes the name meanwhile.
+        let back = "it reaches that session when it's back";
         assert_eq!(
-            offline_note(Some(&seen("codex")), 3 * HOUR),
-            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
+            offline_note(Some(&seen("codex:1", "codex")), 3 * HOUR),
+            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {back}")
         );
         assert_eq!(
-            offline_note(Some(&seen("codex")), 24 * HOUR),
-            format!("queued: last seen 1d ago; unread mail may be dropped any time; {name}")
+            offline_note(Some(&seen("codex:1", "codex")), 24 * HOUR),
+            format!("queued: last seen 1d ago; unread mail may be dropped any time; {back}")
         );
         // The person's own mailboxes are never forgotten.
-        assert_eq!(offline_note(Some(&seen("cli")), 30 * HOUR), format!("queued: last seen 1d ago; {name}"));
+        assert_eq!(offline_note(Some(&seen("cli:t", "cli")), 30 * HOUR), format!("queued: last seen 1d ago; {back}"));
+        // A session known only by its process can't come back: a new one in its place gets the mail.
+        let name = "a new session that takes this name gets the mail";
+        assert_eq!(
+            offline_note(Some(&seen("proc:7", "zed")), 3 * HOUR),
+            format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
+        );
         assert_eq!(offline_note(None, 0), format!("queued: the session is offline; {name}"));
     }
 
@@ -853,7 +872,7 @@ mod tests {
         let (state, note) = d.receive(bob.public(), msg).unwrap();
         assert_eq!(state, "queued");
         assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
-        assert!(note.ends_with("; a new session that takes this name gets the mail"), "{note}");
+        assert!(note.ends_with("; it reaches that session when it's back"), "{note}");
     }
 
     #[test]

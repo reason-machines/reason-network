@@ -209,7 +209,7 @@ impl Daemon {
         self.presence_of(sessions)
     }
 
-    fn presence_of(&self, mut sessions: Vec<SessionInfo>) -> Presence {
+    pub(super) fn presence_of(&self, mut sessions: Vec<SessionInfo>) -> Presence {
         if !self.cfg.share_paths {
             for s in &mut sessions {
                 s.cwd =
@@ -219,9 +219,14 @@ impl Daemon {
         let g = self.inner.lock().unwrap();
         let mut known = self.remembered(&g);
         known.sort_by_key(|r| -r.last_seen);
+        known.truncate(100);
+        // Not the person's own mailboxes: each machine has its own (`terminal`).
+        let now = util::now_ms();
+        let kept = known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()).collect();
         Presence {
             sessions,
-            known: known.into_iter().take(100).map(|r| r.name).collect(),
+            known: known.into_iter().map(|r| r.name).collect(),
+            kept,
             features: vec![crate::files::FEATURE.into()],
         }
     }
@@ -476,7 +481,7 @@ mod tests {
                 tier: Tier::Push,
                 last_seen: util::now_ms(),
             };
-            d.inner.lock().unwrap().store.upsert_session(&r).unwrap();
+            d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         }
         assert_eq!(d.presence_of(Vec::new()).known, ["api-claude"]);
         // Claude Code's own list: neither registered nor shown without Reason Network.
