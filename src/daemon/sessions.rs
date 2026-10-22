@@ -97,7 +97,7 @@ impl Daemon {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
             }
-            let name = pick_name(g, &reg, &git, &others, |r| self.holds(r, now))?;
+            let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             g.live.insert(
@@ -141,6 +141,11 @@ impl Daemon {
     /// it registered now. (Checked as the terminal is used: each command from it comes through here.) A rename that
     /// fails (another session took the name meanwhile) is logged, and the command goes on: it is tried again next time.
     fn recheck_terminal(&self, others: &Elsewhere) {
+        self.recheck_terminal_with(others, |name| self.set_status(TERMINAL, None, Some(name)).map(drop));
+    }
+
+    /// `recheck_terminal`, renaming with `rename`.
+    fn recheck_terminal_with(&self, others: &Elsewhere, rename_to: impl FnOnce(String) -> Result<()>) {
         let now = util::now_ms();
         let rename = || -> Result<()> {
             let name = {
@@ -149,14 +154,13 @@ impl Daemon {
                 if others.terminals || !others.live.contains(&l.name) {
                     return Ok(());
                 }
-                pick_name(&g, &l.reg, &l.git, others, |r| self.holds(r, now))?
+                pick_name(&g, &l.reg, &l.git, others, &self.person, |r| self.holds(r, now))?
             };
             log(&format!(
                 "{} is on another machine too, and an older engine is in the team: now {name}",
                 self.addr("terminal")
             ));
-            self.set_status(TERMINAL, None, Some(name))?;
-            Ok(())
+            rename_to(name)
         };
         if let Err(e) = rename() {
             log(&format!("renaming {}: {e:#}", self.addr("terminal")));
@@ -542,13 +546,16 @@ fn pick_name(
     reg: &SessionReg,
     git: &GitInfo,
     elsewhere: &Elsewhere,
+    person: &str,
     holds: impl Fn(&Remembered) -> bool,
 ) -> Result<String> {
     // A machine's own `terminal` is its own: another machine's never makes it take a suffix, once every engine in the
     // team shows which machine a terminal's message came from. (An older one couldn't tell two apart in a reply.)
     let none = Elsewhere::default();
     let elsewhere = if reg.key == TERMINAL && elsewhere.terminals { &none } else { elsewhere };
-    let live = |n: &str| g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
+    // The person's own name is never a session's (`<person>/<person>` would read as the person), as for a rename.
+    let live =
+        |n: &str| n == person || g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
     let free = |n: &str| -> Result<bool> {
         let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
         Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))
@@ -850,7 +857,7 @@ mod tests {
             Elsewhere { live: HashSet::from(["api-claude".to_string()]), kept: HashSet::new(), terminals: true };
         let mut g = d.inner.lock().unwrap();
         let g = &mut *g;
-        let name = pick_name(g, &claude("a"), &GitInfo::default(), &elsewhere, |_| true).unwrap();
+        let name = pick_name(g, &claude("a"), &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap();
         assert_eq!(name, "api-claude-2");
         let r = Remembered {
             name: name.clone(),
@@ -878,7 +885,10 @@ mod tests {
             terminals: true,
         };
         let g = d.inner.lock().unwrap();
-        assert_eq!(pick_name(&g, &claude("c"), &GitInfo::default(), &elsewhere, |_| true).unwrap(), "api-claude-3");
+        assert_eq!(
+            pick_name(&g, &claude("c"), &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap(),
+            "api-claude-3"
+        );
     }
 
     #[test]
@@ -1167,13 +1177,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_terminal_rename_that_fails_never_fails_the_command() {
-        // The name the terminal would move to can't be had (here: it is the person's own name).
-        let cfg = crate::config::Config { person: Some("terminal-2".into()), ..Default::default() };
-        let d = Arc::new(super::super::test_daemon(cfg));
+        let d = Arc::new(super::super::test_daemon(Default::default()));
         assert_eq!(join(&d, named(TERMINAL, "cli", Some("terminal"))).name, "terminal");
         let others =
             Elsewhere { live: HashSet::from(["terminal".to_string()]), terminals: false, ..Default::default() };
-        d.recheck_terminal(&others);
+        // The rename loses a race: another session took the name it picked meanwhile.
+        d.recheck_terminal_with(&others, |name| bail!("'{name}' is taken by a live session"));
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // The terminal's commands go on as before.
         let call = HookCall {
@@ -1192,6 +1201,29 @@ mod tests {
     }
 
     #[test]
+    fn no_session_is_named_after_its_person() {
+        let d = super::super::test_daemon(crate::config::Config { person: Some("lars".into()), ..Default::default() });
+        // `listen --as lars`, and a Claude Code session someone named Lars.
+        assert_eq!(join(&d, named("cli:lars", "cli", Some("lars"))).name, "lars-2");
+        assert_eq!(join(&d, SessionReg { name: Some("Lars".into()), ..claude("a") }).name, "lars-3");
+        // Nor a session coming back to such a name an older engine gave it.
+        let r = Remembered {
+            name: "lars".into(),
+            key: "claude-code:old".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen: util::now_ms(),
+            attached: true,
+        };
+        d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
+        assert_eq!(join(&d, claude("old")).name, "api-claude");
+    }
+
+    #[test]
     fn each_machine_has_its_own_terminal() {
         let d = super::super::test_daemon(Default::default());
         let mut elsewhere = Elsewhere {
@@ -1202,14 +1234,17 @@ mod tests {
         let g = d.inner.lock().unwrap();
         let terminal = named(TERMINAL, "cli", Some("terminal"));
         // While an older engine in the team couldn't tell two apart in a reply, the second one on is `terminal-2`.
-        assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal-2");
+        assert_eq!(
+            pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap(),
+            "terminal-2"
+        );
         elsewhere.terminals = true;
-        assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal");
+        assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap(), "terminal");
         // Any other session asking for it, or for a name kept elsewhere, still gets the next free one.
         let other = named("cli:t2", "cli", Some("terminal"));
-        assert_eq!(pick_name(&g, &other, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal-2");
+        assert_eq!(pick_name(&g, &other, &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap(), "terminal-2");
         let review = named("cli:review", "cli", Some("review"));
-        assert_eq!(pick_name(&g, &review, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "review-2");
+        assert_eq!(pick_name(&g, &review, &GitInfo::default(), &elsewhere, &d.person, |_| true).unwrap(), "review-2");
     }
 
     #[test]
