@@ -51,8 +51,15 @@ fn apply_in(home: &Path, exe: &Path, remove: bool, dry: bool) -> Result<Report> 
     let to_fallback = !remove
         && !servers(&mut read_json(&native.0)?, true)?.keys().any(|k| k != AGENT_NAME)
         && !servers(&mut read_json(&fallback.0)?, false)?.is_empty();
-    // Removing takes ours out of both: which one ZCode reads may have changed since.
-    let targets = if remove || to_fallback { vec![native, fallback] } else { vec![native] };
+    // Removing takes ours out of both: which one ZCode reads may have changed since. Moving writes `.agents` first,
+    // so a failed write there leaves ours where it was.
+    let targets = if remove {
+        vec![native, fallback]
+    } else if to_fallback {
+        vec![fallback, native]
+    } else {
+        vec![native]
+    };
     for (path, native) in targets {
         let mut v = read_json(&path)?;
         let servers = servers(&mut v, native)?;
@@ -140,6 +147,30 @@ mod tests {
         apply_in(&h, exe, false, false).unwrap();
         assert_eq!(read(&native), json!({"mcp": {"servers": {}}}));
         assert!(read(&fallback)["mcpServers"][AGENT_NAME].is_object());
+        std::fs::remove_dir_all(h).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_ours_when_agents_cant_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = scratch();
+        let [(native, _), (fallback, _)] = files(&h);
+        let exe = Path::new("/opt/reason-network");
+        apply_in(&h, exe, false, false).unwrap();
+        let before = std::fs::read(&native).unwrap();
+        put(&fallback, r#"{"mcpServers":{"memory":{"command":"npx"}}}"#);
+        let dir = fallback.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anyway: nothing to check then.
+        let checked = std::fs::write(dir.join("probe"), "").is_err();
+        let failed = apply_in(&h, exe, false, false).is_err();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if checked {
+            assert!(failed);
+            assert_eq!(std::fs::read(&native).unwrap(), before);
+            assert!(wired_in(&h, exe));
+        }
         std::fs::remove_dir_all(h).unwrap();
     }
 
