@@ -283,7 +283,7 @@ for _ in range(20):
 check("after /clear, Claude Code's registry puts the new conversation on at once, and only it",
       "clear-proj-claude-2" in until_out and until_out.count("clear-proj-claude") == 1, until_out)
 log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
-check("…ending the cleared one", "(claude-code:before-clear) ended: its agent moved on to claude-code:after-clear" in log, log[-1500:])
+check("…ending the cleared one", "alex/clear-proj-claude ended: its agent went on to another conversation" in log, log[-1500:])
 out = run("send", "clear-proj-claude", "for the cleared conversation")
 check("…whose mail waits for it", "queued" in out and "it reaches that session when it's back" in out, out)
 rpc(cc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
@@ -308,8 +308,8 @@ time.sleep(5)
 out = run("who", "clear-proj")
 log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
 check("a headless Claude run from it is a session of its own, not its parent's conversation",
-      "clear-proj-claude-3" in out and "clear-proj-claude-2" in out and "(claude-code:inner) ended" not in log
-      and "claude-code:inner) registered" in log, out + log[-800:])
+      "clear-proj-claude-3" in out and "clear-proj-claude-2" in out and "clear-proj-claude-3 ended" not in log
+      and "alex/clear-proj-claude-3 (claude-code:inner) registered" in log, out + log[-800:])
 hc.kill()
 cc.kill()
 claude_proc.kill()

@@ -78,7 +78,7 @@ impl Daemon {
                 .filter(|(k, l)| l.conn == conn && l.reg.agent == reg.agent && **k != key)
                 .map(|(k, _)| k.clone())
                 .collect();
-            self.moved_on(g, before, &key, now);
+            self.moved_on(g, before, now);
         }
         if let Some(l) = g.live.get_mut(&key) {
             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
@@ -182,12 +182,13 @@ impl Daemon {
         }
     }
 
-    /// Ends sessions whose agent is in conversation `key` now: they are offline from here on, their names kept for them.
-    pub(super) fn moved_on(&self, g: &mut Inner, keys: Vec<String>, key: &str, now: i64) {
+    /// Ends sessions whose agent is in another conversation now: they are offline from here on, their names kept for
+    /// them. (The log names them by address: agents' session ids stay out of it.)
+    pub(super) fn moved_on(&self, g: &mut Inner, keys: Vec<String>, now: i64) {
         for k in keys {
             if let Some(l) = g.live.remove(&k) {
                 let _ = g.store.touch_session(&l.name, now);
-                log(&format!("session {} ({k}) ended: its agent moved on to {key}", self.addr(&l.name)));
+                log(&format!("session {} ended: its agent went on to another conversation", self.addr(&l.name)));
                 self.presence_changed();
             }
         }

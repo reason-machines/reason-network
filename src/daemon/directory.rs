@@ -166,7 +166,7 @@ impl Daemon {
                 .filter(|(k, l)| l.reg.agent == agent::CLAUDE_CODE && l.reg.pid == Some(c.pid) && **k != key)
                 .map(|(k, _)| k.clone())
                 .collect();
-            self.moved_on(&mut g, before, &key, now);
+            self.moved_on(&mut g, before, now);
         }
         if !self.inner.lock().unwrap().live.contains_key(&key) {
             let named = matches!(c.name_source.as_deref(), Some("user" | "peer" | "hook" | "auto"));
