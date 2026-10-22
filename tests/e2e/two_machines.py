@@ -332,7 +332,7 @@ r = subprocess.run([BIN, "send", "alice/work-codex", "from alex's terminal in th
                    capture_output=True, text=True, timeout=90)
 check("the person's own terminal there still sends", "→ alice/work-codex" in r.stdout, r.stdout + r.stderr)
 out = codex.tool("check_inbox", {}, meta)
-check("…as alex/terminal", 'from="alex/terminal"' in out and "in the folder that is off" in out, out)
+check("…as alex/terminal, from alex's laptop", 'from="alex/terminal@laptop"' in out and "in the folder that is off" in out, out)
 with open(os.path.join(PRIVATE, "notes.txt"), "w") as f:
     f.write("private\n")
 agent_shell = dict(person, CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="44444444-dddd", CLAUDE_PROJECT_DIR=PRIVATE)
@@ -376,7 +376,7 @@ after = {who: counts(who) for who in H}
 check("each machine counts the messages it sent and received today",
       all(after[who] == (before[who][0] + 1, before[who][1] + 1) for who in H), (before, after))
 out = codex.tool("check_inbox", {}, meta)
-check("remote message arrives in codex inbox, from alex/terminal", 'from="alex/terminal"' in out and "hello from alex's terminal" in out, out)
+check("remote message arrives in codex inbox, from alex's terminal on his laptop", 'from="alex/terminal@laptop"' in out and "hello from alex's terminal" in out, out)
 out = codex.tool("check_inbox", {}, meta)
 check("…and is gone once read", out.startswith("No messages."), out)
 out = cli("alice", "send", "alex", "dinner at 8?")

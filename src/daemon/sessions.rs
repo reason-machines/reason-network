@@ -11,8 +11,14 @@ use crate::{
     store::Remembered,
     util,
 };
+use crate::{net::Remote, team::TeamState};
 use anyhow::{Result, anyhow, bail};
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use iroh::EndpointId;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 /// A hook-only session that hasn't fired a hook for this long is considered gone.
 const HOOK_TTL_MS: i64 = 6 * 3_600_000;
@@ -54,7 +60,7 @@ impl Daemon {
             bail!(OFF_HERE);
         }
         let now = util::now_ms();
-        let others = self.my_names_elsewhere();
+        let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
@@ -66,8 +72,10 @@ impl Daemon {
             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
             if conn.is_some() {
                 l.conn = conn;
+                l.attached = true;
             }
             l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+            l.attached |= l.reg.tier == Tier::Push;
             if l.last_hook.is_none() {
                 l.reg.cwd = reg.cwd;
                 l.git = git;
@@ -79,6 +87,7 @@ impl Daemon {
             }
             let name = pick_name(g, &reg, &git, &others, |r| self.holds(r, now))?;
             self.take_over(g, &name, &key)?;
+            let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             g.live.insert(
                 key.clone(),
                 Live {
@@ -94,6 +103,7 @@ impl Daemon {
                     transcript: None,
                     retry: None,
                     stop_gen: 0,
+                    attached,
                 },
             );
             self.presence_changed();
@@ -108,19 +118,10 @@ impl Daemon {
         Ok((Registered { name, address, unread: pending.len() as u32 }, (key, wake)))
     }
 
-    /// My session names on my other machines, so my addresses stay unique across them: live sessions', and those kept
-    /// there for sessions that are offline (older engines don't say which those are).
-    fn my_names_elsewhere(&self) -> Elsewhere {
-        let Some(net) = self.net() else { return Elsewhere::default() };
-        let Some(team) = self.team_state() else { return Elsewhere::default() };
-        let mut out = Elsewhere::default();
-        for (_, r) in
-            net.remotes().into_iter().filter(|(id, _)| team.member(id).is_some_and(|m| m.person == self.person))
-        {
-            out.live.extend(r.presence.sessions.into_iter().map(|s| s.name));
-            out.kept.extend(r.presence.kept);
-        }
-        out
+    /// My session names on my other machines, so my addresses stay unique across them (see [`names_elsewhere`]).
+    fn my_names_elsewhere(&self, now: i64) -> Elsewhere {
+        let (Some(net), Some(team)) = (self.net(), self.team_state()) else { return Elsewhere::default() };
+        names_elsewhere(&net.remotes(), &team, &self.person, now)
     }
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
@@ -143,14 +144,14 @@ impl Daemon {
             && r.kept()
         {
             log(&format!("{} lapsed: {key} takes the name", self.addr(name)));
-            g.store.forget_session(name, &self.person)?;
+            g.store.forget_session(&r, &self.person)?;
         }
         Ok(())
     }
 
     pub(super) fn set_status(&self, key: &str, doing: Option<String>, name: Option<String>) -> Result<Registered> {
-        let others = self.my_names_elsewhere();
         let now = util::now_ms();
+        let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let new_name = name.as_deref().map(util::slug);
@@ -329,11 +330,20 @@ impl Daemon {
             })
             .collect();
         let here: Vec<&(&String, &Live)> = busy.iter().filter(|(_, l)| l.reg.cwd == cwd).collect();
-        Ok(match (here.as_slice(), busy.as_slice()) {
+        let key = match (here.as_slice(), busy.as_slice()) {
             ([(k, _)], _) => Some((*k).clone()),
             ([], [(k, _)]) => Some((*k).clone()),
             _ => None,
-        })
+        };
+        // Its agent's MCP server answers for it now.
+        if let Some(l) = key.as_ref().and_then(|k| g.live.get_mut(k))
+            && !l.attached
+        {
+            l.attached = true;
+            let r = remembered(l, now);
+            g.store.upsert_session(&r, &self.person)?;
+        }
+        Ok(key)
     }
 
     pub(super) fn drop_conn(&self, conn: u64) {
@@ -404,19 +414,42 @@ fn remembered(l: &Live, now: i64) -> Remembered {
         doing: l.doing.clone(),
         tier: l.reg.tier,
         last_seen: now,
+        attached: l.attached,
     }
 }
 
-/// My session names on my other machines (see [`Daemon::my_names_elsewhere`]).
-#[derive(Default)]
+/// The key of a machine's own terminal mailbox (`<you>/terminal`).
+const TERMINAL: &str = "cli:terminal";
+
+/// My session names on my other machines.
+#[derive(Default, Debug, PartialEq)]
 struct Elsewhere {
     live: HashSet<String>,
     kept: HashSet<String>,
 }
 
+/// The session names on `person`'s other machines, from their presence: live sessions', and those kept there for
+/// sessions that are offline (older engines don't say which). Kept names count while that machine is online or was
+/// in the last day: one off longer can't still be keeping them, and its last presence, loaded from disk, would
+/// otherwise hold them for good.
+fn names_elsewhere(remotes: &HashMap<EndpointId, Remote>, team: &TeamState, person: &str, now: i64) -> Elsewhere {
+    let mut out = Elsewhere::default();
+    for (id, r) in remotes {
+        if team.member(id).is_none_or(|m| m.person != person) {
+            continue;
+        }
+        out.live.extend(r.presence.sessions.iter().map(|s| s.name.clone()));
+        if r.online || now - r.last_seen <= FORGET_MS {
+            out.kept.extend(r.presence.kept.iter().cloned());
+        }
+    }
+    out
+}
+
 /// The name of a session registering here. Its own from before (and the mail waiting for it), unless a live session
 /// has that now; else the name it asks for or `<repo>-<agent>`, or the first `-2`, `-3`, … that is free: that no live
-/// session has, here or on my other machines, and that isn't kept for another session that is offline (`holds`).
+/// session has, here or on my other machines, and that isn't kept for another session that is offline (`holds`). One of
+/// the person's own mailboxes (`listen --as`) takes the name it asks for whenever that is free.
 fn pick_name(
     g: &Inner,
     reg: &SessionReg,
@@ -424,22 +457,29 @@ fn pick_name(
     elsewhere: &Elsewhere,
     holds: impl Fn(&Remembered) -> bool,
 ) -> Result<String> {
+    // A machine's own `terminal` is its own: another machine's never makes it take a suffix.
+    let none = Elsewhere::default();
+    let elsewhere = if reg.key == TERMINAL { &none } else { elsewhere };
     let live = |n: &str| g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
+    let free = |n: &str| -> Result<bool> {
+        let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
+        Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))
+    };
+    let asked = reg.name.as_deref().map(util::slug).filter(|s| !s.is_empty());
+    // One of the person's own mailboxes is the name it asks for: once that is free again, it goes back to it (its mail
+    // from the suffixed name comes along).
+    if reg.key.starts_with("cli:")
+        && let Some(n) = asked.as_deref()
+        && free(n)?
+    {
+        return Ok(n.to_string());
+    }
     if let Some(r) = g.store.session_by_key(&reg.key)?
         && !live(&r.name)
     {
         return Ok(r.name);
     }
-    let free = |n: &str| -> Result<bool> {
-        let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
-        Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))
-    };
-    let base = reg
-        .name
-        .as_deref()
-        .map(util::slug)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| agent::default_name(&reg.agent, &reg.cwd, git));
+    let base = asked.unwrap_or_else(|| agent::default_name(&reg.agent, &reg.cwd, git));
     if free(&base)? {
         return Ok(base);
     }
@@ -571,7 +611,10 @@ mod tests {
             name: None,
             dirs: Vec::new(),
         };
-        assert_eq!(d.hook(call("a")).await.unwrap().address, Some(d.addr("api-claude")));
+        // Its MCP server registered it; then it ends.
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        d.hook(call("a")).await.unwrap();
+        d.drop_conn(1);
         d.hook(HookCall { event: "end".into(), ..call("a") }).await.unwrap();
         mail(&d, "m1", "api-claude");
         assert_eq!(d.hook(call("b")).await.unwrap().address, Some(d.addr("api-claude-2")));
@@ -679,6 +722,7 @@ mod tests {
             doing: None,
             tier: Tier::Push,
             last_seen: util::now_ms() - 3_600_000,
+            attached: true,
         };
         {
             let g = d.inner.lock().unwrap();
@@ -722,6 +766,7 @@ mod tests {
             doing: None,
             tier: Tier::Push,
             last_seen: util::now_ms(),
+            attached: true,
         };
         g.store.upsert_session(&r, &d.person).unwrap();
         assert!(g.store.session_by_name("api-claude").unwrap().is_none());
@@ -758,6 +803,206 @@ mod tests {
         assert_eq!(known, ["api-claude", "api-claude-2", "api-zed", "terminal"]);
         // Not each machine's own `terminal`, nor a session that can't come back, nor one that has lapsed.
         assert_eq!(p.kept, ["api-claude"]);
+    }
+    #[tokio::test]
+    async fn a_run_only_its_hooks_ever_saw_keeps_no_name() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |id: &str, event: &str| HookCall {
+            agent: "claude-code".into(),
+            event: event.into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+        };
+        // A headless run: hooks only, never an MCP server, a push channel or a listen.
+        assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
+        d.hook(call("p", "end")).await.unwrap();
+        mail(&d, "m1", "api-claude");
+        let r = d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap().unwrap();
+        assert!(!r.kept());
+        // As for a session without an id: the next one in its place takes the name, mail and all.
+        let next = join(&d, claude("q"));
+        assert_eq!((next.name.as_str(), next.unread), ("api-claude", 1));
+        // A run whose MCP server answers for it is reachable, so its name is kept from then on.
+        assert_eq!(d.hook(call("r", "prompt")).await.unwrap().address, Some(d.addr("api-claude-2")));
+        let mut cursor = call("r", "prompt");
+        cursor.agent = "cursor".into();
+        d.hook(cursor).await.unwrap();
+        assert_eq!(d.attach("cursor", "/work/api").unwrap().as_deref(), Some("cursor:r"));
+        assert!(d.inner.lock().unwrap().store.session_by_key("cursor:r").unwrap().unwrap().kept());
+    }
+
+    #[test]
+    fn a_listen_mailbox_goes_back_to_the_name_it_asks_for_once_free() {
+        let mut d = super::super::test_daemon(Default::default());
+        join(&d, named("cli:review-x", "cli", Some("x")));
+        join(&d, SessionReg { name: Some("review".into()), ..claude("a") });
+        leave(&d, "claude-code:a", 3_600_000);
+        // `listen --as review` while the name is kept for the conversation: the next free one.
+        assert_eq!(join(&d, named("cli:review", "cli", Some("review"))).name, "review-2");
+        leave(&d, "cli:review", 0);
+        mail(&d, "m1", "review-2");
+        assert_eq!(join(&d, named("cli:review", "cli", Some("review"))).name, "review-2");
+        leave(&d, "cli:review", 0);
+        // Once the conversation's name lapses, the mailbox takes it, and its mail comes along.
+        d.inner.lock().unwrap().store.touch_session("review", util::now_ms() - 2 * DAY).unwrap();
+        settled(&mut d);
+        let r = join(&d, named("cli:review", "cli", Some("review")));
+        assert_eq!((r.name.as_str(), r.unread), ("review", 1));
+        assert!(d.inner.lock().unwrap().store.session_by_name("review-2").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mail_held_for_a_conversation_goes_with_it_and_never_to_the_next_session() {
+        let cfg = crate::config::Config {
+            person: Some("alex".into()),
+            inbound: crate::config::Inbound { default: crate::config::Policy::Hold, ..Default::default() },
+            ..Default::default()
+        };
+        let mut d = super::super::test_daemon(cfg);
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let d = {
+            join(&d, claude("a"));
+            join(&d, named("proc:5", "zed", None));
+            leave(&d, "claude-code:a", 0);
+            leave(&d, "proc:5", 0);
+            settled(&mut d);
+            Arc::new(d)
+        };
+        let (h1, h2) = (ulid::Ulid::generate().to_string(), ulid::Ulid::generate().to_string());
+        let from_bob = |id: &str, to: &str| Message {
+            id: id.into(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr(to),
+            via: None,
+            reply_to: None,
+            body: "hi".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        let (state, note) = d.receive(bob.public(), from_bob(&h1, "api-claude")).unwrap();
+        assert_eq!(state, "held");
+        assert_eq!(note, "held until alex approves it; dropped if that session is gone for a day first");
+        // Held for a session without an id, it stays the person's to settle, for whoever has the name, as before.
+        assert_eq!(d.receive(bob.public(), from_bob(&h2, "api-zed")).unwrap().1, "held until alex approves it");
+        // A day on, both names lapse: the conversation's held mail goes with it.
+        {
+            let g = d.inner.lock().unwrap();
+            g.store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
+            g.store.touch_session("api-zed", util::now_ms() - 2 * DAY).unwrap();
+        }
+        let next = join(&d, claude("b"));
+        assert_eq!(next.name, "api-claude");
+        let held: Vec<String> = d.inner.lock().unwrap().store.held().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(held, [h2]);
+        assert_eq!(d.settle(&[], true).unwrap(), 1);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+    }
+
+    #[test]
+    fn names_elsewhere_are_my_other_machines_and_kept_ones_only_while_they_could_still_be_kept() {
+        let d = super::super::test_daemon(crate::config::Config { person: Some("alex".into()), ..Default::default() });
+        let (desk, old, bob) = (iroh::SecretKey::generate(), iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, desk.public(), "alex", "desk", true);
+        team.put_member(&d.key, old.public(), "alex", "old", true);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        let now = util::now_ms();
+        let remote = |live: &str, kept: &str, online: bool, last_seen: i64| Remote {
+            presence: crate::net::Presence {
+                sessions: vec![SessionInfo {
+                    address: String::new(),
+                    name: live.into(),
+                    person: String::new(),
+                    machine: String::new(),
+                    agent: "codex".into(),
+                    cwd: String::new(),
+                    repo: None,
+                    branch: None,
+                    status: "idle".into(),
+                    since: None,
+                    doing: None,
+                    tier: Tier::Pull,
+                    unread: 0,
+                    is_me: false,
+                }],
+                known: vec![kept.into()],
+                kept: vec![kept.into()],
+                ..Default::default()
+            },
+            last_seen,
+            online,
+        };
+        let remotes = HashMap::from([
+            (desk.public(), remote("desk-live", "desk-kept", false, now - 3_600_000)),
+            // Off for two days: what it kept then has lapsed by now.
+            (old.public(), remote("old-live", "old-kept", false, now - 2 * DAY)),
+            // Another person's names are theirs.
+            (bob.public(), remote("bob-live", "bob-kept", true, now)),
+        ]);
+        let e = names_elsewhere(&remotes, &team, "alex", now);
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(e.live, set(&["desk-live", "old-live"]));
+        assert_eq!(e.kept, set(&["desk-kept"]));
+    }
+
+    #[test]
+    fn each_machine_has_its_own_terminal() {
+        let d = super::super::test_daemon(Default::default());
+        let elsewhere =
+            Elsewhere { live: HashSet::from(["terminal".to_string()]), kept: HashSet::from(["review".to_string()]) };
+        let g = d.inner.lock().unwrap();
+        let terminal = named(TERMINAL, "cli", Some("terminal"));
+        assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal");
+        // Any other session asking for it, or for a name kept elsewhere, still gets the next free one.
+        let other = named("cli:t2", "cli", Some("terminal"));
+        assert_eq!(pick_name(&g, &other, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal-2");
+        let review = named("cli:review", "cli", Some("review"));
+        assert_eq!(pick_name(&g, &review, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "review-2");
+    }
+
+    #[test]
+    fn presence_names_the_most_recent_kept_names_when_there_are_too_many() {
+        let d = super::super::test_daemon(Default::default());
+        let now = util::now_ms();
+        {
+            let g = d.inner.lock().unwrap();
+            for i in 0..120 {
+                let r = Remembered {
+                    name: format!("s{i}"),
+                    key: format!("codex:{i}"),
+                    agent: "codex".into(),
+                    cwd: "/work/api".into(),
+                    repo: None,
+                    branch: None,
+                    doing: None,
+                    tier: Tier::Pull,
+                    last_seen: now - 1_000 * (120 - i),
+                    attached: true,
+                };
+                g.store.upsert_session(&r, &d.person).unwrap();
+            }
+        }
+        let p = d.presence_of(Vec::new());
+        assert_eq!(p.kept.len(), 100);
+        assert_eq!(
+            (p.kept.first().map(String::as_str), p.kept.last().map(String::as_str)),
+            (Some("s119"), Some("s20"))
+        );
+        assert_eq!(p.known, p.kept);
     }
 
     #[test]

@@ -487,9 +487,9 @@ impl Daemon {
     /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
     /// means "not now": the sender keeps it in its outbox.
     pub fn receive(self: &Arc<Self>, peer: EndpointId, msg: Message) -> Result<(String, String)> {
-        let sender = self
+        let (sender, machine) = self
             .team_state()
-            .and_then(|t| t.member(&peer).map(|m| m.person.clone()))
+            .and_then(|t| t.member(&peer).map(|m| (m.person.clone(), m.machine.clone())))
             .ok_or_else(|| anyhow!("not a team member"))?;
         let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
@@ -560,13 +560,23 @@ impl Daemon {
                 let note = format!("refused: agents message one of {}'s sessions, not a group", self.person);
                 return Ok(("refused".into(), note));
             }
+            // Each machine has its own terminal: replies go back to the one this came from.
+            if render::from_terminal(&msg.from) {
+                msg.from = format!("{}@{machine}", msg.from);
+            }
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
+            // Held for a session whose name is kept, it is that session's: it goes when the session does.
+            let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
             if g.store.insert(&mut msg, held)? && !held {
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
             let (state, note) = match key {
+                _ if kept => (
+                    "held".into(),
+                    format!("held until {} approves it; dropped if that session is gone for a day first", self.person),
+                ),
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
                 None => ("queued".into(), offline_note(remembered.as_ref(), util::now_ms())),
@@ -576,7 +586,7 @@ impl Daemon {
         self.arrived.notify_waiters();
         // The sender's session can be answered right away, before its machine's next presence names it.
         if let (Some(net), Some((_, from))) = (self.net(), msg.from.split_once('/')) {
-            net.note_session(&peer, from);
+            net.note_session(&peer, from.split_once('@').map_or(from, |(n, _)| n));
         }
         Ok(res)
     }
@@ -810,6 +820,7 @@ mod tests {
             doing: None,
             tier: Tier::Pull,
             last_seen: 0,
+            attached: true,
         };
         // A conversation its agent gave an id waits for it, whoever takes the name meanwhile.
         let back = "it reaches that session when it's back";
@@ -873,6 +884,40 @@ mod tests {
         assert_eq!(state, "queued");
         assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
         assert!(note.ends_with("; it reaches that session when it's back"), "{note}");
+    }
+
+    #[test]
+    fn a_message_from_a_teammates_terminal_is_answered_on_that_machine() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        let msg = Message {
+            id: Ulid::generate().to_string(),
+            from: "bob/terminal".into(),
+            from_agent: Some("cli".into()),
+            from_repo: None,
+            to: to.clone(),
+            via: None,
+            reply_to: None,
+            body: "hi".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        d.receive(bob.public(), msg).unwrap();
+        let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!(got[0].from, "bob/terminal@xps");
+        let text = render::for_agent(&got, Some("codex"), false);
+        assert!(
+            text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
+            "{text}"
+        );
     }
 
     #[test]

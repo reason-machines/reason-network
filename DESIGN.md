@@ -57,7 +57,11 @@ Session names default to `<repo-or-dir>-<agent>` (`api-claude`), get `-2`, `-3` 
 renamed by the agent.
 
 **A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
-conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table.
+conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table. This holds for
+a session the agent identifies and that could be reached: an MCP server connected for it or answered a call for it, a
+push channel delivers into it (Claude Code's inbox, `codex queue`, the opencode and pi plugins, Reason), or it is one of
+the person's own mailboxes. A run only its hooks ever saw (a one-shot or headless run without Reason Network's tools)
+couldn't be messaged, so its name isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 
 - The same conversation coming back (the agent restarted or resumed it, or the daemon restarted) gets its name back,
   with the mail that waited for it, whichever sessions register first.
@@ -67,10 +71,17 @@ conversation (`<agent>:<id>`, see Session registration below): one name per key,
 - The name lapses when its session would be forgotten (below: a day after it was last seen, never in the hours after the
   daemon starts). Then it is free again, without that session's unread mail, which is dropped as the sender was told:
   mail is never another conversation's. A conversation back after that is a new session.
-- A conversation whose name a live session has when it comes back (only an older engine on another of the person's
-  machines gives a kept name out) gets a new name, and its waiting mail moves to it.
-- The person's own mailboxes (`listen --as <name>`, `terminal`) are kept for good, on their own machine: each machine
-  has its own `terminal`.
+- A conversation whose name a live session has when it comes back (another of the person's machines gave it out: one
+  of an older engine, or one that hadn't heard yet that this machine keeps it) gets a new name, and its waiting mail
+  moves to it.
+- Another machine's kept names count while it is online or was in the last day: one off longer can't still be keeping
+  them.
+- The person's own mailboxes (`listen --as <name>`, `terminal`) are kept for good, on their own machine. `listen --as`
+  a name that is kept for another session gets the next free one, and the name it asked for as soon as that is free
+  again (with the mail from the other).
+- Each machine has its own `terminal`: another machine's never makes it take a suffix. A teammate's machine shows a
+  message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine; `<you>/terminal` alone is
+  the terminal of the machine it is sent from.
 - Names are kept per machine: the same conversation turning up on another machine is a new session there, and mail
   queued for it stays where it was.
 - A session whose agent gives it no id (`proc:<pid>`, one per MCP process: DeepSeek Harness, ZCode, and MCP clients
@@ -187,7 +198,9 @@ machines). On connect they exchange roster heads (anti-entropy) and full presenc
 daemon pushes `Presence{machine, seq, sessions[], human_status}` to all peers. A dropped connection marks
 that machine offline (sessions shown with last-seen). Presence also names the machine's offline sessions (`known`, so
 mail for them is queued there) and, of those, the ones whose names are kept (`kept`, which the person's other machines
-give to no new session; older engines leave it out and ignore it).
+give to no new session; older engines leave it out and ignore it). Each list carries at most 100 names, the most
+recent, which is what receivers take; a machine keeping more says so in its log, and its older kept names are then
+protected on that machine only.
 
 **Messages.** `Envelope{id: ulid, from, to, reply_to, thread, body, sent_at}` sent directly to each target
 machine on ALPN `tincan/1`, length-prefixed JSON frames. The receiver persists, then acks with
@@ -197,8 +210,10 @@ machine's mailbox under the session name, for a day: a session gone longer is fo
 read (not the person's own `listen` mailboxes, such as `terminal`, nor mail held for them; and nothing in the
 hours after the daemon starts, while live sessions register again). Until then the mail waits for that session, and the
 sender is told so ("…; it reaches that session when it's back"); for a session whose agent gives it no id, a new session
-that takes the name gets it, and the note says that instead. Live sessions are marked seen every 10 minutes, so a
-daemon that stops without seeing them go keeps their names from then.
+that takes the name gets it, and the note says that instead. Mail held for the person's approval follows the same rule:
+held for a session whose name is kept, it goes when that session is forgotten, never to the next one, and its sender is
+told so up front ("held until alex approves it; dropped if that session is gone for a day first"). Live sessions are
+marked seen every 10 minutes, so a daemon that stops without seeing them go keeps their names from then.
 
 **Files.** A message can carry small text files (`files: [{name, content}]`, at most 10, 256 KB each, 512 KB in all;
 UTF-8 with no control characters but tab and line ends), inside the same envelope, so they are as authenticated as its
@@ -230,7 +245,9 @@ session connection also receives pushed `deliver` events for its sessions.
 
 **Session registration**, by priority:
 1. Per-call `_meta`: Codex `sessionId` (the root thread, same id its hooks see), opencode V2 `ai.opencode/sessionID`.
-2. Env: `CLAUDE_CODE_SESSION_ID` (Claude), `COPILOT_AGENT_SESSION_ID` (Copilot), `GROK_SESSION_ID` (Grok).
+2. Env: `REASON_NETWORK_SESSION` (set by our pi extension), else the agent's own: `CLAUDE_CODE_SESSION_ID` (Claude),
+   `CODEX_THREAD_ID` (Codex), `OPENCODE_SESSION_ID` (opencode), `GEMINI_SESSION_ID` (Gemini), `COPILOT_AGENT_SESSION_ID`
+   (Copilot), `GROK_SESSION_ID` (Grok).
 3. Hook stdin `session_id` (`SessionStart`), correlated to the MCP process by agent PID ancestry.
 4. Fallback: one session per MCP process.
 

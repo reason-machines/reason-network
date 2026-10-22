@@ -58,14 +58,17 @@ pub struct Remembered {
     pub doing: Option<String>,
     pub tier: Tier,
     pub last_seen: i64,
+    /// Whether it could ever be reached beyond its own hooks (see `Live::attached`).
+    pub attached: bool,
 }
 
 impl Remembered {
     /// Whether the name stays this session's while it is offline: it is an agent's conversation, by the id its agent
     /// gave it (`<agent>:<id>`), so the same conversation can come back to it, or one of the person's own mailboxes
-    /// (`cli:<name>`). A session known only by its process (`proc:<pid>`) has nothing that could come back.
+    /// (`cli:<name>`); and it could be reached while it ran. A session known only by its process (`proc:<pid>`) has
+    /// nothing that could come back, and one only its hooks ever knew (a one-shot run) nothing anyone could reach.
     pub fn kept(&self) -> bool {
-        !self.key.starts_with("proc:")
+        self.attached && !self.key.starts_with("proc:")
     }
 }
 
@@ -105,7 +108,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     branch TEXT,
     doing TEXT,
     tier TEXT NOT NULL,
-    last_seen INTEGER NOT NULL
+    last_seen INTEGER NOT NULL,
+    attached INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
 CREATE TABLE IF NOT EXISTS counts (
@@ -117,7 +121,7 @@ CREATE TABLE IF NOT EXISTS counts (
 
 const MESSAGE_COLS: &str =
     "id, sender, sender_agent, sender_repo, recipient, via, reply_to, body, wake, sent_at, approval, files";
-const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen";
+const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached";
 
 impl Store {
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
@@ -145,6 +149,11 @@ impl Store {
         // folder instead).
         if !db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'files'")?.exists([])? {
             db.execute("ALTER TABLE messages ADD COLUMN files TEXT", [])?;
+        }
+        // Added with names kept for their sessions: whether a session could be reached beyond its own hooks. Sessions
+        // remembered from before count as reachable, so their names stay theirs.
+        if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'attached'")?.exists([])? {
+            db.execute("ALTER TABLE sessions ADD COLUMN attached INTEGER NOT NULL DEFAULT 1", [])?;
         }
         Ok(Store { db, inbox })
     }
@@ -455,13 +464,15 @@ impl Store {
         for old in before {
             self.rename(&old, &s.name, &format!("{person}/{old}"), &format!("{person}/{}", s.name))?;
         }
+        // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
             &format!(
-                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (name) DO UPDATE SET key = ?2, agent = ?3, cwd = ?4, repo = ?5, branch = ?6,
-                 doing = ?7, tier = ?8, last_seen = ?9"
+                 doing = ?7, tier = ?8, last_seen = ?9,
+                 attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END"
             ),
-            params![s.name, s.key, s.agent, s.cwd, s.repo, s.branch, s.doing, s.tier.as_str(), s.last_seen],
+            params![s.name, s.key, s.agent, s.cwd, s.repo, s.branch, s.doing, s.tier.as_str(), s.last_seen, s.attached],
         )?;
         Ok(())
     }
@@ -472,20 +483,28 @@ impl Store {
     }
 
     /// Forgets the sessions not seen since `before`, other than `live` ones and the person's own mailboxes (`cli`), and
-    /// deletes the mail they never read, so a session that takes the name later doesn't get it (mail held for the
-    /// person stays theirs to settle).
+    /// deletes the mail they never read, so a session that takes the name later doesn't get it (see `forget_session`).
     pub fn forget_sessions(&self, before: i64, live: &HashSet<&str>, person: &str) -> Result<()> {
-        let mut st = self.db.prepare_cached("SELECT name FROM sessions WHERE last_seen < ?1 AND agent != 'cli'")?;
-        let gone: Vec<String> = st.query_map([before], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        for name in gone.iter().filter(|n| !live.contains(n.as_str())) {
-            self.forget_session(name, person)?;
+        let mut st = self
+            .db
+            .prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions WHERE last_seen < ?1 AND agent != 'cli'"))?;
+        let gone: Vec<Remembered> = st.query_map([before], remembered)?.collect::<rusqlite::Result<_>>()?;
+        for r in gone.iter().filter(|r| !live.contains(r.name.as_str())) {
+            self.forget_session(r, person)?;
         }
         Ok(())
     }
 
-    /// Forgets one session, with the mail it never read and that mail's files (mail held for the person stays).
-    pub fn forget_session(&self, name: &str, person: &str) -> Result<()> {
-        let unread = "FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0";
+    /// Forgets one session, with the mail it never read and that mail's files. Mail held for the person goes too when
+    /// the name was kept for the session: it was that conversation's, never the next one's. Otherwise it stays the
+    /// person's to settle, for whoever has the name.
+    pub fn forget_session(&self, r: &Remembered, person: &str) -> Result<()> {
+        let unread = if r.kept() {
+            "FROM messages WHERE recipient = ?1 AND read_at IS NULL"
+        } else {
+            "FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0"
+        };
+        let name = r.name.as_str();
         let to = format!("{person}/{name}");
         let mut cols = self.db.prepare_cached(&format!("SELECT files {unread} AND files IS NOT NULL"))?;
         let cols: Vec<String> = cols.query_map([&to], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
@@ -558,6 +577,7 @@ fn remembered(r: &Row) -> rusqlite::Result<Remembered> {
         doing: r.get(6)?,
         tier: Tier::parse(&r.get::<_, String>(7)?),
         last_seen: r.get(8)?,
+        attached: r.get(9)?,
     })
 }
 
@@ -688,7 +708,7 @@ mod tests {
 
     #[test]
     fn a_session_gone_a_day_is_forgotten_with_the_mail_it_never_read() {
-        // (Not one that is live, nor the person's own mailbox, nor mail held for the person.)
+        // (Not one that is live, nor the person's own mailbox.)
         let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
         let day = 86_400_000;
         let session = |name: &str, agent: &str, last_seen: i64| Remembered {
@@ -701,12 +721,14 @@ mod tests {
             doing: None,
             tier: Tier::Push,
             last_seen,
+            attached: true,
         };
         for s in [
             session("gone", "claude-code", 0),
             session("recent", "claude-code", 2 * day),
             session("still-up", "claude-code", 0),
             session("terminal", "cli", 0),
+            Remembered { key: "proc:7".into(), ..session("no-id", "zed", 0) },
         ] {
             store.upsert_session(&s, "lars").unwrap();
         }
@@ -729,13 +751,15 @@ mod tests {
         store.insert(&mut to("2", "recent"), false).unwrap();
         store.insert(&mut to("3", "terminal"), false).unwrap();
         store.insert(&mut to("4", "gone"), true).unwrap();
+        store.insert(&mut to("5", "no-id"), true).unwrap();
         store.forget_sessions(day + 1, &HashSet::from(["still-up"]), "lars").unwrap();
         let names: Vec<String> = store.sessions().unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["recent", "still-up", "terminal"]);
         assert_eq!(store.unread_count("lars/gone").unwrap(), 0);
         assert_eq!(store.unread_count("lars/recent").unwrap(), 1);
         assert_eq!(store.unread_count("lars/terminal").unwrap(), 1);
-        assert_eq!(store.held().unwrap().len(), 1);
+        // Mail held for a conversation goes with it; for a session without an id it stays the person's to settle.
+        assert_eq!(store.held().unwrap().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["5"]);
     }
 
     #[test]
@@ -751,6 +775,7 @@ mod tests {
             doing: None,
             tier: Tier::Push,
             last_seen,
+            attached: true,
         };
         // As older engines could: the same session under two names, mail waiting under each.
         for (name, seen) in [("api-claude", 1), ("api-claude-2", 2)] {
@@ -758,7 +783,9 @@ mod tests {
             store
                 .db
                 .execute(
-                    &format!("INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)"),
+                    &format!(
+                        "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, 1)"
+                    ),
                     params![s.name, s.key, s.agent, s.cwd, s.tier.as_str(), s.last_seen],
                 )
                 .unwrap();
@@ -962,6 +989,7 @@ mod tests {
             doing: None,
             tier: Tier::Push,
             last_seen: 0,
+            attached: true,
         };
         store.upsert_session(&session("gone"), "lars").unwrap();
         store.upsert_session(&session("api"), "lars").unwrap();

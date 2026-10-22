@@ -19,6 +19,9 @@ use std::{
     sync::Arc,
 };
 
+/// How many offline names (`known`, and `kept`) presence carries: what teammates' machines take.
+const PRESENCE_NAMES: usize = 100;
+
 /// A resolved recipient.
 pub(super) enum Target {
     /// A session on this machine; `key` is set when it is running.
@@ -219,14 +222,21 @@ impl Daemon {
         let g = self.inner.lock().unwrap();
         let mut known = self.remembered(&g);
         known.sort_by_key(|r| -r.last_seen);
-        known.truncate(100);
         // Not the person's own mailboxes: each machine has its own (`terminal`).
         let now = util::now_ms();
-        let kept = known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()).collect();
+        let kept: Vec<String> =
+            known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()).collect();
+        // Teammates' machines take 100 of each, so only the most recent go; the rest are named only here.
+        if kept.len() > PRESENCE_NAMES && !self.capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            super::log(&format!(
+                "{} names are kept for offline sessions here: other machines hear of the {PRESENCE_NAMES} most recent",
+                kept.len()
+            ));
+        }
         Presence {
             sessions,
-            known: known.into_iter().map(|r| r.name).collect(),
-            kept,
+            known: known.into_iter().take(PRESENCE_NAMES).map(|r| r.name).collect(),
+            kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
             features: vec![crate::files::FEATURE.into()],
         }
     }
@@ -437,7 +447,11 @@ impl Daemon {
     /// One session among same-named candidates: the live one, else an offline one to queue for.
     fn pick(&self, found: Vec<&Cand>, spec: &str, target: &dyn Fn(&Cand) -> Target) -> Result<Vec<Target>> {
         let live: Vec<&&Cand> = found.iter().filter(|c| c.live).collect();
-        let pool: Vec<&&Cand> = if live.is_empty() { found.iter().collect() } else { live };
+        let mut pool: Vec<&&Cand> = if live.is_empty() { found.iter().collect() } else { live };
+        // Each machine has its own `<you>/terminal`: unnamed, it is this machine's (one elsewhere is `…@<machine>`).
+        if pool.len() > 1 && pool.iter().all(|c| c.name == "terminal" && c.person == pool[0].person) {
+            pool.retain(|c| matches!(c.place, Place::Local(_)));
+        }
         match pool.as_slice() {
             [] => bail!(
                 "no session called '{spec}'. Run list_team (or `{CLI} who`) to see who is around (sessions without Reason Network can't \
@@ -461,6 +475,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_machine_answers_for_its_own_terminal() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let desk = iroh::SecretKey::generate();
+        let mut team = crate::team::TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, desk.public(), "alex", "desk", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let reg = SessionReg {
+            key: "cli:terminal".into(),
+            agent: "cli".into(),
+            cwd: "/".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: Some("terminal".into()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "terminal");
+        let mut theirs = d.row("terminal", "cli", "/", None);
+        theirs.tier = Tier::Pull;
+        let remotes = HashMap::from([(
+            desk.public(),
+            Remote {
+                presence: Presence { sessions: vec![theirs], ..Default::default() },
+                last_seen: util::now_ms(),
+                online: true,
+            },
+        )]);
+        let g = d.inner.lock().unwrap();
+        let to = |spec: &str| {
+            d.resolve(&g, &remotes, spec, None).unwrap().into_iter().map(|t| match t {
+                Target::Session { .. } => "here".to_string(),
+                Target::Remote { machine_name, .. } => machine_name,
+            })
+        };
+        assert_eq!(to("alex/terminal").collect::<Vec<_>>(), ["here"]);
+        assert_eq!(to("alex/terminal@desk").collect::<Vec<_>>(), ["desk"]);
+    }
+
+    #[test]
     fn presence_leaves_out_sessions_in_a_folder_that_is_off() {
         let cfg = crate::config::Config {
             folders: [("/work/private".to_string(), "off".to_string())].into(),
@@ -480,6 +533,7 @@ mod tests {
                 doing: None,
                 tier: Tier::Push,
                 last_seen: util::now_ms(),
+                attached: true,
             };
             d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         }

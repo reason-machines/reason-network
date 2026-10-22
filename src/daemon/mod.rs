@@ -119,6 +119,8 @@ pub struct Daemon {
     asks: Mutex<HashMap<String, ask::Asking>>,
     /// When this daemon started (ms): sessions live before it register again in the while after.
     started: i64,
+    /// Whether the log says presence names only some of the names kept here.
+    capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
 }
@@ -163,6 +165,11 @@ struct Live {
     retry: Option<(Instant, Duration)>,
     /// Bumped to end this session's `check_inbox` wait (its client gave up on it).
     stop_gen: u64,
+    /// It could be reached beyond its own hooks: an MCP server connected for it or attached a call to it, a push channel
+    /// delivers into it (Claude Code's inbox, `codex queue`, the opencode and pi plugins, Reason), or it is one of the
+    /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
+    /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
+    attached: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -215,6 +222,7 @@ impl Daemon {
             asks: Mutex::new(HashMap::new()),
             started: util::now_ms(),
             plain_until: Mutex::new(None),
+            capped: Default::default(),
         })
     }
 

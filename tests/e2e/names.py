@@ -16,6 +16,7 @@ FAKE_BIN = os.path.join(D, "bin")
 UNEXPECTED = os.path.join(D, "unexpected.log")
 RELAYS_URL = serve_relay_lists({"all": ["sfo1", "iad1", "fra1", "sin1"]}) + "/all.json"
 PROJ = os.path.join(D, "proj")
+PROJ2 = os.path.join(D, "batch")
 results = []
 
 
@@ -40,11 +41,11 @@ def cli(who, *args, **extra):
     return (r.stdout + r.stderr).strip()
 
 
-def claude(who, event, sid):
-    """A hook of a Claude Code session `sid` working in PROJ; what it prints."""
-    payload = {"session_id": sid, "cwd": PROJ}
+def claude(who, event, sid, cwd=PROJ):
+    """A hook of a Claude Code session `sid` working in `cwd`; what it prints."""
+    payload = {"session_id": sid, "cwd": cwd}
     r = subprocess.run([BIN, "hook", "claude-code", event], env=env(who), capture_output=True, text=True,
-                       input=json.dumps(payload), timeout=30, cwd=PROJ)
+                       input=json.dumps(payload), timeout=30, cwd=cwd)
     return r.stdout.strip()
 
 
@@ -61,11 +62,11 @@ def name_of(who, sid):
 
 
 class Mcp:
-    """An MCP client that gives no session id (one session per server process)."""
+    """An agent's MCP server: Claude Code's, with its session id, or a client's that gives none."""
 
-    def __init__(self, who, client):
+    def __init__(self, who, client, **extra):
         self.p = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  env=env(who), cwd=PROJ, text=True, bufsize=1)
+                                  env=env(who, **extra), cwd=PROJ, text=True, bufsize=1)
         self.id = 0
         self.req("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": client, "version": "1"}})
         self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
@@ -111,10 +112,18 @@ try:
     check("a team, signed in", "You are lars on laptop." in out, out)
 
     # --- one machine: restarts ---
-    a = you_are(claude("one", "session-start", "conv-a"))
-    b = you_are(claude("one", "session-start", "conv-b"))
+    # Two Claude Code conversations, each with its hooks and its MCP server (which Claude Code gives the session id).
+    servers = {}
+    for sid in ("conv-a", "conv-b"):
+        claude("one", "session-start", sid)
+        servers[sid] = Mcp("one", "claude-code", CLAUDE_CODE_SESSION_ID=sid)
+        servers[sid].tool("list_team", {})
+    a, b = name_of("one", "conv-a"), name_of("one", "conv-b")
     check("two Claude Code conversations in one folder", (a, b) == ("lars/proj-claude", "lars/proj-claude-2"), (a, b))
-    claude("one", "session-end", "conv-a")
+    # Both end (Claude Code restarts), and so does the daemon.
+    for sid, server in servers.items():
+        server.close()
+        claude("one", "session-end", sid)
     out = cli("one", "send", "proj-claude", "bug report for conversation A")
     check("mail for the offline conversation waits for it, and the sender is told so",
           "it reaches that session when it's back" in out and "a new session that takes this name" not in out, out)
@@ -141,6 +150,14 @@ try:
     out = cli("one", "listen", "--as", "proj-claude", "--wait", "0")
     check("listen --as the offline conversation's name gets the next free one", "You are lars/proj-claude-3." in out, out)
 
+    # A headless run only its hooks saw couldn't be messaged: its name isn't kept from the next one.
+    os.makedirs(PROJ2)
+    first = you_are(claude("one", "session-start", "run-1", cwd=PROJ2))
+    claude("one", "session-end", "run-1", cwd=PROJ2)
+    second = you_are(claude("one", "session-start", "run-2", cwd=PROJ2))
+    claude("one", "session-end", "run-2", cwd=PROJ2)
+    check("a one-shot run's name goes to the next run, not a suffix", first == second == "lars/batch-claude", (first, second))
+
     # An agent that gives no session id: as before, the next session in its place takes the name and its mail.
     zed = Mcp("one", "zed")
     out = zed.tool("list_team", {})
@@ -166,11 +183,24 @@ try:
     check("…and when one goes offline", "auth" in out and "proj-claude-2" not in out, out)
     d = claude("two", "session-start", "conv-d")
     check("a new conversation there gets none of the names kept on the first", you_are(d) not in ("lars/proj-claude", "lars/proj-claude-2"), d)
+    # Each computer has its own terminal, whatever the other's is doing.
+    out = cli("one", "listen", "--as", "terminal", "--wait", "0")
+    check("the first computer's terminal", "You are lars/terminal." in out, out)
+    until(lambda: cli("two", "who"), lambda o: re.search(r"terminal\s+cli", o) is not None)
+    out = cli("two", "listen", "--as", "terminal", "--wait", "0")
+    check("…and the second's, with the first's live: no suffix", "You are lars/terminal." in out, out)
     out = cli("two", "send", "lars/proj-claude", "from the desk")
     check("mail from there to the kept name goes to the first computer, for its conversation",
           "it reaches that session when it's back" in out, out)
     back = until(lambda: claude("one", "session-start", "conv-a"), lambda o: "from the desk" in o, secs=20)
     check("…which gets it when it's back, as itself", "from the desk" in back and name_of("one", "conv-a") == "lars/proj-claude", back)
+    check("…from the desk's terminal, by name", 'send_message to "lars/terminal@desk"' in back, back)
+    out = cli("one", "send", "lars/terminal@desk", "--from", "proj-claude", "got it, desk")
+    check("a reply to it goes to that computer", "→ lars/terminal" in out and "refused" not in out, out)
+    out = until(lambda: cli("two", "listen", "--as", "terminal", "--wait", "5"), lambda o: "got it, desk" in o, secs=30)
+    check("…and its terminal reads it", "got it, desk" in out, out)
+    out = cli("one", "listen", "--as", "terminal", "--wait", "0")
+    check("…not this one's", "got it, desk" not in out, out)
 finally:
     for w in MACHINE:
         subprocess.run([BIN, "stop"], env=env(w), capture_output=True, timeout=30)
