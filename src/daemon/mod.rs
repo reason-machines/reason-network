@@ -165,6 +165,8 @@ struct Live {
     retry: Option<(Instant, Duration)>,
     /// Bumped to end this session's `check_inbox` wait (its client gave up on it).
     stop_gen: u64,
+    /// Its MCP connection pushes into it (it registered as `push`, knowing the agent's inbox). Claude Code's only.
+    mcp_push: bool,
     /// It could be reached beyond its own hooks: an MCP server connected for it or attached a call to it, a push channel
     /// delivers into it (Claude Code's inbox, `codex queue`, the opencode and pi plugins, Reason), or it is one of the
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
@@ -323,6 +325,10 @@ impl Daemon {
                 for id in &ids {
                     g.in_flight.remove(id);
                 }
+                Value::Null
+            }
+            Request::PushFailed { key, ids } => {
+                self.push_failed(&key, &ids);
                 Value::Null
             }
             Request::Hook(h) => json!(self.hook(h).await?),

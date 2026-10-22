@@ -64,8 +64,9 @@ impl Link {
         Ok(r)
     }
 
-    pub fn is_registered(&self, key: &str) -> bool {
-        self.regs.lock().unwrap().contains_key(key)
+    /// How a registered session was said to be reached.
+    pub fn registered_tier(&self, key: &str) -> Option<Tier> {
+        self.regs.lock().unwrap().get(key).map(|r| r.tier)
     }
 
     async fn raw(&self, conn: &Conn, req: &Request) -> Result<Value> {

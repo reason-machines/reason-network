@@ -85,6 +85,7 @@ impl Daemon {
             if conn.is_some() {
                 l.conn = conn;
                 l.attached = true;
+                l.mcp_push = reg.tier == Tier::Push;
             }
             l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
             l.attached |= l.reg.tier == Tier::Push;
@@ -100,6 +101,7 @@ impl Daemon {
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
+            let mcp_push = conn.is_some() && reg.tier == Tier::Push;
             g.live.insert(
                 key.clone(),
                 Live {
@@ -116,6 +118,7 @@ impl Daemon {
                     retry: None,
                     stop_gen: 0,
                     attached,
+                    mcp_push,
                 },
             );
             self.presence_changed();

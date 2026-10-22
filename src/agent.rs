@@ -215,32 +215,40 @@ pub fn agent_pid() -> u32 {
 /// not have written its entry yet), not on every call: each look can run `ps` for each ancestor.
 pub fn claude_pid() -> Option<u32> {
     static PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    static MISSED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     if let Some(pid) = PID.get() {
         return Some(*pid);
     }
-    if MISSED.lock().unwrap().is_some_and(|t| t.elapsed() < LOOK_AGAIN) {
-        return None;
-    }
+    // Our ancestors don't change: they are looked up once (each can take a `ps`), their entries each time.
+    let chain = ancestors();
     let dir = paths::claude_sessions();
     let found = find_claude(
-        util::parent_pid(),
+        chain.first().copied().unwrap_or_else(util::parent_pid),
         std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref(),
         std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()),
         |p| registry_session_id(&dir, p),
-        parent_of,
+        |p| chain.iter().position(|a| *a == p).and_then(|i| chain.get(i + 1).copied()),
     );
-    match found {
-        Some(pid) => {
-            let _ = PID.set(pid);
-        }
-        None => *MISSED.lock().unwrap() = Some(std::time::Instant::now()),
+    if let Some(pid) = found {
+        let _ = PID.set(pid);
     }
     found
 }
 
-/// How long `claude_pid` goes by not having found the Claude process before it looks again.
-const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
+/// Our parent and its ancestors, a few levels up: found once.
+fn ancestors() -> &'static [u32] {
+    static CHAIN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    CHAIN.get_or_init(|| {
+        let mut chain = vec![util::parent_pid()];
+        while chain.len() < 5 {
+            let last = *chain.last().expect("never empty");
+            match parent_of(last) {
+                Some(p) if p > 1 && !chain.contains(&p) => chain.push(p),
+                _ => break,
+            }
+        }
+        chain
+    })
+}
 
 /// The Claude Code process in conversation `given`: the nearest of `start` and its ancestors, else `claude_pid`, whose
 /// registry entry (`entry`) names it. None without a conversation to match.
@@ -303,19 +311,18 @@ pub struct ClaudeSocket {
     pub token: Option<String>,
 }
 
-/// The inbox of the Claude Code session we serve: only the one its process's registry entry names, for the process
-/// whose entry is in our conversation (`claude_pid`). Any other is someone else's: a headless Claude run from another's
-/// shell has no entry, and a socket or `CLAUDE_PID` it inherited would be the other session's. Then nothing is pushed,
-/// and mail waits for `check_inbox`.
+/// The inbox of the Claude Code session we serve: the one Claude Code gave us (`CLAUDE_CODE_MESSAGING_SOCKET`, which it
+/// sets once its inbox listens, having dropped any it inherited), else the one named by the registry entry of the
+/// process in our conversation (`claude_pid`). Never another's: a headless Claude run from another's shell has no entry,
+/// and a `CLAUDE_PID` it inherited would be the other session's. Then nothing is pushed, and mail waits for
+/// `check_inbox`.
 pub fn claude_socket() -> Option<ClaudeSocket> {
+    let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok().filter(|s| !s.is_empty());
+    if let Some(path) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET").filter(|p| !p.is_empty()) {
+        return Some(ClaudeSocket { path: path.into(), token });
+    }
     let pid = claude_pid()?;
-    socket_of(
-        &paths::claude_sessions(),
-        pid,
-        std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET").map(PathBuf::from),
-        std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok().filter(|s| !s.is_empty()),
-        crate::claude::peer_token,
-    )
+    socket_of(&paths::claude_sessions(), pid, None, token, crate::claude::peer_token)
 }
 
 /// The inbox Claude Code process `pid`'s registry entry names, with its token: the one we were given, when that is for

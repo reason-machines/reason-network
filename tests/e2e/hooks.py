@@ -314,6 +314,73 @@ hc.kill()
 cc.kill()
 claude_proc.kill()
 
+# Pushing through Claude Code's MCP server, whenever Claude Code lists its inbox in its registry: before the server
+# starts, after its first tool call, or right after `tools/list` (the call at once, or 3 s later). Every message is
+# either put into the inbox or left unread, and the sender is told which.
+def push_case(name, when):
+    proj = os.path.join(D, f"push-{name}")
+    os.makedirs(proj)
+    sock = os.path.join(D, f"p{name[:2]}.sock")
+    frames = []
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(sock)
+    srv.listen(8)
+    def serve_inbox():
+        while True:
+            c, _ = srv.accept()
+            frames.append(c.makefile().read())
+    threading.Thread(target=serve_inbox, daemon=True).start()
+    proc = subprocess.Popen(["sleep", "300"])
+    sid = f"push-{name}"
+    def list_inbox():
+        with open(os.path.join(CLAUDE, "sessions", f"{proc.pid}.json"), "w") as f:
+            json.dump({"pid": proc.pid, "sessionId": sid, "cwd": proj, "kind": "interactive", "messagingSocketPath": sock}, f)
+    if when == "before":
+        list_inbox()
+    p = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         env=dict(env, CLAUDE_PID=str(proc.pid), CLAUDE_CODE_SESSION_ID=sid), cwd=proj, text=True)
+    rpc(p, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "1"}}})
+    reply(p, 1)
+    rpc(p, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    rpc(p, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    reply(p, 2)
+    if when.startswith("after-list"):
+        list_inbox()
+    if when == "after-list-later":
+        time.sleep(3)
+    rpc(p, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+    reply(p, 3)
+    if when == "after-call":
+        list_inbox()
+    to = f"push-{name}-claude"
+    sent = {}
+    for i in range(2):
+        body = f"push {name} {i}"
+        sent[body] = run("send", to, body)
+        time.sleep(3)
+    time.sleep(2)
+    got = "".join(frames)
+    rpc(p, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "check_inbox", "arguments": {}}})
+    unread = json.dumps(reply(p, 4))
+    for body, out in sent.items():
+        # Told it was delivered, it is in the inbox. Told it was queued, it is unread, or went in once the inbox was
+        # known: never lost, never claimed.
+        told_delivered = "delivered into the session" in out
+        check(f"push, inbox listed {when}: '{body}' reached the session as the sender was told ({'delivered' if told_delivered else 'queued'})",
+              (body in got) if told_delivered else ("queued" in out and (body in unread) != (body in got)),
+              f"send said: {out}\ninbox got: {got[-400:]}\nunread: {unread[-400:]}")
+    # Once Claude Code has listed it, the inbox is used.
+    body = f"push {name} last"
+    out = run("send", to, body)
+    time.sleep(2)
+    check(f"push, inbox listed {when}: once listed, mail goes into it", "delivered into the session" in out and body in "".join(frames),
+          out + "".join(frames)[-300:])
+    p.kill()
+    proc.kill()
+
+for name, when in [("b", "before"), ("c", "after-call"), ("n", "after-list-now"), ("l", "after-list-later")]:
+    push_case(name, when)
+
 # An agent's MCP server outlives daemon restarts without collecting zombies or storming restarts.
 mcp = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 time.sleep(4)

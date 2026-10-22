@@ -322,10 +322,11 @@ impl ReasonNetworkMcp {
             Some(id) => format!("{agent}:{id}"),
             None => format!("proc:{}", std::process::id()),
         };
-        if self.link.is_registered(&key) {
+        let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
+        // Registered already, unless its inbox has turned up since (Claude Code may list it after starting us).
+        if self.link.registered_tier(&key).is_some_and(|t| t == Tier::Push || tier != Tier::Push) {
             return Ok(key);
         }
-        let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
         let reg = SessionReg {
             key: key.clone(),
             agent: agent.to_string(),
@@ -372,7 +373,11 @@ impl ReasonNetworkMcp {
 
     async fn on_event(&self, ev: Event) {
         let Event::Deliver { key, ids, text } = ev;
-        let Some(sock) = self.claude() else { return };
+        // No inbox to put it in: the daemon takes it back, and doesn't push here again until there is one.
+        let Some(sock) = self.claude() else {
+            let _ = self.link.call::<Value>(Request::PushFailed { key, ids }).await;
+            return;
+        };
         match tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await {
             Ok(Ok(())) => {
                 let _ = self.link.call::<Value>(Request::Delivered { key, ids }).await;

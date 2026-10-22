@@ -150,6 +150,12 @@ pub enum Request {
         key: String,
         ids: Vec<String>,
     },
+    /// The client couldn't push these messages into its agent's conversation (it knows no inbox for it): they stay
+    /// unread.
+    PushFailed {
+        key: String,
+        ids: Vec<String>,
+    },
     /// An agent hook fired (`reason network hook`): keeps hook-only sessions alive and returns mail to inject.
     Hook(HookCall),
     /// For agents whose MCP calls carry no session id (Cursor, opencode): the hook-known session of this agent

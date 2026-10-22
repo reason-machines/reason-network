@@ -183,9 +183,12 @@ impl Daemon {
                 super::log(&format!("adding the Claude session of process {}: {e:#}", c.pid));
             }
         }
-        // Seen alive just now (it goes when its process does).
+        // Seen alive just now (it goes when its process does), and its inbox listed: it can be pushed into.
         if let Some(l) = self.inner.lock().unwrap().live.get_mut(&key) {
             l.last_hook = Some(now);
+            if c.messaging_socket_path.is_some() && !l.push_failed {
+                l.reg.tier = Tier::Push;
+            }
         }
     }
 

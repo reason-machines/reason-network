@@ -326,14 +326,17 @@ impl Daemon {
         }
         let has = |bin: &str| !l.push_failed && agent::find_bin(bin).is_some();
         let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
-            (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE => Channel::ClaudeSocket(conn),
+            // Its MCP server knows its inbox; else (it may not yet) the daemon posts into the one Claude Code lists.
+            (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {
+                Channel::ClaudeSocket(conn)
+            }
             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
                 Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
             }
             (Tier::Push, _, Some(id)) if l.reg.agent == "reason" && has("reason") => {
                 Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()])
             }
-            (Tier::Push, None, id) if l.reg.agent == agent::CLAUDE_CODE && !l.push_failed => {
+            (Tier::Push, _, id) if l.reg.agent == agent::CLAUDE_CODE && !l.push_failed => {
                 match claude::socket_for(id.as_deref(), l.reg.pid) {
                     Some(sock) => Channel::ClaudeDirect(sock),
                     None => Channel::Pull,
@@ -393,6 +396,22 @@ impl Daemon {
             Channel::Hook => ("queued".into(), hook_note.into()),
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
         }
+    }
+
+    /// A session's MCP server had no inbox to push `ids` into: they are unread again, for the session to read when it
+    /// checks, and nothing is pushed through it until it registers knowing one (or Claude Code lists one to post into).
+    pub(super) fn push_failed(&self, key: &str, ids: &[String]) {
+        let mut g = self.inner.lock().unwrap();
+        for id in ids {
+            g.in_flight.remove(id);
+        }
+        if let Some(l) = g.live.get_mut(key) {
+            l.mcp_push = false;
+            l.reg.tier = l.reg.tier.max(Tier::Pull);
+        }
+        log(&format!("pushing to {}: its MCP server knows no inbox; left unread", self.logged(&g, key)));
+        drop(g);
+        self.arrived.notify_waiters();
     }
 
     /// Posts into a Claude Code session's messaging socket; read once it took it.
@@ -924,6 +943,50 @@ mod tests {
             text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_is_told_delivered_only_through_a_server_that_knows_its_inbox() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        // Claude Code's MCP server, connected, before Claude Code has listed its inbox.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let claude = |tier| SessionReg {
+            key: "claude-code:a".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/web".into(),
+            agent_session_id: None,
+            pid: None,
+            tier,
+            name: None,
+        };
+        let to = d.register(Some(7), claude(Tier::Pull), crate::git::GitInfo::default()).unwrap().address;
+        let send = |body: &'static str| d.send("codex:1".into(), &to, body, None, true, false, None, Vec::new());
+        let r = send("one").await.unwrap();
+        assert_eq!((r.recipients[0].state.as_str(), rx.try_recv().is_err()), ("queued", true));
+        // Its inbox has turned up: the server registers again, as push; what waited, and the next, go through it.
+        d.register(Some(7), claude(Tier::Push), crate::git::GitInfo::default()).unwrap();
+        let r = send("two").await.unwrap();
+        assert_eq!(r.recipients[0].state, "pushed");
+        let mut pushed = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            let Event::Deliver { ids, .. } = serde_json::from_str(&line).unwrap();
+            pushed.extend(ids);
+        }
+        assert_eq!(pushed.len(), 2);
+        // The server finds it can't after all: unread again, and not pushed through it any more.
+        let key = "claude-code:a".to_string();
+        d.push_failed(&key, &pushed);
+        {
+            let g = d.inner.lock().unwrap();
+            assert!(g.in_flight.is_empty());
+            assert!(!g.live[&key].mcp_push);
+        }
+        let unread: Vec<String> = d.inner.lock().unwrap().pending(&to).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(unread, ["one", "two"]);
+        let r = send("three").await.unwrap();
+        assert_eq!((r.recipients[0].state.as_str(), rx.try_recv().is_err()), ("queued", true));
     }
 
     #[test]
