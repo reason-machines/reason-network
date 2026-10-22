@@ -121,7 +121,28 @@ impl Daemon {
     /// My session names on my other machines, so my addresses stay unique across them (see [`names_elsewhere`]).
     fn my_names_elsewhere(&self, now: i64) -> Elsewhere {
         let (Some(net), Some(team)) = (self.net(), self.team_state()) else { return Elsewhere::default() };
-        names_elsewhere(&net.remotes(), &team, &self.person, now)
+        names_elsewhere(&net.remotes(), &team, &self.person, &self.key.public(), now)
+    }
+
+    /// This machine's terminal took a name another of my machines' terminal has too, while every engine in the team
+    /// could tell two apart in a reply. Once one that can't is in the team, it takes the next free name, as it would if
+    /// it registered now. (Checked as the terminal is used: each command from it comes through here.)
+    fn recheck_terminal(&self, others: &Elsewhere) -> Result<()> {
+        let now = util::now_ms();
+        let name = {
+            let g = self.inner.lock().unwrap();
+            let Some(l) = g.live.get(TERMINAL) else { return Ok(()) };
+            if others.terminals || !others.live.contains(&l.name) {
+                return Ok(());
+            }
+            pick_name(&g, &l.reg, &l.git, others, |r| self.holds(r, now))?
+        };
+        log(&format!(
+            "{} is on another machine too, and an older engine is in the team: now {name}",
+            self.addr("terminal")
+        ));
+        self.set_status(TERMINAL, None, Some(name))?;
+        Ok(())
     }
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
@@ -268,6 +289,9 @@ impl Daemon {
             return Ok(HookReply::default());
         }
         let known = self.inner.lock().unwrap().live.contains_key(&key);
+        if known && key == TERMINAL {
+            self.recheck_terminal(&self.my_names_elsewhere(now))?;
+        }
         if !known {
             let remembered_cwd = self.inner.lock().unwrap().store.session_by_key(&key)?.map(|r| r.cwd);
             let cwd = cwd.or(remembered_cwd).unwrap_or_else(|| "/".into());
@@ -455,11 +479,19 @@ struct Elsewhere {
 /// sessions that are offline (older engines don't say which). Kept names count while that machine is online or was
 /// in the last day: one off longer can't still be keeping them, and its last presence, loaded from disk, would
 /// otherwise hold them for good.
-fn names_elsewhere(remotes: &HashMap<EndpointId, Remote>, team: &TeamState, person: &str, now: i64) -> Elsewhere {
+fn names_elsewhere(
+    remotes: &HashMap<EndpointId, Remote>,
+    team: &TeamState,
+    person: &str,
+    me: &EndpointId,
+    now: i64,
+) -> Elsewhere {
     let mut out = Elsewhere { terminals: true, ..Default::default() };
-    for (id, r) in remotes {
-        let Some(m) = team.member(id).filter(|m| m.active) else { continue };
-        out.terminals &= r.presence.has(TERMINALS);
+    for m in team.active().filter(|m| m.endpoint != *me) {
+        // A machine not heard from yet (offline since before this one joined) may be of an older engine.
+        let r = remotes.get(&m.endpoint);
+        out.terminals &= r.is_some_and(|r| r.presence.has(TERMINALS));
+        let Some(r) = r else { continue };
         if m.person != person {
             continue;
         }
@@ -1044,12 +1076,56 @@ mod tests {
             // Another person's names are theirs.
             (bob.public(), remote("bob-live", "bob-kept", true, now)),
         ]);
-        let e = names_elsewhere(&remotes, &team, "alex", now);
+        let e = names_elsewhere(&remotes, &team, "alex", &d.key.public(), now);
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
         assert_eq!(e.live, set(&["desk-live", "old-live"]));
         assert_eq!(e.kept, set(&["desk-kept"]));
         // None of those engines said it tells terminals apart by machine.
         assert!(!e.terminals);
+    }
+
+    #[test]
+    fn terminals_go_by_machine_only_once_every_machine_in_the_team_says_it_can() {
+        let d = super::super::test_daemon(crate::config::Config { person: Some("alex".into()), ..Default::default() });
+        let (desk, olga) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, desk.public(), "alex", "desk", true);
+        team.put_member(&d.key, olga.public(), "olga", "oldbox", true);
+        let now = util::now_ms();
+        let new = Remote {
+            presence: crate::net::Presence { features: vec![TERMINALS.into()], ..Default::default() },
+            last_seen: now,
+            online: true,
+        };
+        let me = d.key.public();
+        // olga's machine hasn't been heard from (it was off when this one joined): it may be an older engine.
+        let remotes = HashMap::from([(desk.public(), new.clone())]);
+        assert!(!names_elsewhere(&remotes, &team, "alex", &me, now).terminals);
+        // Heard from, and an older engine.
+        let old = Remote { presence: Default::default(), ..new.clone() };
+        let remotes = HashMap::from([(desk.public(), new.clone()), (olga.public(), old)]);
+        assert!(!names_elsewhere(&remotes, &team, "alex", &me, now).terminals);
+        // Every other machine says it can (this one isn't asked).
+        let remotes = HashMap::from([(desk.public(), new.clone()), (olga.public(), new)]);
+        assert!(names_elsewhere(&remotes, &team, "alex", &me, now).terminals);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_takes_a_suffix_once_an_older_engine_turns_up() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        assert_eq!(join(&d, named(TERMINAL, "cli", Some("terminal"))).name, "terminal");
+        mail(&d, "m1", "terminal");
+        let mut others =
+            Elsewhere { live: HashSet::from(["terminal".to_string()]), terminals: true, ..Default::default() };
+        // Every engine tells two apart: it stays `terminal`.
+        d.recheck_terminal(&others).unwrap();
+        assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
+        // An older one is in the team now: the next free name, with its mail.
+        others.terminals = false;
+        d.recheck_terminal(&others).unwrap();
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live[TERMINAL].name, "terminal-2");
+        assert_eq!(g.store.unread_count(&d.addr("terminal-2")).unwrap(), 1);
     }
 
     #[test]

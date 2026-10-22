@@ -85,8 +85,9 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
   message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine. On one of your machines
   that has its own, `<you>/terminal` alone is that one; anywhere else, with two of yours on, it is ambiguous and the
   error names each `@<machine>`, as for any two sessions of one name. An engine from before this shows the message as
-  from `<you>/terminal`, and couldn't tell two apart: while any machine in the team is one (its presence lacks the
-  `terminals` feature), the second terminal on at once is `terminal-2`, as before.
+  from `<you>/terminal`, and couldn't tell two apart: while any machine in the team may be one (its presence lacks the
+  `terminals` feature, or it hasn't been heard from), the second terminal on at once is `terminal-2`, as before. A
+  terminal named `terminal` while none was takes the next free name the next time it is used, once one is.
 - Names are kept per machine: the same conversation turning up on another machine is a new session there, and mail
   queued for it stays where it was.
 - A session whose agent gives it no id (`proc:<pid>`, one per MCP process: DeepSeek Harness, ZCode, and MCP clients

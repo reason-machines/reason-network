@@ -1,8 +1,10 @@
 """A session's name stays with its conversation across daemon restarts, here and on the person's other machine.
 
-    cargo build && env -u CLAUDE_CODE_MESSAGING_SOCKET python3 tests/e2e/names.py
+    cargo build && [REASON_NETWORK_OLD_BIN=<an older reason-network, e.g. 0.12.6>] \
+        env -u CLAUDE_CODE_MESSAGING_SOCKET python3 tests/e2e/names.py
 
-Needs internet for the second machine (iroh relays/discovery).
+Needs internet for the other machines (iroh relays/discovery). With an older build, it also checks terminals with an
+older engine in the team.
 """
 import json, os, re, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -11,7 +13,8 @@ from proofs import TRUST, proof, serve_relay_lists
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
 D = tempfile.mkdtemp(prefix="reason-network-names-")
-MACHINE = {"one": "laptop", "two": "desk"}
+MACHINE = {"one": "laptop", "two": "desk", "three": "pad", "olga": "oldbox"}
+OLD = os.environ.get("REASON_NETWORK_OLD_BIN")
 FAKE_BIN = os.path.join(D, "bin")
 UNEXPECTED = os.path.join(D, "unexpected.log")
 RELAYS_URL = serve_relay_lists({"all": ["sfo1", "iad1", "fra1", "sin1"]}) + "/all.json"
@@ -37,7 +40,8 @@ def env(who, **extra):
 
 
 def cli(who, *args, **extra):
-    r = subprocess.run([BIN, *args], env=env(who, **extra), capture_output=True, text=True, timeout=90, cwd=PROJ)
+    exe = OLD if who == "olga" else BIN
+    r = subprocess.run([exe, *args], env=env(who, **extra), capture_output=True, text=True, timeout=90, cwd=PROJ)
     return (r.stdout + r.stderr).strip()
 
 
@@ -107,7 +111,7 @@ for name in ("open", "xdg-open", "osascript", "notify-send", "codex"):
     os.chmod(os.path.join(FAKE_BIN, name), 0o755)
 
 try:
-    ep = {w: cli(w, "endpoint") for w in MACHINE}
+    ep = {w: cli(w, "endpoint") for w in ("one", "two")}
     out = cli("one", "init", "names", "--proof", proof("u_lars", "lars", ep["one"]), "--no-setup")
     check("a team, signed in", "You are lars on laptop." in out, out)
 
@@ -219,9 +223,28 @@ try:
     check("…and its terminal reads it", "got it, desk" in out, out)
     out = cli("one", "listen", "--as", "terminal", "--wait", "0")
     check("…not this one's", "got it, desk" not in out, out)
+
+    # An older engine can't tell two terminals of one person apart in a reply: while one is in the team, a second
+    # terminal on at once is `terminal-2`, as before.
+    if OLD:
+        out = cli("olga", "join", link, "--as", "olga", "--no-setup")
+        check("an older engine joins", "Joined team names as olga on oldbox." in out, out)
+        until(lambda: cli("two", "team"), lambda o: re.search(r"olga\s+oldbox\s+(direct|relay)", o) is not None)
+        out = until(lambda: cli("two", "listen", "--as", "terminal", "--wait", "0"), lambda o: "terminal-2" in o)
+        check("…so the second computer's terminal, used again, is terminal-2", "You are lars/terminal-2." in out, out)
+        # With the older machine off, a new computer of lars's joins: never having heard from it, it still counts it.
+        cli("olga", "stop")
+        until(lambda: cli("one", "team"), lambda o: not re.search(r"olga\s+oldbox\s+(direct|relay)", o))
+        link = re.search(r"https://\S+/join/#\S+", cli("one", "link")).group(0)
+        out = cli("three", "join", link, "--proof", proof("u_lars", "lars", cli("three", "endpoint")), "--no-setup")
+        check("a third computer joins while the older one is off", "Joined team names as lars on pad." in out, out)
+        until(lambda: cli("three", "who"), lambda o: "terminal-2" in o)
+        out = cli("three", "listen", "--as", "terminal", "--wait", "0")
+        check("…and its terminal takes the next free name", "You are lars/terminal-3." in out, out)
 finally:
     for w in MACHINE:
-        subprocess.run([BIN, "stop"], env=env(w), capture_output=True, timeout=30)
+        if w != "olga" or OLD:
+            subprocess.run([OLD if w == "olga" else BIN, "stop"], env=env(w), capture_output=True, timeout=30)
 log = open(UNEXPECTED).read() if os.path.exists(UNEXPECTED) else ""
 check("nothing opened a browser or reached the real notifications", log == "", log)
 print(f"\n{sum(results)}/{len(results)} checks passed  (state in {D})")
