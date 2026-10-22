@@ -78,7 +78,7 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
 /// it was last seen, unless it is one of the person's own mailboxes (`cli`), which are kept. Until then, a new session
 /// that takes the name gets the mail.
 fn offline_note(r: Option<&crate::store::Remembered>, now: i64) -> String {
-    const NAME: &str = "a new session that takes this name gets it";
+    const NAME: &str = "a new session that takes this name gets the mail";
     let Some(r) = r else { return format!("queued: the session is offline; {NAME}") };
     let seen = util::ago(r.last_seen, now);
     let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
@@ -799,7 +799,7 @@ mod tests {
             tier: Tier::Pull,
             last_seen: 0,
         };
-        let name = "a new session that takes this name gets it";
+        let name = "a new session that takes this name gets the mail";
         assert_eq!(
             offline_note(Some(&seen("codex")), 3 * HOUR),
             format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
@@ -853,7 +853,7 @@ mod tests {
         let (state, note) = d.receive(bob.public(), msg).unwrap();
         assert_eq!(state, "queued");
         assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
-        assert!(note.ends_with("; a new session that takes this name gets it"), "{note}");
+        assert!(note.ends_with("; a new session that takes this name gets the mail"), "{note}");
     }
 
     #[test]
