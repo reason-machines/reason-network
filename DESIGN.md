@@ -59,9 +59,11 @@ renamed by the agent.
 **A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
 conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table. This holds for
 a session the agent identifies and that could be reached: an MCP server connected for it or answered a call for it, a
-push channel delivers into it (Claude Code's inbox, `codex queue`, the opencode and pi plugins, Reason), or it is one of
-the person's own mailboxes. A run only its hooks ever saw (a one-shot or headless run without Reason Network's tools)
-couldn't be messaged, so its name isn't kept, and it doesn't push later sessions to `-2`, `-3`.
+push channel delivers into it (Claude Code's inbox, `codex queue`, the opencode and pi plugins, Reason), its hooks
+handed it mail (Gemini, Copilot, Grok, Cursor, Codex without its binary), it sent or was sent mail, or it is one of the
+person's own mailboxes. Once reachable, it stays so for as long as it is remembered. A run only its hooks ever saw,
+that no mail reached (a one-shot or headless run without Reason Network's tools), couldn't be messaged, so its name
+isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 
 - The same conversation coming back (the agent restarted or resumed it, or the daemon restarted) gets its name back,
   with the mail that waited for it, whichever sessions register first.
@@ -80,8 +82,11 @@ couldn't be messaged, so its name isn't kept, and it doesn't push later sessions
   a name that is kept for another session gets the next free one, and the name it asked for as soon as that is free
   again (with the mail from the other).
 - Each machine has its own `terminal`: another machine's never makes it take a suffix. A teammate's machine shows a
-  message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine; `<you>/terminal` alone is
-  the terminal of the machine it is sent from.
+  message from it as from `<you>/terminal@<machine>`, so a reply goes back to that machine. On one of your machines
+  that has its own, `<you>/terminal` alone is that one; anywhere else, with two of yours on, it is ambiguous and the
+  error names each `@<machine>`, as for any two sessions of one name. An engine from before this shows the message as
+  from `<you>/terminal`, and couldn't tell two apart: while any machine in the team is one (its presence lacks the
+  `terminals` feature), the second terminal on at once is `terminal-2`, as before.
 - Names are kept per machine: the same conversation turning up on another machine is a new session there, and mail
   queued for it stays where it was.
 - A session whose agent gives it no id (`proc:<pid>`, one per MCP process: DeepSeek Harness, ZCode, and MCP clients

@@ -240,7 +240,12 @@ pub fn send_result(r: &SendResult) -> String {
 /// recipient's agent kind, if known; `cli` when it has no Reason Network tools and replies with the CLI.
 /// Whether a message comes from a person's terminal (`<person>/terminal`, or `…@<machine>` once it is here).
 pub fn from_terminal(from: &str) -> bool {
-    from.split_once('@').map_or(from, |(a, _)| a).ends_with("/terminal")
+    without_machine(from).ends_with("/terminal")
+}
+
+/// An address without the `@<machine>` it may name.
+pub fn without_machine(address: &str) -> &str {
+    address.split_once('@').map_or(address, |(a, _)| a)
 }
 
 pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {

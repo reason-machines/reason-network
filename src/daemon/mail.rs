@@ -153,6 +153,8 @@ impl Daemon {
             let (from_addr, from_agent, from_repo) =
                 (self.addr(&sender.name), Some(sender.reg.agent.clone()), sender.git.repo.clone());
             let exclude = sender.reg.key.clone();
+            // It talks to teammates: its name stays its own.
+            self.reached(&mut g, &exclude);
             // A person at a terminal may message a group; an agent picks the one session it needs.
             if is_group(to) && !from_addr.ends_with("/terminal") {
                 bail!("agents message one session, not a group: pick it with list_team, or ask your user");
@@ -305,10 +307,13 @@ impl Daemon {
         msgs: Vec<Message>,
         wake: bool,
     ) -> (String, String) {
-        let Some(l) = g.live.get(key) else {
+        if !g.live.contains_key(key) {
             let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
             return ("queued".into(), note);
-        };
+        }
+        // Mail reached it: it is a session teammates talk to, whose name stays its own.
+        self.reached(g, key);
+        let l = &g.live[key];
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
         }
@@ -702,7 +707,7 @@ fn tidy(s: &str, extra: &str, max: usize) -> Option<String> {
 /// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that machine
 /// for this team, as its own person's answer, for that session, and of a sane size (in characters, as the sender cuts
 /// it). Which request it answers is the approver's machine's word: the frame shows `about`, for the agent to check.
-fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
+pub(super) fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
     let b = &a.body;
     let size: usize = [&b.about, &b.asker, &b.question, &b.request, &b.note].iter().map(|s| s.chars().count()).sum();
     size <= 2000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")

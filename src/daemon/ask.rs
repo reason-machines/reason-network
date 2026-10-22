@@ -5,6 +5,7 @@
 use super::{Daemon, MAX_WAIT, log, mail::unregistered};
 use crate::{
     proto::{Approval, HookCall, Message},
+    render,
     team::Signed,
     util,
 };
@@ -185,16 +186,7 @@ impl Daemon {
             }
             None => (text.to_string(), question.to_string()),
         };
-        let approval = Approval {
-            about: request.id.clone(),
-            asker: request.from.clone(),
-            approver: self.person.clone(),
-            approved,
-            question,
-            request: seen,
-            note: clip(note, 500),
-            at: util::now_ms(),
-        };
+        let approval = self.approval(request, approved, question, seen, note);
         let signed = Box::new(Signed::new(approval, &self.key, team.name(), "approval"));
         let live = self.inner.lock().unwrap().live.contains_key(key);
         let from = if live { key.to_string() } else { self.terminal().await };
@@ -207,6 +199,21 @@ impl Daemon {
                 log(&format!("couldn't send {}'s answer to {}: {e:#}", self.person, request.from));
                 format!(" (Couldn't send it to {}: {e:#}.)", request.from)
             }
+        }
+    }
+
+    /// The person's answer to `request`, as signed for its sender.
+    fn approval(&self, request: &Message, approved: bool, question: String, seen: String, note: &str) -> Approval {
+        Approval {
+            about: request.id.clone(),
+            // Its address as its own machine knows it: one from another machine's terminal names that machine here.
+            asker: render::without_machine(&request.from).to_string(),
+            approver: self.person.clone(),
+            approved,
+            question,
+            request: seen,
+            note: clip(note, 500),
+            at: util::now_ms(),
         }
     }
 
@@ -520,6 +527,34 @@ if ($script:choice) { "$($script:choice)`n$(& $chars $req $reqShown)`n$(& $chars
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_to_another_machines_terminal_verifies_there() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = super::super::test_daemon(cfg);
+        let team = crate::team::TeamState::found("acme", &d.person, &d.machine, &d.key);
+        // Bob typed it in his terminal on his laptop: here it is from `bob/terminal@laptop`.
+        let request = Message {
+            id: Ulid::generate().to_string(),
+            from: "bob/terminal@laptop".into(),
+            from_agent: Some("cli".into()),
+            from_repo: None,
+            to: "alex/api-claude".into(),
+            via: None,
+            reply_to: None,
+            body: "may I deploy?".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        let a = d.approval(&request, true, "deploy?".into(), "may I deploy?".into(), "");
+        assert_eq!(a.asker, "bob/terminal");
+        // Bob's machine checks it against its own address for the terminal.
+        let signed = Signed::new(a, &d.key, team.name(), "approval");
+        assert!(super::super::mail::approval_holds(&signed, team.name(), &d.key.public(), "alex", "bob/terminal"));
+    }
 
     #[tokio::test]
     async fn a_late_answer_reaches_the_session_but_isnt_counted_as_a_message() {

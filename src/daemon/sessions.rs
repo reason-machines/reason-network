@@ -136,6 +136,19 @@ impl Daemon {
         now - self.started > HOOK_TTL_MS
     }
 
+    /// A live session turned out reachable (mail went to it or came from it): from now on its name is kept for it.
+    pub(super) fn reached(&self, g: &mut Inner, key: &str) {
+        if let Some(l) = g.live.get_mut(key)
+            && !l.attached
+        {
+            l.attached = true;
+            let r = remembered(l, util::now_ms());
+            if let Err(e) = g.store.upsert_session(&r, &self.person) {
+                log(&format!("remembering {key}: {e:#}"));
+            }
+        }
+    }
+
     /// Before `key` takes `name`: a session that kept the name until it lapsed is forgotten, with the mail it never
     /// read, which is never another session's. A session known only by its process leaves its mail to the name.
     fn take_over(&self, g: &mut Inner, name: &str, key: &str) -> Result<()> {
@@ -307,6 +320,10 @@ impl Daemon {
         for id in &ids {
             g.in_flight.insert(id.clone(), Instant::now());
         }
+        // Its hooks hand it mail: it can be reached, and its name stays its own.
+        if !ids.is_empty() {
+            self.reached(g, &key);
+        }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
         Ok(HookReply { address: Some(address), text, ids })
     }
@@ -421,11 +438,17 @@ fn remembered(l: &Live, now: i64) -> Remembered {
 /// The key of a machine's own terminal mailbox (`<you>/terminal`).
 const TERMINAL: &str = "cli:terminal";
 
+/// What a machine's presence says when its engine shows a message from another machine's terminal as from
+/// `<person>/terminal@<machine>`, so its agents' replies reach the one it came from.
+pub(super) const TERMINALS: &str = "terminals";
+
 /// My session names on my other machines.
 #[derive(Default, Debug, PartialEq)]
 struct Elsewhere {
     live: HashSet<String>,
     kept: HashSet<String>,
+    /// Every teammate machine heard from routes replies to a terminal by machine (`TERMINALS`).
+    terminals: bool,
 }
 
 /// The session names on `person`'s other machines, from their presence: live sessions', and those kept there for
@@ -433,9 +456,11 @@ struct Elsewhere {
 /// in the last day: one off longer can't still be keeping them, and its last presence, loaded from disk, would
 /// otherwise hold them for good.
 fn names_elsewhere(remotes: &HashMap<EndpointId, Remote>, team: &TeamState, person: &str, now: i64) -> Elsewhere {
-    let mut out = Elsewhere::default();
+    let mut out = Elsewhere { terminals: true, ..Default::default() };
     for (id, r) in remotes {
-        if team.member(id).is_none_or(|m| m.person != person) {
+        let Some(m) = team.member(id).filter(|m| m.active) else { continue };
+        out.terminals &= r.presence.has(TERMINALS);
+        if m.person != person {
             continue;
         }
         out.live.extend(r.presence.sessions.iter().map(|s| s.name.clone()));
@@ -457,9 +482,10 @@ fn pick_name(
     elsewhere: &Elsewhere,
     holds: impl Fn(&Remembered) -> bool,
 ) -> Result<String> {
-    // A machine's own `terminal` is its own: another machine's never makes it take a suffix.
+    // A machine's own `terminal` is its own: another machine's never makes it take a suffix, once every engine in the
+    // team shows which machine a terminal's message came from. (An older one couldn't tell two apart in a reply.)
     let none = Elsewhere::default();
-    let elsewhere = if reg.key == TERMINAL { &none } else { elsewhere };
+    let elsewhere = if reg.key == TERMINAL && elsewhere.terminals { &none } else { elsewhere };
     let live = |n: &str| g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
     let free = |n: &str| -> Result<bool> {
         let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
@@ -751,7 +777,8 @@ mod tests {
         leave(&d, "claude-code:a", 3_600_000);
         mail(&d, "m1", "api-claude");
         // An older engine on another of my machines gave the name to a live session there.
-        let elsewhere = Elsewhere { live: HashSet::from(["api-claude".to_string()]), kept: HashSet::new() };
+        let elsewhere =
+            Elsewhere { live: HashSet::from(["api-claude".to_string()]), kept: HashSet::new(), terminals: true };
         let mut g = d.inner.lock().unwrap();
         let g = &mut *g;
         let name = pick_name(g, &claude("a"), &GitInfo::default(), &elsewhere, |_| true).unwrap();
@@ -779,6 +806,7 @@ mod tests {
         let elsewhere = Elsewhere {
             live: HashSet::from(["api-claude".to_string()]),
             kept: HashSet::from(["api-claude-2".to_string()]),
+            terminals: true,
         };
         let g = d.inner.lock().unwrap();
         assert_eq!(pick_name(&g, &claude("c"), &GitInfo::default(), &elsewhere, |_| true).unwrap(), "api-claude-3");
@@ -835,6 +863,69 @@ mod tests {
         d.hook(cursor).await.unwrap();
         assert_eq!(d.attach("cursor", "/work/api").unwrap().as_deref(), Some("cursor:r"));
         assert!(d.inner.lock().unwrap().store.session_by_key("cursor:r").unwrap().unwrap().kept());
+    }
+
+    fn gemini(id: &str, event: &str) -> HookCall {
+        HookCall {
+            agent: "gemini".into(),
+            event: event.into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_its_hooks_hand_mail_to_keeps_its_name() {
+        // Gemini is reached through its hooks only: no MCP connection or push channel ever.
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        assert_eq!(d.hook(gemini("g1", "start")).await.unwrap().address, Some(d.addr("api-gemini")));
+        mail(&d, "m1", "api-gemini");
+        let got = d.hook(gemini("g1", "stop")).await.unwrap();
+        assert!(got.text.is_some_and(|t| t.contains("for api-gemini")));
+        d.hook(gemini("g1", "end")).await.unwrap();
+        mail(&d, "m2", "api-gemini");
+        // A new conversation gets the next name, and none of g1's mail.
+        let g2 = d.hook(gemini("g2", "start")).await.unwrap();
+        assert_eq!((g2.address, g2.text.is_some()), (Some(d.addr("api-gemini-2")), false));
+        // g1, resumed, is api-gemini again, with what came meanwhile.
+        let back = d.hook(gemini("g1", "start")).await.unwrap();
+        assert_eq!(back.address, Some(d.addr("api-gemini")));
+        assert!(back.text.is_some_and(|t| t.contains("for api-gemini")));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_sends_or_is_sent_mail_keeps_its_name() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.hook(gemini("s", "start")).await.unwrap();
+        let mut copilot = gemini("r", "start");
+        copilot.agent = "copilot".into();
+        d.hook(copilot.clone()).await.unwrap();
+        // s writes to r, whose hooks haven't shown it yet.
+        d.send("gemini:s".into(), &d.addr("api-copilot"), "hi", None, true, false, None, Vec::new()).await.unwrap();
+        let g = d.inner.lock().unwrap();
+        for key in ["gemini:s", "copilot:r"] {
+            assert!(g.store.session_by_key(key).unwrap().unwrap().kept(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_stays_reachable_once_it_has_been() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.hook(gemini("g1", "start")).await.unwrap();
+        mail(&d, "m1", "api-gemini");
+        d.hook(gemini("g1", "stop")).await.unwrap();
+        d.hook(gemini("g1", "end")).await.unwrap();
+        // Back through its hooks, with no mail this time, then gone again: still kept.
+        d.hook(gemini("g1", "start")).await.unwrap();
+        d.hook(gemini("g1", "end")).await.unwrap();
+        assert!(d.inner.lock().unwrap().store.session_by_key("gemini:g1").unwrap().unwrap().kept());
+        assert_eq!(d.hook(gemini("g2", "start")).await.unwrap().address, Some(d.addr("api-gemini-2")));
     }
 
     #[test]
@@ -957,15 +1048,23 @@ mod tests {
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
         assert_eq!(e.live, set(&["desk-live", "old-live"]));
         assert_eq!(e.kept, set(&["desk-kept"]));
+        // None of those engines said it tells terminals apart by machine.
+        assert!(!e.terminals);
     }
 
     #[test]
     fn each_machine_has_its_own_terminal() {
         let d = super::super::test_daemon(Default::default());
-        let elsewhere =
-            Elsewhere { live: HashSet::from(["terminal".to_string()]), kept: HashSet::from(["review".to_string()]) };
+        let mut elsewhere = Elsewhere {
+            live: HashSet::from(["terminal".to_string()]),
+            kept: HashSet::from(["review".to_string()]),
+            terminals: false,
+        };
         let g = d.inner.lock().unwrap();
         let terminal = named(TERMINAL, "cli", Some("terminal"));
+        // While an older engine in the team couldn't tell two apart in a reply, the second one on is `terminal-2`.
+        assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal-2");
+        elsewhere.terminals = true;
         assert_eq!(pick_name(&g, &terminal, &GitInfo::default(), &elsewhere, |_| true).unwrap(), "terminal");
         // Any other session asking for it, or for a name kept elsewhere, still gets the next free one.
         let other = named("cli:t2", "cli", Some("terminal"));

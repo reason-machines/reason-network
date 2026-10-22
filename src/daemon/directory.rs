@@ -237,7 +237,7 @@ impl Daemon {
             sessions,
             known: known.into_iter().take(PRESENCE_NAMES).map(|r| r.name).collect(),
             kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), super::sessions::TERMINALS.into()],
         }
     }
 
@@ -448,9 +448,14 @@ impl Daemon {
     fn pick(&self, found: Vec<&Cand>, spec: &str, target: &dyn Fn(&Cand) -> Target) -> Result<Vec<Target>> {
         let live: Vec<&&Cand> = found.iter().filter(|c| c.live).collect();
         let mut pool: Vec<&&Cand> = if live.is_empty() { found.iter().collect() } else { live };
-        // Each machine has its own `<you>/terminal`: unnamed, it is this machine's (one elsewhere is `…@<machine>`).
-        if pool.len() > 1 && pool.iter().all(|c| c.name == "terminal" && c.person == pool[0].person) {
-            pool.retain(|c| matches!(c.place, Place::Local(_)));
+        // Each machine has its own `<you>/terminal`: unnamed on one that has its own, it is that one (another is
+        // `…@<machine>`). Anywhere else, two are ambiguous, as two sessions of any one name are.
+        let local = |c: &&&Cand| matches!(c.place, Place::Local(_));
+        if pool.len() > 1
+            && pool.iter().all(|c| c.name == "terminal" && c.person == pool[0].person)
+            && pool.iter().any(local)
+        {
+            pool.retain(local);
         }
         match pool.as_slice() {
             [] => bail!(
@@ -511,6 +516,39 @@ mod tests {
         };
         assert_eq!(to("alex/terminal").collect::<Vec<_>>(), ["here"]);
         assert_eq!(to("alex/terminal@desk").collect::<Vec<_>>(), ["desk"]);
+    }
+
+    #[test]
+    fn on_a_teammates_machine_two_terminals_of_one_person_are_ambiguous_and_one_is_found() {
+        let cfg = crate::config::Config { person: Some("bob".into()), ..Default::default() };
+        let d = super::super::test_daemon(cfg);
+        let (laptop, desk) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let mut team = crate::team::TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, laptop.public(), "alex", "laptop", true);
+        team.put_member(&d.key, desk.public(), "alex", "desk", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let mut terminal = d.row("terminal", "cli", "/", None);
+        terminal.tier = Tier::Pull;
+        let remote = |sessions: Vec<SessionInfo>| Remote {
+            presence: Presence { sessions, ..Default::default() },
+            last_seen: util::now_ms(),
+            online: true,
+        };
+        let g = d.inner.lock().unwrap();
+        // Only one of alex's machines has a terminal on: it is the one, as before.
+        let remotes =
+            HashMap::from([(laptop.public(), remote(vec![terminal.clone()])), (desk.public(), remote(vec![]))]);
+        let found = d.resolve(&g, &remotes, "alex/terminal", None).unwrap();
+        assert!(matches!(&found[..], [Target::Remote { machine_name, .. }] if machine_name == "laptop"));
+        // Both: which one, by machine (a reply to a message from one names it).
+        let remotes =
+            HashMap::from([(laptop.public(), remote(vec![terminal.clone()])), (desk.public(), remote(vec![terminal]))]);
+        let e = d.resolve(&g, &remotes, "alex/terminal", None).err().unwrap().to_string();
+        assert!(
+            e.contains("is ambiguous") && e.contains("alex/terminal@laptop") && e.contains("alex/terminal@desk"),
+            "{e}"
+        );
+        assert_eq!(d.resolve(&g, &remotes, "alex/terminal@desk", None).unwrap().len(), 1);
     }
 
     #[test]

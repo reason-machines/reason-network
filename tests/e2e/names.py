@@ -158,6 +158,24 @@ try:
     claude("one", "session-end", "run-2", cwd=PROJ2)
     check("a one-shot run's name goes to the next run, not a suffix", first == second == "lars/batch-claude", (first, second))
 
+    # Gemini is reached through its hooks only: once they hand it mail, its name is kept like any other.
+    def gemini(event, sid):
+        r = subprocess.run([BIN, "hook", "gemini", event], env=env("one"), capture_output=True, text=True,
+                           input=json.dumps({"session_id": sid, "cwd": PROJ}), timeout=30, cwd=PROJ)
+        return r.stdout.strip()
+    gemini("session-start", "g1")
+    g1 = until(lambda: cli("one", "who"), lambda o: "proj-gemini" in o)
+    cli("one", "send", "proj-gemini", "for gemini g1")
+    got = gemini("stop", "g1")
+    check("a Gemini session gets mail through its hooks", "for gemini g1" in got, got)
+    gemini("session-end", "g1")
+    cli("one", "send", "proj-gemini", "more for g1")
+    gemini("session-start", "g2")
+    out = cli("one", "who")
+    check("…and once it's gone, a new Gemini session there gets the next name", "proj-gemini-2" in out, out)
+    got = gemini("stop", "g1")
+    check("…while g1, back, is proj-gemini with what came meanwhile", "more for g1" in got, got)
+
     # An agent that gives no session id: as before, the next session in its place takes the name and its mail.
     zed = Mcp("one", "zed")
     out = zed.tool("list_team", {})
