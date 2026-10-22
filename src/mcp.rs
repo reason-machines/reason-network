@@ -373,9 +373,13 @@ impl ReasonNetworkMcp {
 
     async fn on_event(&self, ev: Event) {
         let Event::Deliver { key, ids, text } = ev;
-        // No inbox to put it in: the daemon takes it back, and doesn't push here again until there is one.
+        // No inbox to put it in: the daemon takes it back, and doesn't push here again until there is one. Off this
+        // task, which every push goes through: an older daemon doesn't know the request (its answer is a timeout).
         let Some(sock) = self.claude() else {
-            let _ = self.link.call::<Value>(Request::PushFailed { key, ids }).await;
+            let link = self.link.clone();
+            tokio::spawn(async move {
+                let _ = link.call::<Value>(Request::PushFailed { key, ids }).await;
+            });
             return;
         };
         match tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await {

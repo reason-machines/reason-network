@@ -137,6 +137,63 @@ try:
     out = until("alex", ["team"], lambda o: re.search(r"olga\s+oldbox\s+(direct|relay)", o))
     check("after both restart, people stay verified", "alex (verified)" in out and "nina (verified)" in out
           and re.search(r"olga\s+oldbox\s+(direct|relay)", out) is not None, out)
+
+    # This build's MCP server for a Claude Code session on the older machine: with no inbox to push into yet, it tells
+    # the daemon so, which an older daemon can't read. That mustn't hold up the pushes after it.
+    import json, socket, threading
+    claude_dir = os.path.join(D, "claude")
+    os.makedirs(os.path.join(claude_dir, "sessions"), exist_ok=True)
+    with open(os.path.join(claude_dir, ".claude.json"), "w") as f:
+        json.dump({"mcpServers": {"reason-network": {"type": "stdio", "command": NEW, "args": ["mcp"]}}}, f)
+    cli("olga", "stop")
+    cli("olga", "team")  # the older daemon again, now seeing Claude Code set up
+    proj = os.path.join(D, "mv-proj")
+    os.makedirs(proj)
+    claude_proc = subprocess.Popen(["sleep", "300"])
+    entry = os.path.join(claude_dir, "sessions", f"{claude_proc.pid}.json")
+    inbox_path = os.path.join(D, "mv.sock")
+    def list_session(inbox):
+        with open(entry, "w") as f:
+            json.dump({"pid": claude_proc.pid, "sessionId": "mv-1", "cwd": proj, "kind": "interactive",
+                       **({"messagingSocketPath": inbox_path} if inbox else {})}, f)
+    list_session(False)
+    until("olga", ["who"], lambda o: "mv-proj-claude" in o)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(inbox_path)
+    srv.listen(4)
+    frames = []
+    def serve_inbox():
+        while True:
+            c, _ = srv.accept()
+            frames.append(c.makefile().read())
+    threading.Thread(target=serve_inbox, daemon=True).start()
+    mcp = subprocess.Popen([NEW, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=proj, text=True,
+                           env=dict(env("olga"), CLAUDE_PID=str(claude_proc.pid), CLAUDE_CODE_SESSION_ID="mv-1"))
+    def rpc(msg):
+        mcp.stdin.write(json.dumps(msg) + "\n")
+        mcp.stdin.flush()
+    def reply(want):
+        while True:
+            m = json.loads(mcp.stdout.readline())
+            if m.get("id") == want:
+                return m
+    rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "1"}}})
+    reply(1)
+    rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+    reply(2)
+    out = cli("olga", "send", "mv-proj-claude", "first, with no inbox yet")
+    check("the older daemon pushes to this build's Claude Code server, which has no inbox yet", "→ olga/mv-proj-claude" in out, out)
+    time.sleep(2)
+    list_session(True)
+    cli("olga", "send", "mv-proj-claude", "second, once there is one")
+    deadline = time.time() + 10
+    while time.time() < deadline and "second, once there is one" not in "".join(frames):
+        time.sleep(0.5)
+    check("…and the next push still goes into the inbox once there is one", "second, once there is one" in "".join(frames),
+          "".join(frames)[-500:])
+    mcp.kill()
+    claude_proc.kill()
 finally:
     for w in WHO:
         subprocess.run([WHO[w][0], "stop"], env=env(w), capture_output=True, timeout=30)

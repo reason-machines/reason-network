@@ -26,6 +26,28 @@ struct Conn {
     tx: mpsc::UnboundedSender<String>,
     pending: Pending,
     alive: Arc<AtomicBool>,
+    /// The last failure the daemon answered with no request's id: an older daemon can't read a request it doesn't
+    /// know, and says so this way. Told to a call that then gets no answer.
+    unmatched: Arc<Mutex<Option<String>>>,
+}
+
+/// How long a call waits for the daemon's answer, at most: an older daemon never answers a request it doesn't know
+/// (it fails it under no id), and the caller mustn't wait for good. Calls that wait on purpose get that long, and more.
+fn patience(req: &Request) -> Duration {
+    match req {
+        // Up to 10 minutes each, for a message or the person's answer.
+        Request::Inbox { .. } | Request::Ask { .. } => Duration::from_secs(660),
+        // Over the network.
+        Request::CreateTeam { .. }
+        | Request::Join { .. }
+        | Request::Invite { .. }
+        | Request::Link { .. }
+        | Request::Remove { .. }
+        | Request::Leave { .. }
+        | Request::SetRelay { .. }
+        | Request::Proof { .. } => Duration::from_secs(600),
+        _ => Duration::from_secs(120),
+    }
 }
 
 pub struct Link {
@@ -70,12 +92,24 @@ impl Link {
     }
 
     async fn raw(&self, conn: &Conn, req: &Request) -> Result<Value> {
+        self.raw_within(conn, req, patience(req)).await
+    }
+
+    async fn raw_within(&self, conn: &Conn, req: &Request, patience: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         conn.pending.lock().unwrap().insert(id, tx);
         let line = serde_json::to_string(&Frame { id, body: req })?;
         conn.tx.send(line).map_err(|_| anyhow!("network daemon connection closed"))?;
-        let reply = rx.await.map_err(|_| anyhow!("network daemon connection closed"))?;
+        let reply = match tokio::time::timeout(patience, rx).await {
+            Ok(reply) => reply.map_err(|_| anyhow!("network daemon connection closed"))?,
+            Err(_) => {
+                conn.pending.lock().unwrap().remove(&id);
+                let said =
+                    conn.unmatched.lock().unwrap().take().map(|e| format!(" (it said: {e})")).unwrap_or_default();
+                bail!("no answer from the network daemon in {}s{said}; is it an older version?", patience.as_secs())
+            }
+        };
         if reply.ok {
             Ok(reply.result.unwrap_or(Value::Null))
         } else {
@@ -108,7 +142,12 @@ impl Link {
     fn spawn_io(self: &Arc<Self>, stream: ipc::Stream) -> Conn {
         let (rd, mut wr) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        let conn = Conn { tx, pending: Pending::default(), alive: Arc::new(AtomicBool::new(true)) };
+        let conn = Conn {
+            tx,
+            pending: Pending::default(),
+            alive: Arc::new(AtomicBool::new(true)),
+            unmatched: Default::default(),
+        };
         tokio::spawn(async move {
             while let Some(mut line) = rx.recv().await {
                 line.push('\n');
@@ -117,21 +156,13 @@ impl Link {
                 }
             }
         });
-        let (pending, alive, events, link) =
-            (conn.pending.clone(), conn.alive.clone(), self.events.clone(), Arc::downgrade(self));
+        let (reader, alive, events, link) =
+            (conn.clone(), conn.alive.clone(), self.events.clone(), Arc::downgrade(self));
+        let pending = conn.pending.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(rd).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                if v.get("event").is_some() {
-                    if let (Some(events), Ok(ev)) = (&events, serde_json::from_value::<Event>(v)) {
-                        let _ = events.send(ev);
-                    }
-                } else if let Ok(reply) = serde_json::from_value::<Reply>(v)
-                    && let Some(tx) = pending.lock().unwrap().remove(&reply.id)
-                {
-                    let _ = tx.send(reply);
-                }
+                reader.dispatch(&line, events.as_ref());
             }
             alive.store(false, Ordering::Relaxed);
             pending.lock().unwrap().clear();
@@ -140,6 +171,27 @@ impl Link {
             }
         });
         conn
+    }
+}
+
+impl Conn {
+    /// A line from the daemon: an event, or the reply to a call, which it hands over.
+    fn dispatch(&self, line: &str, events: Option<&mpsc::UnboundedSender<Event>>) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        if v.get("event").is_some() {
+            if let (Some(events), Ok(ev)) = (events, serde_json::from_value::<Event>(v)) {
+                let _ = events.send(ev);
+            }
+            return;
+        }
+        let Ok(reply) = serde_json::from_value::<Reply>(v) else { return };
+        match self.pending.lock().unwrap().remove(&reply.id) {
+            Some(tx) => {
+                let _ = tx.send(reply);
+            }
+            None if !reply.ok => *self.unmatched.lock().unwrap() = reply.error,
+            None => {}
+        }
     }
 }
 
@@ -258,6 +310,44 @@ fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_request_an_older_daemon_cant_read_fails_instead_of_waiting_for_good() {
+        let link = Link::existing();
+        let (tx, mut sent) = mpsc::unbounded_channel();
+        let conn = Conn {
+            tx,
+            pending: Pending::default(),
+            alive: Arc::new(AtomicBool::new(true)),
+            unmatched: Default::default(),
+        };
+        let req = Request::PushFailed { key: "claude-code:a".into(), ids: vec!["01M".into()] };
+        let call = {
+            let (link, conn) = (link.clone(), conn.clone());
+            tokio::spawn(async move { link.raw_within(&conn, &req, Duration::from_millis(300)).await })
+        };
+        // What 0.12.6 answers: a failure under no request's id.
+        let line = sent.recv().await.unwrap();
+        assert!(line.contains("push_failed"), "{line}");
+        conn.dispatch(r#"{"id":0,"ok":false,"error":"bad request: unknown variant `push_failed`"}"#, None);
+        let e = call.await.unwrap().unwrap_err().to_string();
+        assert!(
+            e.starts_with("no answer from the network daemon") && e.contains("unknown variant `push_failed`"),
+            "{e}"
+        );
+        assert!(conn.pending.lock().unwrap().is_empty());
+        // A reply to its own id still comes through.
+        let call = {
+            let (link, conn) = (link.clone(), conn.clone());
+            tokio::spawn(async move { link.raw_within(&conn, &Request::Team, Duration::from_secs(5)).await })
+        };
+        let line = sent.recv().await.unwrap();
+        let id = serde_json::from_str::<Value>(&line).unwrap()["id"].as_u64().unwrap();
+        conn.dispatch(&serde_json::to_string(&Reply::ok(id, serde_json::json!(7))).unwrap(), None);
+        assert_eq!(call.await.unwrap().unwrap(), serde_json::json!(7));
+    }
+
     #[test]
     fn a_reconnect_registers_only_the_conversation_a_server_is_in_now() {
         let reg = |key: &str, agent: &str| crate::proto::SessionReg {

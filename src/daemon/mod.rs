@@ -94,6 +94,13 @@ async fn tray() {
     }
 }
 
+/// The answer to a request this daemon can't read (from a newer client, say): under its id when that much reads, so
+/// the caller gets it rather than waiting.
+fn bad_request(line: &str, e: serde_json::Error) -> Reply {
+    let id = serde_json::from_str::<Value>(line).ok().and_then(|v| v.get("id")?.as_u64()).unwrap_or(0);
+    Reply::err(id, anyhow!("bad request: {e}"))
+}
+
 fn log(msg: &str) {
     eprintln!("[{}] {msg}", util::now_ms());
 }
@@ -274,9 +281,7 @@ impl Daemon {
             let f = match serde_json::from_str::<Frame<Request>>(&line) {
                 Ok(f) => f,
                 Err(e) => {
-                    let _ = tx.send(
-                        serde_json::to_string(&Reply::err(0, anyhow!("bad request: {e}"))).expect("reply serializes"),
-                    );
+                    let _ = tx.send(serde_json::to_string(&bad_request(&line, e)).expect("reply serializes"));
                     continue;
                 }
             };
@@ -402,4 +407,18 @@ fn test_daemon(cfg: Config) -> Daemon {
     let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
     let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
     Daemon::with(cfg, store, SecretKey::generate()).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_request_this_daemon_cant_read_is_answered_under_its_id() {
+        let line = r#"{"id":42,"op":"something_newer","key":"x"}"#;
+        let e = serde_json::from_str::<super::Frame<super::Request>>(line).unwrap_err();
+        let r = super::bad_request(line, e);
+        assert_eq!((r.id, r.ok), (42, false));
+        assert!(r.error.unwrap().starts_with("bad request:"));
+        let e = serde_json::from_str::<super::Frame<super::Request>>("not json").unwrap_err();
+        assert_eq!(super::bad_request("not json", e).id, 0);
+    }
 }
