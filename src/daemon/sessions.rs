@@ -31,6 +31,8 @@ impl Daemon {
     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
     fn hook_tier(&self, agent: &str, push_failed: bool) -> Tier {
         match agent {
+            // Native Hermes queues push events, otherwise its explicit inbox tool is the reader.
+            "hermes" => Tier::Pull,
             "codex" if !push_failed && agent::find_bin("codex").is_some() => Tier::Push,
             // Their plugin or extension delivers into idle sessions; Reason's CLI sends into its sessions.
             "opencode" | "pi" | "reason" => Tier::Push,

@@ -14,6 +14,7 @@ use std::{
     process::Command,
 };
 
+mod hermes;
 mod zcode;
 
 /// The service's name. A non-default `REASON_NETWORK_HOME` gets its own, so a second instance (or a test) can never
@@ -1204,7 +1205,15 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 11] = [
+const AGENTS: [Agent; 12] = [
+    Agent {
+        id: "hermes",
+        name: "Hermes",
+        hint: "native plugin; enable it in each Hermes profile",
+        installed: hermes::installed,
+        wired: hermes::wired,
+        apply: hermes::apply,
+    },
     Agent {
         id: "claude",
         name: "Claude Code",

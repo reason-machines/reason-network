@@ -334,8 +334,11 @@ impl Daemon {
             && has("codex")
             && l.transcript.as_deref().and_then(codex::turn_running) == Some(true);
         let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
-            // Its MCP server knows its inbox; else (it may not yet) the daemon posts into the one Claude Code lists.
-            (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {
+            // These adapters take Deliver events on this connection. Codex and Reason still
+            // use their native channels below, even when their MCP client registers as push.
+            (Tier::Push, Some(conn), _)
+                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes") =>
+            {
                 Channel::ClaudeSocket(conn)
             }
             // In a turn, its next PostToolUse (or Stop) shows it; `codex queue` would hold it until the turn ends.

@@ -141,7 +141,7 @@ fn home() -> String {
 
 /// The `folders` entry that decides for `cwd`: of those that hold it, the deepest.
 fn folder_rule<'a>(folders: &'a BTreeMap<String, String>, home: &str, cwd: &str) -> Option<(&'a str, &'a str)> {
-    let at = parts(cwd, home);
+    let at = entry_parts(cwd, home);
     folders
         .iter()
         .filter(|(k, v)| rule_holds(k, v, home))

@@ -1,4 +1,5 @@
 mod agent;
+mod bridge;
 mod claude;
 mod client;
 mod codex;
@@ -303,6 +304,8 @@ enum Cmd {
     },
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
+    /// Local JSON-lines transport for native agent adapters
+    Bridge,
     /// The menu bar icon (macOS; the background service starts it)
     #[command(hide = true)]
     Tray,
@@ -316,6 +319,7 @@ async fn main() -> Result<()> {
     match cmd {
         Some(Cmd::Daemon { service }) => daemon::run(service).await,
         Some(Cmd::Mcp) => mcp::run().await,
+        Some(Cmd::Bridge) => bridge::run().await,
         // Blocks this (the main) thread with AppKit's event loop; its daemon calls run on the runtime's workers.
         Some(Cmd::Tray) => tray::run(),
         Some(Cmd::Endpoint) => {
@@ -690,7 +694,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 println!("The daemon is not running.");
             }
         }
-        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
+        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Bridge | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
             unreachable!("handled in main")
         }
     }

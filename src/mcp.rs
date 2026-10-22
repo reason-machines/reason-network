@@ -401,11 +401,14 @@ fn off_here() -> bool {
 /// hidden files, nothing where credentials or Reason Network's state are kept. A person's `send --file` has no such
 /// limit; an agent can be talked into sending what its harness wouldn't let it read.
 fn agent_files(paths: &[String]) -> Result<Vec<Attachment>> {
+    agent_files_in(paths, &agent::cwd())
+}
+
+pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachment>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let cwd = agent::cwd();
-    let root = crate::git::lookup(&cwd).root.unwrap_or_else(|| cwd.clone());
+    let root = crate::git::lookup(cwd).root.unwrap_or_else(|| cwd.to_string());
     let confine =
         crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
             .with_folders(crate::config::Config::load_strict().unwrap_or_default());

@@ -109,6 +109,19 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 └───────────────────────────────────────────────────────────────┘
 ```
 
+The native Hermes path uses the same daemon and peer transport:
+
+```text
+Hermes conversation -> profile plugin -> reason-network bridge -> local daemon -> peer daemon
+                            ^                    |
+                            +-- delivery event --+
+```
+
+The plugin submits incoming events to the captured conversation's permitted
+input queue. It acknowledges accepted queue entries and leaves rejected mail
+unread. See the [Hermes guide](integrations/hermes/README.md#bridge-protocol)
+for adapter request/reply examples.
+
 One static Rust binary, `reason-network` (fronted by `reason network` where the Reason CLI is installed), with
 subcommands:
 
@@ -117,6 +130,9 @@ subcommands:
   from the user's Run key; there the local socket is a named pipe).
 - `reason-network mcp`: stdio MCP server spawned by the agent. Thin client of the daemon. **Must handle many
   sessions per process**: Codex, opencode and Cursor share one MCP process across threads/tabs.
+- `reason-network bridge`: JSON-lines subprocess transport for native adapters. The Hermes plugin starts one per
+  conversation, registers its profile-scoped identity and working directory, and uses it for messaging and activity.
+  The bridge confines attachment paths and accepts acknowledgements only for messages it gave that session.
 - `reason-network hook <agent>`: hook handler (status, context injection, stop-continuation, wake).
 - `reason-network who | send | listen | status | init | invite | join | setup | doctor`: the CLI. `send` goes out as
   the agent session whose shell runs it, `--from <session>`, or from a plain terminal as `<you>/terminal`;
@@ -127,7 +143,7 @@ SDK) both exist and work today. Zig has neither, which is why agent-rpc's MCP sh
 
 ## Network layer (M1)
 
-**Transport: iroh 1.3.** Each daemon is an iroh `Endpoint` with a persistent secret key
+**Transport: iroh 1.4.** Each daemon is an iroh `Endpoint` with a persistent secret key
 (`~/.reason/network/machine.key`). Peers are dialed by `EndpointId`; iroh resolves addresses via n0 DNS/pkarr, finds
 LAN peers with `iroh-mdns-address-lookup` (works with no internet), hole-punches, and falls back to a relay
 over HTTPS. Relays only see encrypted QUIC. The default relays are Reason's, one per region, as Reason lists them at
@@ -267,6 +283,7 @@ The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each
 | Codex | thread id | `_meta.sessionId` / `threadId`, `CODEX_THREAD_ID`, hooks' `session_id` |
 | opencode | session id | `_meta["ai.opencode/sessionID"]`, `OPENCODE_SESSION_ID`, the plugin's `--session` |
 | pi | session id | the extension's `REASON_NETWORK_SESSION` and `--session` |
+| Hermes | profile-scoped conversation id | profile name, hash of the plugin state directory, and captured route key (or session id); compaction keeps the registered identity |
 | Cursor | conversation id | hooks' `conversation_id` (its shared MCP server takes the session its hooks registered) |
 | Gemini CLI | session id | `GEMINI_SESSION_ID`, hooks' `session_id` |
 | Copilot CLI | session id | `COPILOT_AGENT_SESSION_ID`, hooks' `sessionId` |
@@ -314,6 +331,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Hooks need one-time approval in `/hooks`. |
 | opencode | push | Plugin (one file for 1.x and 2.x): `client.session.promptAsync` (1.x), `ctx.session.prompt` (2.x, where busy/idle come from `session.execution.*` events). |
 | pi | push | Extension (`~/.pi/agent/extensions/reason-network.ts`): registers the MCP server per session (`deferred`, with `REASON_NETWORK_SESSION`), `sendUserMessage` (`deliverAs: "steer"` mid-run, a new turn when idle), busy/idle from `agent_start`/`agent_settled`, the session name as `doing`. |
+| Hermes | pull by default; optional push | Native profile plugin over `reason-network bridge`. Explicit wake uses Hermes's permission-checked input queue and captured conversation route. Requires the companion, unreleased Hermes session APIs; see [setup and delivery](integrations/hermes/README.md). Queue acceptance acknowledges delivery, without claiming model completion; rejection leaves mail unread. |
 | Reason | push | Its agent runs in Reason's cloud: the daemon lists live sessions (`reason session list --json`, when `reason = true`) and sends with `reason session send`. Replies go through the CLI: `reason-network send <to> --from <its address>`. |
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
@@ -330,7 +348,7 @@ Gotcha: Cursor, Copilot CLI and Devin load **Claude Code's** hooks from `~/.clau
 
 ## What the agent sees
 
-Three tools, none of which an agent has to call unless it wants to message someone:
+Four tools, none of which an agent has to call unless it wants to message someone:
 
 - `list_team(filter?, all?)`: the directory, grouped by person then machine. One line per session: name,
   agent, status and for how long, repo@branch, `doing`, tier. Marks `← you`.
@@ -365,13 +383,17 @@ Three tools, none of which an agent has to call unless it wants to message someo
   answers. That is a speed bump, not a guarantee: software that controls the approver's machine can still sign (the
   machine's key is a file there, and it could build its own engine).
 
-Agents never report what they are doing; Reason Network reads it from what they record anyway (`doing.rs`): the
+For transcript-backed adapters, Reason Network reads activity from what agents record anyway (`doing.rs`): the
 session's title (Claude Code's `ai-title` transcript entries, Codex's thread names in
 `~/.codex/session_index.jsonl`, opencode's session title) and the task in progress on its own todo list
 (Claude Code's `~/.claude/tasks/<session>/`, TodoWrite, Codex's `update_plan`, Gemini's `write_todos`,
 Cursor's `todo_write`, opencode 1.x's todos). Transcripts come from hooks (`transcript_path`) or, for Claude Code,
 from its session id; only what was appended since the last look is read. A Claude Code session renamed with
 `/rename` keeps that name on Reason Network.
+
+The native Hermes plugin reports prompt, tool and turn-end activity through its bridge. It uses the active tool's
+name as `doing`, then clears it when the turn ends. Its four tools use the `reason_network_` prefix; their names and
+arguments are listed in the [Hermes integration guide](integrations/hermes/README.md).
 
 Incoming messages are framed as peer input, never as the user:
 
