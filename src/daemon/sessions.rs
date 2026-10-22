@@ -126,23 +126,29 @@ impl Daemon {
 
     /// This machine's terminal took a name another of my machines' terminal has too, while every engine in the team
     /// could tell two apart in a reply. Once one that can't is in the team, it takes the next free name, as it would if
-    /// it registered now. (Checked as the terminal is used: each command from it comes through here.)
-    fn recheck_terminal(&self, others: &Elsewhere) -> Result<()> {
+    /// it registered now. (Checked as the terminal is used: each command from it comes through here.) A rename that
+    /// fails (another session took the name meanwhile) is logged, and the command goes on: it is tried again next time.
+    fn recheck_terminal(&self, others: &Elsewhere) {
         let now = util::now_ms();
-        let name = {
-            let g = self.inner.lock().unwrap();
-            let Some(l) = g.live.get(TERMINAL) else { return Ok(()) };
-            if others.terminals || !others.live.contains(&l.name) {
-                return Ok(());
-            }
-            pick_name(&g, &l.reg, &l.git, others, |r| self.holds(r, now))?
+        let rename = || -> Result<()> {
+            let name = {
+                let g = self.inner.lock().unwrap();
+                let Some(l) = g.live.get(TERMINAL) else { return Ok(()) };
+                if others.terminals || !others.live.contains(&l.name) {
+                    return Ok(());
+                }
+                pick_name(&g, &l.reg, &l.git, others, |r| self.holds(r, now))?
+            };
+            log(&format!(
+                "{} is on another machine too, and an older engine is in the team: now {name}",
+                self.addr("terminal")
+            ));
+            self.set_status(TERMINAL, None, Some(name))?;
+            Ok(())
         };
-        log(&format!(
-            "{} is on another machine too, and an older engine is in the team: now {name}",
-            self.addr("terminal")
-        ));
-        self.set_status(TERMINAL, None, Some(name))?;
-        Ok(())
+        if let Err(e) = rename() {
+            log(&format!("renaming {}: {e:#}", self.addr("terminal")));
+        }
     }
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
@@ -290,7 +296,7 @@ impl Daemon {
         }
         let known = self.inner.lock().unwrap().live.contains_key(&key);
         if known && key == TERMINAL {
-            self.recheck_terminal(&self.my_names_elsewhere(now))?;
+            self.recheck_terminal(&self.my_names_elsewhere(now));
         }
         if !known {
             let remembered_cwd = self.inner.lock().unwrap().store.session_by_key(&key)?.map(|r| r.cwd);
@@ -1118,14 +1124,40 @@ mod tests {
         let mut others =
             Elsewhere { live: HashSet::from(["terminal".to_string()]), terminals: true, ..Default::default() };
         // Every engine tells two apart: it stays `terminal`.
-        d.recheck_terminal(&others).unwrap();
+        d.recheck_terminal(&others);
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // An older one is in the team now: the next free name, with its mail.
         others.terminals = false;
-        d.recheck_terminal(&others).unwrap();
+        d.recheck_terminal(&others);
         let g = d.inner.lock().unwrap();
         assert_eq!(g.live[TERMINAL].name, "terminal-2");
         assert_eq!(g.store.unread_count(&d.addr("terminal-2")).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_rename_that_fails_never_fails_the_command() {
+        // The name the terminal would move to can't be had (here: it is the person's own name).
+        let cfg = crate::config::Config { person: Some("terminal-2".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        assert_eq!(join(&d, named(TERMINAL, "cli", Some("terminal"))).name, "terminal");
+        let others =
+            Elsewhere { live: HashSet::from(["terminal".to_string()]), terminals: false, ..Default::default() };
+        d.recheck_terminal(&others);
+        assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
+        // The terminal's commands go on as before.
+        let call = HookCall {
+            agent: "cli".into(),
+            event: "stop".into(),
+            session_id: "terminal".into(),
+            cwd: Some("/".into()),
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: Some("terminal".into()),
+            dirs: Vec::new(),
+        };
+        assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
 
     #[test]
