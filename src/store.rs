@@ -249,9 +249,11 @@ impl Store {
         Ok(self.db.query_row("SELECT 1 FROM messages WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some())
     }
 
+    /// A mailbox's unread messages, in the order they were sent: those sent the same millisecond in the order they came
+    /// (their ids, random within a millisecond, say nothing of it).
     pub fn unread(&self, recipient: &str) -> Result<Vec<Message>> {
         let mut st = self.db.prepare_cached(&format!(
-            "SELECT {MESSAGE_COLS}, held FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0 ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS}, held FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0 ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map([recipient], |r| self.row(r))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -267,7 +269,7 @@ impl Store {
 
     pub fn held(&self) -> Result<Vec<Message>> {
         let mut st = self.db.prepare_cached(&format!(
-            "SELECT {MESSAGE_COLS}, held FROM messages WHERE held = 1 ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS}, held FROM messages WHERE held = 1 ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map([], |r| self.row(r))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -376,7 +378,7 @@ impl Store {
     /// Undelivered messages for a machine; older than a week are given up on.
     pub fn outbox_for(&self, target: &str, now: i64) -> Result<Vec<Message>> {
         self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
-        let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, id")?;
+        let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
     }
@@ -887,6 +889,22 @@ mod tests {
         assert_eq!(mailboxes(&store), ["ask-lunch", "review", "terminal"]);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn messages_sent_the_same_millisecond_come_out_in_the_order_they_came_in() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        // Ids within one millisecond are random: here the later message has the smaller one.
+        let msg = |id: &str, body: &str| Message { body: body.into(), sent_at: 1_000, ..message(id, "lars/api") };
+        for (id, body) in [("01M5Z", "do X"), ("01M5A", "never mind X")] {
+            store.insert(&mut msg(id, body), false).unwrap();
+            store.insert(&mut msg(&format!("{id}H"), body), true).unwrap();
+            store.outbox_add("peer", &msg(id, body)).unwrap();
+        }
+        let bodies = |ms: Vec<Message>| ms.into_iter().map(|m| m.body).collect::<Vec<_>>();
+        assert_eq!(bodies(store.unread("lars/api").unwrap()), ["do X", "never mind X"]);
+        assert_eq!(bodies(store.held().unwrap()), ["do X", "never mind X"]);
+        assert_eq!(bodies(store.outbox_for("peer", 1_000).unwrap()), ["do X", "never mind X"]);
     }
 
     fn temp_inbox() -> PathBuf {
