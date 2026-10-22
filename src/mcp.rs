@@ -320,12 +320,9 @@ impl ReasonNetworkMcp {
             agent: agent.to_string(),
             cwd: agent::cwd(),
             agent_session_id: id,
-            // Claude Code's own process, as its registry names it: the daemon's scan of the registry matches it.
-            pid: Some(if agent == agent::CLAUDE_CODE {
-                agent::claude_pid().unwrap_or_else(agent::agent_pid)
-            } else {
-                agent::agent_pid()
-            }),
+            // Claude Code's own process, as its registry names it: the daemon's scan of the registry matches it. None
+            // when that isn't known: any other process (a parent's) would get this session ended as that one moves on.
+            pid: if agent == agent::CLAUDE_CODE { agent::claude_pid() } else { Some(agent::agent_pid()) },
             tier,
             name: None,
         };

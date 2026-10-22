@@ -541,6 +541,36 @@ mod tests {
         assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn a_headless_claude_run_from_an_interactive_ones_shell_is_a_session_of_its_own() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        // The interactive Claude, in `outer`, in Claude Code's registry.
+        let pid = std::process::id();
+        let entry: ClaudeSession = serde_json::from_value(serde_json::json!({
+            "pid": pid, "sessionId": "outer", "cwd": "/work/api", "kind": "interactive"
+        }))
+        .unwrap();
+        d.claude_seen(&entry, GitInfo::default(), util::now_ms());
+        // A headless Claude it ran, in `inner`, with no entry: its MCP server registers it with no process.
+        let reg = SessionReg {
+            key: "claude-code:inner".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("inner".into()),
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude-2");
+        // The scan, again and again, leaves it alone.
+        for _ in 0..3 {
+            d.claude_seen(&entry, GitInfo::default(), util::now_ms());
+        }
+        let mut live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+        live.sort();
+        assert_eq!(live, ["claude-code:inner", "claude-code:outer"]);
+    }
+
     #[test]
     fn each_machine_answers_for_its_own_terminal() {
         let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };

@@ -291,8 +291,26 @@ got3 = json.dumps(reply(cc, 3))
 check("its MCP server's next call is the new conversation's, without that mail", "for the cleared conversation" not in got3, got3)
 out = run("who", "clear-proj")
 check("…so one session shows for it", out.count("clear-proj-claude") == 1, out)
-out = subprocess.run([BIN, "status"], env=dict(cc_env, CLAUDECODE="1"), capture_output=True, text=True, timeout=30).stdout
-check("…and its shell is that conversation (the cleared one keeps its name, for /resume)", "You are alex/clear-proj-claude-2." in out, out)
+# A shell Claude Code starts in the new conversation (the cleared one keeps its name, for /resume).
+shell_env = dict(cc_env, CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="after-clear")
+out = subprocess.run([BIN, "status"], env=shell_env, capture_output=True, text=True, timeout=30).stdout
+check("…and a shell it starts now is that conversation", "You are alex/clear-proj-claude-2." in out, out)
+# A headless Claude run from that session's shell: no registry entry of its own, its server started in `inner`. The
+# entry above it is the other conversation's, so it is a session of its own, which the scan leaves alone.
+hc = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      env=dict(cc_env, CLAUDE_CODE_SESSION_ID="inner"), cwd=clear_dir, text=True)
+rpc(hc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code", "version": "1"}}})
+reply(hc, 1)
+rpc(hc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+rpc(hc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+reply(hc, 2)
+time.sleep(5)
+out = run("who", "clear-proj")
+log = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read()
+check("a headless Claude run from it is a session of its own, not its parent's conversation",
+      "clear-proj-claude-3" in out and "clear-proj-claude-2" in out and "(claude-code:inner) ended" not in log
+      and "claude-code:inner) registered" in log, out + log[-800:])
+hc.kill()
 cc.kill()
 claude_proc.kill()
 

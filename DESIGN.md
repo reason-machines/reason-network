@@ -282,9 +282,11 @@ Agent kind comes from MCP `clientInfo.name` plus env (`CLAUDECODE`, `CODEX_*`, `
 **Passive discovery.** Claude Code writes every live session to `~/.claude/sessions/<pid>.json` (name, cwd,
 busy/idle). The daemon reads these, so Claude sessions show up with live busy/idle status even without our
 MCP server loaded. Our MCP server reads the conversation it serves from there too, from the entry of the Claude Code
-process it runs under (the nearest of its ancestors with an entry, else `CLAUDE_PID`; `CLAUDE_CODE_SESSION_ID` when
-there is none): after `/clear` the same process is in a new conversation, which the server then serves, and the one
-before ends. The daemon's scan ends it as soon as the registry names the new one, by the process the server registered
+process it runs under: the nearest of its ancestors, else `CLAUDE_PID`, whose entry names the conversation it was
+started in (`CLAUDE_CODE_SESSION_ID`), followed from then on. After `/clear` the same process is in a new conversation,
+which the server then serves, and the one before ends. With no such entry (a headless Claude run from an interactive
+one's shell has none, and the entry above it is the other conversation's), it goes by `CLAUDE_CODE_SESSION_ID` and
+registers no process, so nothing ends it but its own server. The daemon's scan ends it as soon as the registry names the new one, by the process the server registered
 it under, so mail for it waits for it instead of going into the new conversation before the server's next call. Any MCP
 server that serves one session at a time (not Codex's, opencode's or Cursor's) ends its session when it registers or
 takes up another, also one the registry scan or its hooks already registered.

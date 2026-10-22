@@ -207,10 +207,12 @@ pub fn agent_pid() -> u32 {
     std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()).unwrap_or_else(util::parent_pid)
 }
 
-/// The Claude Code process we run under, if any: the nearest of our ancestors with an entry in its session registry (a
-/// shell or a launcher can sit between), else `CLAUDE_PID` when Claude Code sets it. Kept once found: it is the same for
-/// our whole life. Not found, it is looked for again after a while (Claude Code may not have written its entry yet), not
-/// on every call: each look can run `ps` for each ancestor.
+/// The Claude Code process we run under, if any: the nearest of our ancestors (a shell or a launcher can sit between),
+/// else `CLAUDE_PID`, whose entry in Claude Code's session registry names the conversation Claude Code started us in
+/// (`CLAUDE_CODE_SESSION_ID`). Another's isn't ours: a headless Claude run from an interactive one's shell has no entry
+/// of its own, and the entry above it is the other conversation's. Kept once found, and its entry followed from then
+/// on (after `/clear` it names the new conversation). Not found, it is looked for again after a while (Claude Code may
+/// not have written its entry yet), not on every call: each look can run `ps` for each ancestor.
 pub fn claude_pid() -> Option<u32> {
     static PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     static MISSED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
@@ -221,8 +223,13 @@ pub fn claude_pid() -> Option<u32> {
         return None;
     }
     let dir = paths::claude_sessions();
-    let found = registry_ancestor(util::parent_pid(), |p| dir.join(format!("{p}.json")).is_file(), parent_of)
-        .or_else(|| std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()));
+    let found = find_claude(
+        util::parent_pid(),
+        std::env::var("CLAUDE_CODE_SESSION_ID").ok().as_deref(),
+        std::env::var("CLAUDE_PID").ok().and_then(|s| s.parse().ok()),
+        |p| registry_session_id(&dir, p),
+        parent_of,
+    );
     match found {
         Some(pid) => {
             let _ = PID.set(pid);
@@ -234,6 +241,20 @@ pub fn claude_pid() -> Option<u32> {
 
 /// How long `claude_pid` goes by not having found the Claude process before it looks again.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The Claude Code process in conversation `given`: the nearest of `start` and its ancestors, else `claude_pid`, whose
+/// registry entry (`entry`) names it. None without a conversation to match.
+fn find_claude(
+    start: u32,
+    given: Option<&str>,
+    claude_pid: Option<u32>,
+    entry: impl Fn(u32) -> Option<String>,
+    parent: impl Fn(u32) -> Option<u32>,
+) -> Option<u32> {
+    let given = given.filter(|g| !g.is_empty())?;
+    let ours = |p: u32| entry(p).as_deref() == Some(given);
+    registry_ancestor(start, ours, parent).or_else(|| claude_pid.filter(|p| ours(*p)))
+}
 
 /// The nearest of `pid` and its ancestors (a few levels up) that `has_entry`.
 fn registry_ancestor(
@@ -368,6 +389,26 @@ mod tests {
         // Not past init, nor round a loop.
         assert_eq!(registry_ancestor(900, |p| p == 1, parent), None);
         assert_eq!(registry_ancestor(5, |_| false, |_| Some(5)), None);
+    }
+
+    #[test]
+    fn the_claude_process_is_the_one_whose_entry_names_our_conversation() {
+        // 900 (us) ← 800 (a headless Claude, no entry) ← 700 (an interactive Claude, in `outer`) ← 1.
+        let parent = |p: u32| match p {
+            900 => Some(800),
+            800 => Some(700),
+            700 => Some(1),
+            _ => None,
+        };
+        let entry = |p: u32| (p == 700).then(|| "outer".to_string());
+        // The headless Claude's server, started in `inner`: not the interactive one's, by walking up or by CLAUDE_PID.
+        assert_eq!(find_claude(900, Some("inner"), None, entry, parent), None);
+        assert_eq!(find_claude(900, Some("inner"), Some(700), entry, parent), None);
+        // The interactive one's own server.
+        assert_eq!(find_claude(900, Some("outer"), None, entry, parent), Some(700));
+        assert_eq!(find_claude(5, Some("outer"), Some(700), entry, |_| None), Some(700));
+        // Nothing to match by.
+        assert_eq!(find_claude(900, None, Some(700), entry, parent), None);
     }
 
     #[test]
