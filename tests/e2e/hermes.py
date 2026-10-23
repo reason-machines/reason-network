@@ -350,6 +350,38 @@ class NativeHermes(unittest.TestCase):
         self.network.finalize(session_id="after-compression")
         self.assertFalse(original["bridge"].alive)
 
+    def assert_late_delivery_is_ignored(self, close):
+        sender, target = self.start("sender"), self.start("closing")
+        entered, release, finished = (threading.Event() for _ in range(3))
+        receive = self.network.receive
+        def paused_receive(session, event):
+            entered.set()
+            try:
+                if not release.wait(10):
+                    raise TimeoutError("test did not release the pending callback")
+                return receive(session, event)
+            finally:
+                finished.set()
+        self.network.receive = paused_receive
+        try:
+            self.send(sender, target, "message arriving while closing")
+            self.assertTrue(entered.wait(5))
+            close()
+            self.assertNotIn("closing", self.network._sessions)
+            self.assertFalse(target["bridge"].alive)
+            release.set()
+            self.assertTrue(finished.wait(5))
+            self.assertEqual(self.context.received, [], "an old callback injected into a closed conversation")
+        finally:
+            release.set()
+            target["bridge"]._delivery.join(timeout=5)
+
+    def test_finalization_ignores_a_delivery_callback_already_in_flight(self):
+        self.assert_late_delivery_is_ignored(lambda: self.network.finalize(session_id="closing"))
+
+    def test_unload_ignores_a_delivery_callback_already_in_flight(self):
+        self.assert_late_delivery_is_ignored(self.network.close)
+
     def test_cancelled_inbox_releases_the_wait_without_consuming_future_mail(self):
         from tools.interrupt import clear_current_thread_interrupt, set_interrupt
         self.context.wake = False

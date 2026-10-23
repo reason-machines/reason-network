@@ -210,6 +210,10 @@ class Network:
         with self._lock:
             if event.get("key") != session["key"]:
                 return
+            # A queued callback may outlive finalization, unload or replacement
+            # of a failed adapter. It must not inject into the old route.
+            if not session["bridge"].alive or not any(current is session for current in self._sessions.values()):
+                return
             accepted = False
             # Settings are profile-scoped and read afresh. Revocation applies even if
             # this conversation has not run another turn since wake was disabled.

@@ -73,6 +73,8 @@ it never substitutes a history id or guesses another chat. A successful queue
 operation means **accepted by Hermes**, not that the model completed the task.
 If the queue refuses delivery, the message stays unread and Reason falls back
 to pull. Reset, finalization and unload close the conversation's adapter.
+Delivery callbacks already in flight are ignored after that adapter is closed
+or removed, so they cannot queue input into an ended conversation.
 Compaction preserves its address and refreshes the route on the next turn.
 Disabling wake is checked again before every incoming queue operation, including
 while the conversation is idle. Enabling wake takes effect on its next interactive turn.
