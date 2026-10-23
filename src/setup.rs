@@ -1451,6 +1451,9 @@ pub async fn doctor() -> Result<()> {
             let team = crate::shown(&t.name);
             println!("✓ daemon running; team {team} with {others} other machine(s), {online} connected");
             print!("{}", crate::shown(&render::team(&t)).lines().skip(1).map(|l| format!("{l}\n")).collect::<String>());
+            if let Some(u) = &t.udp {
+                println!("  {}", render::udp_port(u));
+            }
             if t.relay_connected == Some(false) {
                 let relay = crate::shown(&t.relay.clone().unwrap_or_else(render::default_relays));
                 println!(

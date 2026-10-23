@@ -407,6 +407,17 @@ pub struct TeamInfo {
     /// (UTC) from six before today to tomorrow that had any. Older engines leave it out.
     #[serde(default)]
     pub messages: Vec<DayCount>,
+    /// The UDP port the network is on (`None` while it isn't up). Older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp: Option<UdpPort>,
+}
+
+/// The UDP port direct paths come in on, and the one `port` in the config asked for, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpPort {
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -509,6 +520,7 @@ mod tests {
             machines: vec![],
             features: vec![],
             messages: vec![DayCount { day: "2026-10-20".into(), sent: 3, received: 1 }],
+            udp: Some(UdpPort { port: 41641, fixed: Some(41641) }),
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["team_id"], "00112233445566778899aabbccddeeff");
@@ -521,6 +533,8 @@ mod tests {
             .unwrap();
         assert_eq!((old.id.as_str(), old.name.as_str()), ("", "vibes"));
         assert!(old.messages.is_empty());
+        assert_eq!(v["udp"], serde_json::json!({"port": 41641, "fixed": 41641}));
+        assert!(old.udp.is_none());
     }
 
     #[test]

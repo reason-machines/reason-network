@@ -225,6 +225,15 @@ pub fn team(t: &TeamInfo) -> String {
     out
 }
 
+/// The UDP port the network is on, and whether it is the one `port` in the config asked for.
+pub fn udp_port(u: &crate::proto::UdpPort) -> String {
+    match u.fixed {
+        None => format!("UDP port {} (random)", u.port),
+        Some(f) if f == u.port => format!("UDP port {} (fixed)", u.port),
+        Some(f) => format!("UDP port {} (fixed {f} was taken; using random {})", u.port, u.port),
+    }
+}
+
 pub fn send_result(r: &SendResult) -> String {
     let mut out = String::new();
     for rc in &r.recipients {
@@ -433,10 +442,22 @@ mod tests {
             machines: Vec::new(),
             features: Vec::new(),
             messages: Vec::new(),
+            udp: None,
         };
         assert_eq!(team(&t), "team vibes · relay: Reason's (the default)\n");
         t.relay = Some("https://relay.example.com".into());
         assert_eq!(team(&t), "team vibes · relay: https://relay.example.com\n");
+    }
+
+    #[test]
+    fn doctor_says_which_udp_port_and_why() {
+        use crate::proto::UdpPort;
+        assert_eq!(udp_port(&UdpPort { port: 41641, fixed: Some(41641) }), "UDP port 41641 (fixed)");
+        assert_eq!(udp_port(&UdpPort { port: 53211, fixed: None }), "UDP port 53211 (random)");
+        assert_eq!(
+            udp_port(&UdpPort { port: 53211, fixed: Some(41641) }),
+            "UDP port 53211 (fixed 41641 was taken; using random 53211)"
+        );
     }
 
     /// A directory of one teammate's session, with these fields as its machine and presence gave them.

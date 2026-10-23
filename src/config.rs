@@ -20,6 +20,10 @@ pub struct Config {
     pub reason: bool,
     /// Install new releases when they come out (the daemon checks every few hours).
     pub auto_update: bool,
+    /// The UDP port teammates reach this machine on directly, e.g. `41641` for a firewall or router rule. None: a
+    /// random one each start. Taken by something else, a random one is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub inbound: Inbound,
     /// Folders whose sessions stay off the network, e.g. `"~/personal" = "off"` (`reason-network folder`). The deepest
     /// entry that holds a session's folder decides; `off` is the only value so far.
@@ -63,6 +67,7 @@ impl Default for Config {
             tray: true,
             reason: false,
             auto_update: true,
+            port: None,
             inbound: Inbound::default(),
             folders: BTreeMap::new(),
         }
@@ -306,6 +311,19 @@ mod tests {
         assert!(!Config::default().off_in("/h/alex/work"));
         let parsed: Config = toml::from_str("[folders]\n\"~/personal\" = \"off\"\n").unwrap();
         assert!(parsed.off_in(&format!("{}/personal/x", home())));
+    }
+
+    #[test]
+    fn a_fixed_port_is_optional() {
+        let parsed: Config = toml::from_str("lan = true\n").unwrap();
+        assert_eq!(parsed.port, None);
+        assert!(!toml::to_string_pretty(&parsed).unwrap().contains("port"), "unset: not written");
+        let parsed: Config = toml::from_str("port = 41641\n").unwrap();
+        assert_eq!(parsed.port, Some(41641));
+        assert!(toml::to_string_pretty(&parsed).unwrap().contains("port = 41641"));
+        for bad in ["port = 70000", "port = -1", "port = \"41641\""] {
+            assert!(toml::from_str::<Config>(bad).is_err(), "{bad}");
+        }
     }
 
     fn temp() -> std::path::PathBuf {
