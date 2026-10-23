@@ -14,6 +14,7 @@ import time
 import unittest
 from types import SimpleNamespace
 import shutil
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get("REASON_TEST_BIN", ROOT / "target/debug/reason-network"))
@@ -29,6 +30,7 @@ class Context:
         self.directory = str(directory)
         self.route = "route-first"
         self.wake = wake
+        self.executable = str(BIN)
         self.accept = True
         self.received = []
         self.delivered = threading.Event()
@@ -43,7 +45,7 @@ class Context:
         return True
 
     def get_config(self, key, default=None):
-        return {"executable": str(BIN), "wake": self.wake}.get(key, default)
+        return {"executable": self.executable, "wake": self.wake}.get(key, default)
 
     def session_cwd(self):
         return self.directory
@@ -58,6 +60,23 @@ class Context:
         self.received.append((session_key, text))
         self.delivered.set()
         return self.accept
+
+
+STAND_IN_ENGINE = '''
+import json, sys, time
+for line in sys.stdin:
+    call = json.loads(line)
+    result = {}
+    if call.get("op") == "register":
+        key = call["session"]["key"]
+        if key.endswith(":slow"):
+            open(MARKER, "w").close()
+            time.sleep(8)
+        result = {"address": key}
+    elif call.get("op") == "unread":
+        result = {"count": 0}
+    print(json.dumps({"id": call["id"], "ok": True, "result": result}), flush=True)
+'''
 
 
 class ObservedTurnLock:
@@ -243,8 +262,9 @@ class NativeHermes(unittest.TestCase):
         refused, release, refusal_done, turn_done, fresh_delivery = (threading.Event() for _ in range(5))
         result = []
         watched_name = "test-bound-turn"
-        observed_lock = ObservedTurnLock(self.network._lock, watched_name)
-        self.network._lock = observed_lock
+        # The conversation's own lock: a bound turn waits for its stale refusal, other conversations don't.
+        observed_lock = ObservedTurnLock(target["lock"], watched_name)
+        target["lock"] = self.network._turns["target"] = observed_lock
         request = target["bridge"].request
         inject = self.context.inject_message
         receive = self.network.receive
@@ -426,6 +446,71 @@ class NativeHermes(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bridge.request(op, key=sender["key"], ids=ids)
         self.assertIn("do not consume", self.network.inbox(target))
+
+    @unittest.skipIf(os.name == "nt", "the stand-in engine is a script with a shebang")
+    def test_a_slow_answer_for_one_conversation_does_not_stall_another(self):
+        # A stand-in engine that takes 8 s to register one conversation, as a busy daemon might.
+        marker = self.directory / "slow-register-received"
+        engine = self.directory / "stand-in-engine"
+        engine.write_text(f"#!{sys.executable}\n" + STAND_IN_ENGINE.replace("MARKER", repr(str(marker))),
+                          encoding="utf-8")
+        engine.chmod(0o755)
+        self.context.executable, self.context.route = str(engine), ""
+        slow_done = threading.Event()
+        def slow_turn():
+            self.network.before_turn(session_id="slow", platform="desktop")
+            slow_done.set()
+        threading.Thread(target=slow_turn, daemon=True).start()
+        deadline = time.monotonic() + 5
+        while not marker.exists():
+            self.assertLess(time.monotonic(), deadline, "the slow registration never reached the engine")
+            time.sleep(0.01)
+        started = time.monotonic()
+        self.assertIsNotNone(self.network.before_turn(session_id="fast", platform="desktop"))
+        self.assertLess(time.monotonic() - started, 2, "an unrelated conversation waited on the slow one")
+        self.assertFalse(slow_done.is_set())
+        self.assertTrue(slow_done.wait(15))
+
+    def test_an_oversized_frame_ends_only_that_adapter(self):
+        first, other = self.start(), self.start("other")
+        # One line over the 1 MiB cap: the adapter stops rather than buffering it.
+        first["bridge"].process.stdin.write('{"id":1,"op":"unread","key":"' + "x" * (1024 * 1024) + '"}\n')
+        first["bridge"].process.stdin.flush()
+        self.assertIsNotNone(first["bridge"].process.wait(timeout=10))
+        with self.assertRaises(RuntimeError):
+            first["bridge"].request("unread", key=first["key"], timeout=5)
+        # The daemon and the other conversation's adapter are unaffected.
+        self.assertEqual(other["bridge"].request("unread", key=other["key"])["count"], 0)
+
+    def test_an_older_hermes_without_the_plugin_apis_loads_nothing(self):
+        registered = []
+        older = SimpleNamespace(  # What released Hermes gives a plugin today: no routing key or cancellation.
+            register_hook=lambda *a, **k: registered.append(a), register_tool=lambda **k: registered.append(k),
+            on_unload=registered.append, session_cwd=lambda: "", session_surface=lambda: "cli",
+            inject_message=lambda *a, **k: False,
+        )
+        with self.assertLogs(plugin.log, "WARNING") as logs:
+            plugin.register(older)
+        self.assertEqual(registered, [])
+        self.assertIn("session_key", logs.output[0])
+        self.assertIn("is_interrupted", logs.output[0])
+
+    def test_the_engine_is_found_where_the_installers_put_it(self):
+        home, previous = self.directory / "home", dict(os.environ)
+        name = "reason-network.exe" if os.name == "nt" else "reason-network"
+        local, app = home / ".local" / "bin" / name, home / ".reason" / "bin" / name
+        self.context.executable = ""
+        os.environ.update(HOME=str(home), USERPROFILE=str(home), PATH="")
+        try:
+            app.parent.mkdir(parents=True)
+            app.write_text("")
+            self.assertEqual(self.network.executable(), str(app))
+            local.parent.mkdir(parents=True)
+            local.write_text("")
+            self.assertEqual(self.network.executable(), str(local))
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
 
     def test_real_hermes_loader_routes_through_its_permission_checked_queue(self):
         from agent.runtime_cwd import reset_session_cwd, set_session_cwd

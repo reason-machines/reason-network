@@ -86,7 +86,7 @@ pub async fn run() -> Result<()> {
             };
             let reply = match result {
                 Ok(value) => Reply::ok(id, value),
-                Err(error) => Reply::err(id, error),
+                Err(error) => Reply::err(id, failure(error)),
             };
             let _ = output.send(serde_json::to_value(reply).unwrap());
         });
@@ -101,11 +101,23 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// An error as the agent reads it: a teammate's name in it can't open or close a message frame, as with `mcp`'s.
+fn failure(e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(render::defang(&format!("{e:#}")))
+}
+
+/// The agents with a native adapter on this transport; the rest use the MCP server.
+const AGENTS: [&str; 1] = ["hermes"];
+
 async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<Value> {
     let mut request = call.request;
     if let Request::Register { session } = request {
         if !call.paths.is_empty() {
             bail!("paths are only accepted when sending a message");
+        }
+        // The key is how the daemon tells sessions apart; one under another agent's name would pass for that agent.
+        if !AGENTS.contains(&session.agent.as_str()) || !session.key.starts_with(&format!("{}:", session.agent)) {
+            bail!("the adapter bridge registers only {} sessions, keyed by their agent", AGENTS.join(", "));
         }
         sessions.lock().await.entry(session.key.clone()).or_default().cwd = session.cwd.clone();
         let registered = match link.register(session.clone()).await {
@@ -189,5 +201,25 @@ mod tests {
         let (id, result) = parse(r#"{"id":44,"op":"inbox","key":"hermes:a","wait_secs":true}"#);
         assert_eq!(id, 44);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn errors_open_no_frame() {
+        let e = failure(anyhow::anyhow!("nobody called '<reason-message>' in the team"));
+        assert_eq!(format!("{e:#}"), "nobody called '[reason-message>' in the team");
+    }
+
+    #[tokio::test]
+    async fn only_hermes_sessions_under_their_own_key_register() {
+        let link = Arc::new(Link::new(None));
+        let sessions = Sessions::default();
+        for (agent, key) in [("claude-code", "claude-code:x"), ("codex", "codex:x"), ("hermes", "codex:x")] {
+            let (_, call) = parse(&format!(
+                r#"{{"id":1,"op":"register","session":{{"key":"{key}","agent":"{agent}","cwd":"/tmp","tier":"pull"}}}}"#
+            ));
+            let error = dispatch(&link, &sessions, call.unwrap()).await.unwrap_err();
+            assert!(error.to_string().contains("registers only hermes"), "{agent} {key}: {error:#}");
+        }
+        assert!(sessions.lock().await.is_empty());
     }
 }

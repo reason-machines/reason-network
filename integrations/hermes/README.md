@@ -9,7 +9,7 @@ This plugin does not share histories, model subscriptions, filesystems or permis
 
 Install Reason Network and sign this computer into the intended network first:
 <https://reasonmachines.com/network>. Build this checkout with
-`cargo build --locked --no-default-features`; the native plugin needs that engine's
+`cargo build --locked`; the native plugin needs that engine's
 `bridge` command. Point Hermes at the built executable as shown below.
 
 This integration also requires the companion Hermes public plugin API changes,
@@ -17,11 +17,14 @@ which are not yet released. `ctx.is_interrupted()` is required for inbox and
 human-answer waits; `ctx.session_key()` and
 `ctx.session_supports_async_delivery()` provide routing and wake support.
 Use the generic Reason Network MCP integration until your Hermes build contains
-these APIs. Enabling the native plugin alone does not add them.
+these APIs. Enabling the native plugin alone does not add them: on an older
+Hermes it logs which APIs are missing and registers nothing, and `setup` skips
+that Hermes rather than installing the plugin.
 
 From a checkout of this repository, copy this directory to
 `<Hermes profile home>/plugins/reason-network`. Alternatively, the built engine's
-`setup` command installs the bundled plugin in the active profile. A catalog-managed or
+`setup` command installs the bundled plugin in the active profile, once that
+Hermes has the APIs. A catalog-managed or
 customized copy is preserved. Then run in that same Hermes profile:
 
 ```sh
@@ -33,8 +36,9 @@ additional profile. Hermes defaults to `~/.hermes` on macOS/Linux and
 `%LOCALAPPDATA%\hermes` on Windows. Reason setup follows `HERMES_HOME`, the
 data-directory suffix, and the sticky active profile. It does not rewrite YAML.
 
-The plugin first looks for `reason-network` on PATH, then falls back to
-`~/.reason/bin/reason-network` (`reason-network.exe` on Windows). Use Hermes's
+The plugin first looks for `reason-network` on PATH, then in `~/.local/bin`
+(where `install.sh` and `install.ps1` put it), then `~/.reason/bin`
+(`reason-network.exe` on Windows). Use Hermes's
 own config writer to select the bridge-capable engine you built:
 
 ```sh
@@ -164,7 +168,7 @@ The exact operation fields are the existing `Request` types in `src/proto.rs`;
 Build the engine and run the isolated integration tests with Hermes importable:
 
 ```sh
-cargo build --locked --no-default-features
+cargo build --locked
 PYTHONPATH=/path/to/hermes-agent /path/to/hermes-test-python tests/e2e/hermes.py
 ```
 

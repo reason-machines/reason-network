@@ -131,15 +131,25 @@ class Bridge:
 class Network:
     def __init__(self, ctx):
         self.ctx = ctx
-        self._lock = threading.RLock()
+        # Guards the two maps only, never held across adapter or Hermes calls, so a
+        # slow answer for one conversation cannot stall the others in a gateway.
+        self._lock = threading.Lock()
         self._sessions = {}
+        # One lock per conversation: its turn refresh, deliveries and replacement
+        # run one at a time, so an old refusal cannot undo a newer registration.
+        self._turns = {}
         self.profile_id = None
 
+    def turn_lock(self, session_id):
+        with self._lock:
+            return self._turns.setdefault(session_id, threading.RLock())
+
+    def current(self, session_id):
+        with self._lock:
+            return self._sessions.get(session_id)
+
     def interrupted(self):
-        probe = getattr(self.ctx, "is_interrupted", None)
-        if probe is None:
-            raise RuntimeError("Native Reason inbox/waits need Hermes's ctx.is_interrupted API; update Hermes or use MCP")
-        return probe()
+        return self.ctx.is_interrupted()
 
     def executable(self):
         configured = self.ctx.get_config("executable", "")
@@ -148,13 +158,18 @@ class Network:
         found = shutil.which("reason-network")
         if found:
             return found
-        return str(Path.home() / ".reason" / "bin" / ("reason-network.exe" if os.name == "nt" else "reason-network"))
+        # Where install.sh/install.ps1 put it, then where the Reason app keeps its copy;
+        # a gateway started by a service manager may not have either on PATH.
+        name = "reason-network.exe" if os.name == "nt" else "reason-network"
+        candidates = [Path.home() / ".local" / "bin" / name, Path.home() / ".reason" / "bin" / name]
+        return str(next((path for path in candidates if path.is_file()), candidates[0]))
 
     def session(self, session_id, platform=None):
         if not session_id:
             raise ValueError("Reason tools require an active Hermes conversation")
-        with self._lock:
-            previous = self._sessions.get(session_id)
+        lock = self.turn_lock(session_id)
+        with lock:
+            previous = self.current(session_id)
             if previous and previous["bridge"].alive:
                 if platform is not None:
                     route, interactive, wake = self.delivery_mode(platform)
@@ -176,22 +191,23 @@ class Network:
             if self.profile_id is None:
                 self.profile_id = hashlib.sha256(str(self.ctx.state.data_dir).encode("utf-8")).hexdigest()[:32]
             ident = f"{self.ctx.profile_name}:{self.profile_id}:{route if interactive and route else session_id}"
-            session = {"key": f"hermes:{ident}", "id": ident, "route": route, "cwd": cwd, "wake": wake}
+            session = {"key": f"hermes:{ident}", "id": ident, "route": route, "cwd": cwd, "wake": wake, "lock": lock}
             session["bridge"] = Bridge(self.executable(), lambda event: self.receive(session, event))
             try:
                 self.register_session(session)
             except Exception:
                 session["bridge"].close()
                 raise
-            self._sessions[session_id] = session
+            with self._lock:
+                self._sessions[session_id] = session
             return session
 
     def delivery_mode(self, platform):
-        route = getattr(self.ctx, "session_key", lambda: "")()
+        route = self.ctx.session_key()
         surface = self.ctx.session_surface()
         interactive = platform is not None and platform not in {"subagent", "cron", "api", "api_server"}
         interactive = interactive and surface in {"cli", "tui", "desktop", "telegram", "discord", "slack", "whatsapp", "signal", "matrix"}
-        asynchronous = getattr(self.ctx, "session_supports_async_delivery", lambda: False)()
+        asynchronous = self.ctx.session_supports_async_delivery()
         wake = interactive and asynchronous and self.ctx.get_config("wake", False) is True and bool(route or surface == "cli")
         return route, interactive, wake
 
@@ -205,14 +221,16 @@ class Network:
         })
 
     def receive(self, session, event):
-        # Serialize refusal and mode changes with the next bound turn, so an old
-        # failed delivery cannot demote a newly restored queue registration.
-        with self._lock:
+        # Serialize refusal and mode changes with this conversation's next bound turn,
+        # so an old failed delivery cannot demote a newly restored queue registration.
+        with session["lock"]:
             if event.get("key") != session["key"]:
                 return
             # A queued callback may outlive finalization, unload or replacement
             # of a failed adapter. It must not inject into the old route.
-            if not session["bridge"].alive or not any(current is session for current in self._sessions.values()):
+            with self._lock:
+                active = any(current is session for current in self._sessions.values())
+            if not session["bridge"].alive or not active:
                 return
             accepted = False
             # Settings are profile-scoped and read afresh. Revocation applies even if
@@ -251,8 +269,7 @@ class Network:
             return None
 
     def after_tool(self, session_id="", tool_name="", **_):
-        with self._lock:
-            session = self._sessions.get(session_id)
+        session = self.current(session_id)
         if session and session["bridge"].alive:
             try:
                 self.hook(session, "tool")
@@ -261,8 +278,7 @@ class Network:
                 log.debug("Reason activity update failed: %s", exc)
 
     def end_turn(self, session_id="", **_):
-        with self._lock:
-            session = self._sessions.get(session_id)
+        session = self.current(session_id)
         if session and session["bridge"].alive:
             try:
                 self.hook(session, "stop")
@@ -271,8 +287,13 @@ class Network:
                 log.debug("Reason idle update failed: %s", exc)
 
     def finalize(self, session_id="", old_session_id="", **_):
-        with self._lock:
-            session = self._sessions.pop(old_session_id or session_id, None)
+        key = old_session_id or session_id
+        # Wait out a registration or delivery in progress for this conversation only;
+        # close outside its lock so a waiting delivery callback can finish and see it gone.
+        with self.turn_lock(key):
+            with self._lock:
+                session = self._sessions.pop(key, None)
+                self._turns.pop(key, None)
         if session:
             session["bridge"].close()
 
@@ -283,11 +304,14 @@ class Network:
             session = self._sessions.pop(old_session_id, None)
             if session:
                 self._sessions[session_id] = session
+                self._turns[session_id] = session["lock"]
+                self._turns.pop(old_session_id, None)
 
     def close(self):
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._turns.clear()
         for session in sessions:
             session["bridge"].close()
 
@@ -324,7 +348,22 @@ class Network:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
+# The plugin context methods this needs (NousResearch/hermes-agent#143310). Without them
+# a turn can't name its own conversation, so nothing is registered at all.
+REQUIRED = ("session_key", "session_cwd", "session_surface", "session_supports_async_delivery",
+            "is_interrupted", "inject_message")
+
+
+def missing_apis(ctx):
+    return [name for name in REQUIRED if not callable(getattr(ctx, name, None))]
+
+
 def register(ctx):
+    missing = missing_apis(ctx)
+    if missing:
+        log.warning("Reason Network needs a newer Hermes (plugin APIs missing: %s); not loaded. "
+                    "Use Reason's MCP server with this Hermes instead.", ", ".join(missing))
+        return
     network = Network(ctx)
     ctx.on_unload(network.close)
     for name, callback in (

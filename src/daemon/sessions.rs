@@ -761,6 +761,31 @@ mod tests {
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
     }
 
+    #[tokio::test]
+    async fn a_hermes_conversations_hooks_never_promise_delivery_at_its_next_turn() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        // Its plugin registers it pull (wake off), and calls hooks only for activity: they never carry mail.
+        join(&d, named("hermes:p:1", "hermes", None));
+        for event in ["prompt", "tool", "stop"] {
+            d.hook(HookCall {
+                agent: "hermes".into(),
+                event: event.into(),
+                session_id: "p:1".into(),
+                cwd: Some("/work/api".into()),
+                pid: None,
+                mail: false,
+                transcript: None,
+                doing: None,
+                name: None,
+                dirs: Vec::new(),
+                keep: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(d.inner.lock().unwrap().live["hermes:p:1"].reg.tier, Tier::Pull, "after {event}");
+        }
+    }
+
     #[test]
     fn a_name_is_kept_until_its_conversation_would_be_forgotten_and_then_comes_without_its_mail() {
         let mut d = super::super::test_daemon(Default::default());

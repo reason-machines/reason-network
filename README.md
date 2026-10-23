@@ -55,10 +55,6 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   result says if mail is waiting). Claude sessions you already had open join without a restart.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
   ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.
-- **Native Hermes plugin.** [Install and configure it](integrations/hermes/README.md) for separate conversation
-  addresses, four tools, activity, text files and optional input-queue wake. It requires a Reason engine build with
-  `bridge` and the unreleased companion Hermes plugin APIs. That engine's setup installs the bundle; enable it in
-  each Hermes profile. Delivery defaults to pull; wake requires explicit configuration.
 - **Small text files go along.** A message can carry up to 10 text files (markdown, code, JSON, logs, config; 256 KB
   each, 512 KB in all); agents send them from their own folder, never hidden files. The recipient's engine saves copies
   under `~/.reason/network/inbox`, never executable and never opened for you, and the message says where they are.

@@ -6,21 +6,67 @@ const PLUGIN: &str = include_str!("../../integrations/hermes/__init__.py");
 const README: &str = include_str!("../../integrations/hermes/README.md");
 const MARKER: &str = ".reason-setup.json";
 
-fn root() -> PathBuf {
+#[cfg(test)]
+thread_local! {
+    /// A test's Hermes home, so setup's own dispatch can be run against it.
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The Hermes home, before a sticky profile is chosen.
+fn base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME.with(|h| h.borrow().clone()) {
+        return home;
+    }
     if let Some(path) = std::env::var_os("HERMES_HOME").filter(|p| !p.is_empty()) {
         let path = PathBuf::from(path);
-        return active_root(&path.strip_prefix("~").map(|p| home().join(p)).unwrap_or(path));
+        return path.strip_prefix("~").map(|p| home().join(p)).unwrap_or(path);
     }
     let suffix = std::env::var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
-    let base = if cfg!(windows) {
+    if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join("AppData/Local"))
             .join(format!("hermes{suffix}"))
     } else {
         home().join(format!(".hermes{suffix}"))
-    };
-    active_root(&base)
+    }
+}
+
+fn root() -> PathBuf {
+    active_root(&base())
+}
+
+/// Where this Hermes's own code is: its installer's checkout, else what `hermes --version` reports.
+fn source() -> Option<PathBuf> {
+    let bundled = base().join("hermes-agent");
+    if bundled.join("hermes_cli").is_dir() {
+        return Some(bundled);
+    }
+    let out =
+        Command::new(agent::find_bin("hermes")?).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Install directory:"))
+        .map(|p| PathBuf::from(p.trim()))
+}
+
+/// The plugin context methods the plugin needs (NousResearch/hermes-agent#143310), wherever in `hermes_cli` they are.
+const APIS: [&str; 3] = ["def session_key(self", "def is_interrupted(self", "def session_supports_async_delivery(self"];
+
+fn has_apis(source: &Path) -> bool {
+    let Ok(files) = std::fs::read_dir(source.join("hermes_cli")) else { return false };
+    let code: String = files
+        .flatten()
+        .map(|f| f.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "py"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    APIS.iter().all(|api| code.contains(api))
+}
+
+fn supported() -> bool {
+    source().is_some_and(|s| has_apis(&s))
 }
 
 fn active_root(base: &Path) -> PathBuf {
@@ -35,8 +81,10 @@ fn active_root(base: &Path) -> PathBuf {
     base.to_path_buf()
 }
 
+/// A Hermes that can run the plugin, or one it is already in (so it can be updated or removed).
 pub(super) fn installed() -> bool {
-    root().exists() || agent::find_bin("hermes").is_some()
+    (root().exists() || agent::find_bin("hermes").is_some())
+        && (root().join("plugins/reason-network").exists() || supported())
 }
 
 pub(super) fn wired(_: &Path) -> bool {
@@ -46,10 +94,17 @@ pub(super) fn wired(_: &Path) -> bool {
 }
 
 pub(super) fn apply(_: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
-    apply_in(&root(), dry, remove)
+    if !remove && !supported() {
+        return Err(anyhow!(
+            "this Hermes doesn't have the plugin APIs the native plugin needs yet (NousResearch/hermes-agent#143310); \
+             Reason's MCP server works with it meanwhile"
+        ));
+    }
+    apply_in(&root(), remove, dry)
 }
 
-fn apply_in(root: &Path, dry: bool, remove: bool) -> Result<Option<Report>> {
+/// Takes `remove, dry` in the order setup passes them to every agent: a dry run swapped for a removal deletes.
+fn apply_in(root: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let dir = root.join("plugins/reason-network");
     let files = [("plugin.yaml", MANIFEST), ("__init__.py", PLUGIN), ("README.md", README)];
     let mut lines = Vec::new();
@@ -64,9 +119,12 @@ fn apply_in(root: &Path, dry: bool, remove: bool) -> Result<Option<Report>> {
     });
     let populated =
         files.iter().any(|(file, _)| dir.join(file).exists()) || marker.exists() || dir.join(".git").exists();
+    let shown = crate::util::tilde(&dir.display().to_string());
     if populated && !owned {
-        lines.push(format!("kept the entire existing plugin at {} (customized or managed by Hermes)", dir.display()));
-    } else if remove {
+        lines.push(format!("kept the existing plugin at {shown} (customized or managed by Hermes)"));
+        return Ok(Some(Report { agent: "Hermes", lines, notes: Vec::new() }));
+    }
+    if remove {
         if owned {
             for (file, _) in files {
                 if !dry {
@@ -76,13 +134,15 @@ fn apply_in(root: &Path, dry: bool, remove: bool) -> Result<Option<Report>> {
             if !dry {
                 std::fs::remove_file(&marker)?;
             }
-            lines.push(format!("removed the setup-owned plugin at {}", dir.display()));
+            lines.push(format!("removed the plugin at {shown}"));
         }
     } else {
+        let mut wrote = false;
         for (file, content) in files {
-            if write_file(&dir.join(file), content, dry)? {
-                lines.push(format!("installed {}", dir.join(file).display()));
-            }
+            wrote |= write_file(&dir.join(file), content, dry)?;
+        }
+        if wrote {
+            lines.push(format!("installed the plugin at {shown}"));
         }
         let hashes: BTreeMap<&str, String> = files
             .iter()
@@ -90,7 +150,11 @@ fn apply_in(root: &Path, dry: bool, remove: bool) -> Result<Option<Report>> {
             .collect();
         write_file(&marker, &(serde_json::to_string(&hashes)? + "\n"), dry)?;
     }
-    let notes = if remove {
+    // Said once, when something changed; a run that changes nothing says so, as the other agents do.
+    let notes = if lines.is_empty() {
+        lines.push(changed(&dir, false));
+        Vec::new()
+    } else if remove {
         vec!["disable the plugin in Hermes if it was enabled".into()]
     } else {
         vec![
@@ -120,11 +184,15 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let config = "# preserve formatting\nmodel: example\n";
         std::fs::write(root.join("config.yaml"), config).unwrap();
-        assert!(!apply_in(&root, false, false).unwrap().unwrap().lines.is_empty());
-        assert!(apply_in(&root, false, false).unwrap().unwrap().lines.is_empty());
-        apply_in(&root, false, true).unwrap();
+        let first = apply_in(&root, false, false).unwrap().unwrap();
+        assert!(first.lines[0].starts_with("installed") && !first.notes.is_empty());
+        // Again: one line saying so, and the notes aren't repeated.
+        let again = apply_in(&root, false, false).unwrap().unwrap();
+        assert!(again.lines.len() == 1 && again.lines[0].ends_with("unchanged"), "{:?}", again.lines);
+        assert!(again.notes.is_empty());
+        apply_in(&root, true, false).unwrap();
         assert!(!root.join("plugins/reason-network/plugin.yaml").exists());
-        apply_in(&root, false, true).unwrap();
+        apply_in(&root, true, false).unwrap();
         assert_eq!(std::fs::read_to_string(root.join("config.yaml")).unwrap(), config);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -135,7 +203,7 @@ mod tests {
         let plugin = root.join("plugins/reason-network/__init__.py");
         std::fs::write(&plugin, "# custom version\n").unwrap();
         apply_in(&root, false, false).unwrap();
-        apply_in(&root, false, true).unwrap();
+        apply_in(&root, true, false).unwrap();
         assert_eq!(std::fs::read_to_string(&plugin).unwrap(), "# custom version\n");
         assert!(root.join("plugins/reason-network/plugin.yaml").exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -143,7 +211,7 @@ mod tests {
     #[test]
     fn dry_run_never_changes_an_existing_plugin_or_creates_a_profile() {
         let root = temp();
-        apply_in(&root, true, false).unwrap();
+        apply_in(&root, false, true).unwrap();
         assert!(!root.exists());
         apply_in(&root, false, false).unwrap();
         apply_in(&root, true, true).unwrap();
@@ -157,8 +225,55 @@ mod tests {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(root.join("active_profile"), "work\n").unwrap();
         assert_eq!(active_root(&root), profile);
+        // A name that leads out of `profiles` is refused, even where it leads to a real folder.
+        std::fs::create_dir_all(root.join("other")).unwrap();
         std::fs::write(root.join("active_profile"), "../other").unwrap();
         assert_eq!(active_root(&root), root);
+        std::fs::write(root.join("active_profile"), "..").unwrap();
+        assert_eq!(active_root(&root), root);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn setup_dry_runs_change_nothing_and_its_flags_reach_hermes_the_right_way_round() {
+        let home = temp();
+        // A Hermes with the plugin APIs, as its installer lays it out.
+        let cli = home.join("hermes-agent/hermes_cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::write(cli.join("plugin_session.py"), APIS.map(|a| format!("{a}): ...\n")).concat()).unwrap();
+        TEST_HOME.with(|h| *h.borrow_mut() = Some(home.clone()));
+        let plugin = home.join("plugins/reason-network/__init__.py");
+        let (exe, hermes) = (Path::new("/reason-network"), &["hermes"][..]);
+        // Through setup's own dispatch, as `setup`, `--dry-run` and `--remove` run it.
+        super::super::apply(exe, hermes, &[], None, true).await;
+        assert!(!plugin.exists(), "a dry run installed");
+        super::super::apply(exe, hermes, &[], None, false).await;
+        assert!(plugin.exists());
+        super::super::apply(exe, &[], hermes, None, true).await;
+        assert!(plugin.exists(), "a dry run removed");
+        super::super::apply(exe, &[], hermes, None, false).await;
+        assert!(!plugin.exists());
+        TEST_HOME.with(|h| h.borrow_mut().take());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn only_a_hermes_with_the_plugin_apis_counts_as_supported() {
+        let source = temp();
+        let cli = source.join("hermes_cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        // Released Hermes: session_cwd and session_surface, but no routing key or cancellation.
+        std::fs::write(cli.join("plugins.py"), "class PluginContext:\n    def session_cwd(self) -> str: ...\n")
+            .unwrap();
+        assert!(!has_apis(&source));
+        // With the APIs, in whichever module they live.
+        std::fs::write(
+            cli.join("plugin_session.py"),
+            "class M:\n    def session_key(self) -> str: ...\n    def is_interrupted(self) -> bool: ...\n    \
+             def session_supports_async_delivery(self) -> bool: ...\n",
+        )
+        .unwrap();
+        assert!(has_apis(&source));
+        assert!(!has_apis(&source.join("missing")));
+        std::fs::remove_dir_all(source).unwrap();
     }
 }
