@@ -152,7 +152,7 @@ fn home() -> String {
 /// The `folders` entry that decides for `cwd`: of those that hold it, the deepest. Either path counts as written or by
 /// where its links lead (a folder not yet made included), so a link can't take a session out of an off folder.
 fn folder_rule<'a>(folders: &'a BTreeMap<String, String>, home: &str, cwd: &str) -> Option<(&'a str, &'a str)> {
-    let at = [parts(cwd, home), entry_parts(cwd, home)];
+    let at = cwd_forms(cwd, home);
     folders
         .iter()
         .filter(|(k, v)| rule_holds(k, v, home))
@@ -166,6 +166,23 @@ fn folder_rule<'a>(folders: &'a BTreeMap<String, String>, home: &str, cwd: &str)
         })
         .max_by_key(|(_, _, depth)| *depth)
         .map(|(k, v, _)| (k.as_str(), v.as_str()))
+}
+
+/// `cwd`'s folder names as written, with its links followed, and with only the links above each of its folders followed
+/// (`/tmp/personal/link` as `/private/tmp/personal/link`): links above an off folder and inside it can't, together,
+/// take a session out.
+fn cwd_forms(cwd: &str, home: &str) -> Vec<Vec<String>> {
+    let mut forms = vec![parts(cwd, home), entry_parts(cwd, home)];
+    let path = expand(cwd, home);
+    if full(&path) {
+        let path = Path::new(&path);
+        for above in path.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+            if let Ok(rest) = path.strip_prefix(above) {
+                forms.push(parts(&real(above).join(rest).display().to_string(), home));
+            }
+        }
+    }
+    forms
 }
 
 fn rule_holds(folder: &str, value: &str, home: &str) -> bool {
@@ -385,6 +402,21 @@ mod tests {
         assert!(cfg.off_in(&personal.join("link").join("work").display().to_string()));
         assert!(cfg.off_in(&personal.join("link").display().to_string()));
         assert!(!cfg.off_in(&d.join("x").join("work").display().to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_above_an_off_folder_and_one_inside_it_do_not_take_its_sessions_out() {
+        let d = temp();
+        let personal = d.join("real").join("personal");
+        std::os::unix::fs::symlink(d.join("x"), personal.join("link")).unwrap();
+        // `/tmp` for `/private/tmp`, or a linked home: the folder as `reason-network folder` saves it, links followed.
+        std::os::unix::fs::symlink(d.join("real"), d.join("outer")).unwrap();
+        let entry = real(&personal).display().to_string();
+        let cfg = Config { folders: folders(&[(&entry, "off")]), ..Config::default() };
+        assert!(cfg.off_in(&d.join("outer").join("personal").join("link").join("work").display().to_string()));
+        assert!(!cfg.off_in(&d.join("outer").join("x").display().to_string()));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
