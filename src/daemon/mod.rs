@@ -72,6 +72,7 @@ pub async fn run(service: bool) -> Result<()> {
     }
     tokio::spawn(crate::migrate::run(log));
     tokio::spawn(daemon.clone().relays_loop());
+    tokio::spawn(daemon.clone().leaders_loop());
     if update::allowed(daemon.cfg.auto_update) {
         tokio::spawn(daemon.clone().update_loop());
     }
@@ -152,6 +153,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// The sockets of Grok leaders whose sessions registered here, and since when each was seen unused.
+    leaders: HashMap<String, Option<i64>>,
 }
 
 /// A session running on this machine.
@@ -191,6 +194,25 @@ struct Live {
     human_at: i64,
     /// Ask its agent for a route at the next chance (Antigravity, whose route only its shell can give).
     relink: bool,
+}
+
+impl Inner {
+    /// Whether a session the Grok leader at `socket` runs is mid-turn, as its hooks say.
+    fn leader_busy(&self, socket: &str) -> bool {
+        self.live.values().any(|l| {
+            matches!(&l.reg.route, Some(Route::GrokLeader { socket: s }) if s == socket)
+                && l.status.as_ref().is_some_and(|(s, _)| s == "busy")
+        })
+    }
+}
+
+impl Live {
+    /// A Grok session its leader keeps after its TUI quit: nobody is in it until the TUI resumes it, so it is offline,
+    /// though its MCP server (in the leader) is still connected.
+    fn dormant(&self) -> bool {
+        matches!(self.reg.route, Some(Route::GrokLeader { .. }))
+            && !self.reg.agent_session_id.as_deref().is_some_and(crate::grok::tui_open)
+    }
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -234,6 +256,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                leaders: HashMap::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -379,6 +402,45 @@ impl Daemon {
                 crate::relays::refresh().await;
             }
             tokio::time::sleep(crate::relays::EVERY).await;
+        }
+    }
+
+    /// Every 10 min: closes the Grok leaders that have gone unused for `grok::LEADER_IDLE_MS` (each holds ~75 MB).
+    async fn leaders_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            let sockets: Vec<(String, bool)> = {
+                let g = self.inner.lock().unwrap();
+                g.leaders.keys().map(|s| (s.clone(), g.leader_busy(s))).collect()
+            };
+            let Some(bin) = crate::agent::find_bin("grok") else { continue };
+            let seen = tokio::task::spawn_blocking(move || {
+                sockets
+                    .into_iter()
+                    .map(|(s, busy)| {
+                        let info = crate::grok::leader_info(&bin, &s);
+                        let used = info.map(|(pid, clients)| busy || clients > 0 || util::has_children(pid));
+                        (s, info.map(|i| i.0), used)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let now = util::now_ms();
+            let mut g = self.inner.lock().unwrap();
+            for (socket, pid, used) in seen {
+                let (Some(pid), Some(used)) = (pid, used) else {
+                    g.leaders.remove(&socket);
+                    continue;
+                };
+                let Some(since) = g.leaders.get_mut(&socket) else { continue };
+                let (idle, close) = crate::grok::judge(*since, used, now);
+                *since = idle;
+                if close && crate::grok::close_leader(pid, &socket) {
+                    log(&format!("closed the Grok leader at {socket}: unused for 6 hours"));
+                    g.leaders.remove(&socket);
+                }
+            }
         }
     }
 

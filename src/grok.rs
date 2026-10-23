@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 /// Long enough for `session/load`, which replays the whole conversation first.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// How long a leader nobody uses is kept running: the next TUI started within it finds it there.
+pub const LEADER_IDLE_MS: i64 = 6 * 3_600_000;
+
 /// In the MCP server Grok started for a session: the leader's socket, when a leader runs the session. Its tools run
 /// in the leader, so the leader is our parent. A session Grok runs in the TUI's own process has none: loading it
 /// through a leader would make a second copy of it, which the TUI never sees.
@@ -32,6 +35,51 @@ fn leader_from_args(args: &str, home: &Path) -> Option<String> {
         None => None,
     });
     Some(given.unwrap_or_else(|| home.join("leader.sock").display().to_string()))
+}
+
+/// A leader that is running, from `grok leader info --json`: its process, and how many clients it has (TUIs, ours).
+pub fn leader_info(bin: &Path, socket: &str) -> Option<(u32, u64)> {
+    let out = std::process::Command::new(bin)
+        .args(["leader", "info", "--json", "--leader-socket", socket])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_info(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_info(text: &str) -> Option<(u32, u64)> {
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    if v["classification"] != "Reachable" {
+        return None;
+    }
+    let info = &v["info"];
+    Some((u32::try_from(info["pid"].as_u64()?).ok()?, info["other_client_count"].as_u64()?))
+}
+
+/// When a leader was first seen unused, after seeing it now, and whether to close it. It is in use while a client is
+/// on it or a session in it runs a turn, or its tools' processes run. When its last client leaves, Grok ends what the
+/// session left running in the background, so a leader nobody is on does nothing but wait.
+pub fn judge(idle_since: Option<i64>, in_use: bool, now: i64) -> (Option<i64>, bool) {
+    if in_use {
+        return (None, false);
+    }
+    let since = idle_since.unwrap_or(now);
+    (Some(since), now - since >= LEADER_IDLE_MS)
+}
+
+/// Ends the leader `pid`, if it still is the one serving `socket` (not a process that took its number since).
+#[cfg(unix)]
+pub fn close_leader(pid: u32, socket: &str) -> bool {
+    let ours = crate::util::process_args(pid)
+        .and_then(|a| leader_from_args(&a, &crate::setup::grok_home()))
+        .is_some_and(|s| s == socket);
+    ours && unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == 0
+}
+
+#[cfg(windows)]
+pub fn close_leader(_pid: u32, _socket: &str) -> bool {
+    false
 }
 
 /// Whether a TUI has `session` open: Grok lists the sessions its clients have open, with the client's process. A
@@ -158,6 +206,40 @@ mod tests {
         assert_eq!(leader_from_args("grok", home), None);
         assert_eq!(leader_from_args("grok agent --leader stdio", home), None);
         assert_eq!(leader_from_args("grok --leader-socket /x.sock", home), None);
+    }
+
+    #[test]
+    fn a_leaders_process_and_clients_come_from_its_info() {
+        // As Grok 1.0.67 prints it.
+        let text = r#"{"pid":72612,"pidFromLock":72612,"pidLive":72612,"classification":"Reachable",
+            "socketPath":"/h/.grok/leader.sock","clientId":7,"info":{"type":"leader_info","pid":72612,
+            "socket_path":"/h/.grok/leader.sock","leader_binary_version":"1.0.67","other_client_count":0}}"#;
+        assert_eq!(parse_info(text), Some((72612, 0)));
+        assert_eq!(
+            parse_info(&text.replace(r#""other_client_count":0"#, r#""other_client_count":2"#)),
+            Some((72612, 2))
+        );
+        // No leader on that socket.
+        assert_eq!(parse_info(&text.replace("Reachable", "NotRunning")), None);
+        assert_eq!(parse_info(""), None);
+    }
+
+    #[test]
+    fn a_leader_closes_after_going_unused_for_its_whole_wait() {
+        let h = 3_600_000;
+        // First seen unused: the wait starts.
+        assert_eq!(judge(None, false, 10 * h), (Some(10 * h), false));
+        assert_eq!(judge(Some(10 * h), false, 10 * h + LEADER_IDLE_MS - 1), (Some(10 * h), false));
+        assert_eq!(judge(Some(10 * h), false, 10 * h + LEADER_IDLE_MS), (Some(10 * h), true));
+        // Used in between: it starts over.
+        assert_eq!(judge(Some(10 * h), true, 20 * h), (None, false));
+        assert_eq!(judge(None, false, 21 * h), (Some(21 * h), false));
+    }
+
+    #[test]
+    fn only_a_leader_on_that_socket_is_closed() {
+        // This test process is no Grok leader.
+        assert!(!close_leader(std::process::id(), "/h/.grok/leader.sock"));
     }
 
     #[test]

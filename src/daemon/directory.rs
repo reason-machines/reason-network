@@ -125,7 +125,7 @@ impl Daemon {
         }
         let mut rows = Vec::new();
         let mut matched = HashSet::new();
-        for l in g.live.values() {
+        for l in g.live.values().filter(|l| !l.dormant()) {
             let mut row = self.row(&l.name, &l.reg.agent, &l.reg.cwd, Some(&l.git));
             row.since = Some(l.since);
             if let Some((st, at)) = &l.status {
@@ -226,9 +226,9 @@ impl Daemon {
         claude
     }
 
-    /// Sessions this machine remembers (gone for now), but none from a folder that is off.
+    /// Sessions this machine remembers (gone for now, or dormant), but none from a folder that is off.
     fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
-        let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+        let live: HashSet<&str> = g.live.values().filter(|l| !l.dormant()).map(|l| l.name.as_str()).collect();
         let mut known = g.store.sessions().unwrap_or_default();
         known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd));
         known
@@ -348,12 +348,13 @@ impl Daemon {
                 person: self.person.clone(),
                 name: l.name.clone(),
                 machine: self.machine.clone(),
-                live: true,
+                live: !l.dormant(),
                 repo: l.git.repo.clone(),
                 place: Place::Local(Some(l.reg.key.clone())),
             });
         }
-        for r in self.remembered(g) {
+        let here: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+        for r in self.remembered(g).into_iter().filter(|r| !here.contains(r.name.as_str())) {
             out.push(Cand {
                 person: self.person.clone(),
                 name: r.name,

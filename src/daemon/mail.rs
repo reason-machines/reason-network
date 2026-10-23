@@ -335,7 +335,11 @@ impl Daemon {
         msgs: Vec<Message>,
         wake: bool,
     ) -> (String, String) {
-        if !g.live.contains_key(key) {
+        let dormant = g.live.get(key).map(|l| l.dormant());
+        if dormant != Some(false) {
+            if dormant.is_some() {
+                self.reached(g, key);
+            }
             let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
             return ("queued".into(), note);
         }
@@ -365,13 +369,8 @@ impl Daemon {
         let busy = l.status.as_ref().is_some_and(|(s, _)| s == "busy");
         let by_agent = msgs.iter().any(|m| !render::from_terminal(&m.from));
         let spent = by_agent && l.woken >= WAKE_BUDGET;
-        let route = l.reg.route.clone().filter(|r| {
-            !busy
-                && match r {
-                    Route::GrokLeader { .. } => l.reg.agent_session_id.as_deref().is_some_and(grok::tui_open),
-                    Route::Agy { .. } => true,
-                }
-        });
+        // A Grok session without its TUI is dormant (handled above): its route reaches someone.
+        let route = l.reg.route.clone().filter(|_| !busy);
         let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
             // Its MCP server knows its inbox; else (it may not yet) the daemon posts into the one Claude Code lists.
             (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {

@@ -73,6 +73,20 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
     Some((ppid.trim().parse().ok()?, name.to_string()))
 }
 
+/// Whether a running process has child processes.
+#[cfg(unix)]
+pub fn has_children(pid: u32) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+}
+
+#[cfg(windows)]
+pub fn has_children(_pid: u32) -> bool {
+    true
+}
+
 /// A running process's command line, its words joined by spaces.
 #[cfg(unix)]
 pub fn process_args(pid: u32) -> Option<String> {
@@ -308,6 +322,16 @@ pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_with_a_child_has_children() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(has_children(std::process::id()));
+        assert!(!has_children(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 
     #[test]
     #[cfg(unix)]

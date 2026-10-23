@@ -385,6 +385,13 @@ check("…with the message, framed as a teammate's agent's", "grok: wake up" in 
 tui_has()
 out = run("send", "grok-proj-grok", "grok: after the TUI quit")
 check("a session whose TUI quit isn't woken: nobody would see the turn", "starts a turn" not in out and len(calls("grok")) == len(g), out)
+check("…the sender hears it is offline", "last seen" in out, out)
+w = run("who")
+check("…and it isn't listed as live, though the leader keeps its MCP server", "grok-proj-grok" not in w, w)
+w = run("who", "--all")
+check("…but as offline", any("grok-proj-grok" in l_ and "offline" in l_ for l_ in w.splitlines()), w)
+tui_has("k-1")
+check("a TUI resuming it brings it back", settle(lambda: "grok-proj-grok" in run("who")), run("who"))
 gk.kill()
 tui.kill()
 

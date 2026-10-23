@@ -64,6 +64,9 @@ impl Daemon {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
+        if let Some(Route::GrokLeader { socket }) = &reg.route {
+            g.leaders.entry(socket.clone()).or_insert(None);
+        }
         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
         if g.off.contains_key(&key) {
             bail!(OFF_HERE);
@@ -545,14 +548,14 @@ impl Daemon {
         }
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
         if self.forgetting(now) {
-            let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+            let live: HashSet<&str> = g.live.values().filter(|l| !l.dormant()).map(|l| l.name.as_str()).collect();
             let _ = g.store.forget_sessions(now - FORGET_MS, &live, &self.person);
         }
         // Files of messages that are gone, or were read a day ago.
         if now - g.swept > 10 * 60_000 {
             g.swept = now;
             // Live sessions are seen now: if this daemon stops without seeing them go, their names are kept from then.
-            for l in g.live.values() {
+            for l in g.live.values().filter(|l| !l.dormant()) {
                 let _ = g.store.touch_session(&l.name, now);
             }
             if let Err(e) = g.store.sweep_files(now) {
