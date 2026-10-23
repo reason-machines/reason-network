@@ -2,7 +2,7 @@
 
     cargo build && python3 tests/e2e/hooks.py
 """
-import json, os, socket, subprocess, tempfile, threading, time
+import json, os, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
@@ -15,7 +15,55 @@ os.makedirs(os.path.join(CLAUDE, "sessions"))
 with open(os.path.join(CLAUDE, ".claude.json"), "w") as f:
     json.dump({"mcpServers": {"reason-network": {"type": "stdio", "command": BIN, "args": ["mcp"]}}}, f)
 env["CLAUDE_CONFIG_DIR"] = CLAUDE
+# Stand-ins for agy and grok, which the daemon runs to wake their sessions: they log how they were run.
+CALLS = os.path.join(D, "calls.jsonl")
+AGY_FAIL = os.path.join(D, "agy-fails")
+FAKE_AGY = os.path.join(D, "fake-agy")
+with open(FAKE_AGY, "w") as f:
+    f.write(f"""#!{sys.executable}
+import json, os, sys
+with open({CALLS!r}, "a") as f:
+    f.write(json.dumps({{"bin": "agy", "args": sys.argv[1:], "addr": os.environ.get("ANTIGRAVITY_LS_ADDRESS"),
+                        "token": os.environ.get("ANTIGRAVITY_CSRF_TOKEN")}}) + "\\n")
+sys.exit(1 if os.path.exists({AGY_FAIL!r}) else 0)
+""")
+# grok as a client of its leader: an ACP agent that loads a session and starts a turn for a prompt.
+FAKE_GROK = os.path.join(D, "fake-grok")
+with open(FAKE_GROK, "w") as f:
+    f.write(f"""#!{sys.executable}
+import json, sys
+log = open({CALLS!r}, "a")
+log.write(json.dumps({{"bin": "grok", "args": sys.argv[1:]}}) + "\\n")
+for line in sys.stdin:
+    m = json.loads(line)
+    log.write(json.dumps({{"bin": "grok", "rpc": m}}) + "\\n")
+    log.flush()
+    out = [{{"jsonrpc": "2.0", "id": m["id"], "result": {{}}}}]
+    if m["method"] == "session/prompt":
+        out = [{{"jsonrpc": "2.0", "method": "session/update", "params": {{"update": {{"sessionUpdate": "agent_thought_chunk"}}}}}}]
+    for o in out:
+        print(json.dumps(o), flush=True)
+""")
+for p_ in (FAKE_AGY, FAKE_GROK):
+    os.chmod(p_, 0o755)
+GROK_HOME = os.path.join(D, "grok")
+os.makedirs(GROK_HOME)
+env.update(REASON_NETWORK_AGY_BIN=FAKE_AGY, REASON_NETWORK_GROK_BIN=FAKE_GROK, GROK_HOME=GROK_HOME)
 results = []
+
+
+def calls(bin_):
+    try:
+        return [c for c in map(json.loads, open(CALLS)) if c["bin"] == bin_]
+    except FileNotFoundError:
+        return []
+
+
+def settle(pred, secs=10):
+    end = time.time() + secs
+    while time.time() < end and not pred():
+        time.sleep(0.2)
+    return pred()
 
 
 def check(name, ok, detail=""):
@@ -82,6 +130,7 @@ os.makedirs(agy_dir)
 agy = {"conversationId": "a-1", "workspacePaths": [agy_dir], "transcriptPath": os.path.join(D, "agy.jsonl")}
 out = hook("agy", "session-start", agy)
 check("agy start → injected intro naming the session", '"injectSteps"' in out and "agyproj-agy" in out, out)
+check("…which asks it to run wake once", " wake` once now" in out, out)
 run("send", "agyproj-agy", "agy: check the build")
 out = hook("agy", "stop", dict(agy, terminationReason="USER_CANCELED"))
 check("agy stop after a cancel → nothing, the mail waits", out == "", out)
@@ -90,22 +139,44 @@ check("agy pre-invocation → the mail as a system message", '"systemMessage"' i
 run("send", "agyproj-agy", "agy: and the docs")
 out = hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 check("agy stop at the end of a turn → decision continue", '"decision":"continue"' in out and "and the docs" in out, out)
-check("agy's intro tells it to keep a listener running", "listen` running as a background command" in hook("agy", "session-start", agy))
-# The listener, as agy runs it in its shell: quiet until a message comes, then prints it and ends, which wakes agy.
-shell = dict(env, ANTIGRAVITY_AGENT="1", ANTIGRAVITY_CONVERSATION_ID="a-1")
-listener = subprocess.Popen([BIN, "listen"], env=shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-time.sleep(2)
-check("the listener waits quietly", listener.poll() is None)
+# Waking an idle agy: `wake` in its shell hands the daemon its language server, and the daemon runs `agy agentapi`.
+out = run("wake")
+check("wake outside agy's shell says where to run it", "Antigravity's shell" in out, out)
+shell = dict(env, ANTIGRAVITY_AGENT="1", ANTIGRAVITY_CONVERSATION_ID="a-1", ANTIGRAVITY_LS_ADDRESS="127.0.0.1:1",
+             ANTIGRAVITY_CSRF_TOKEN="tok-1")
+r = subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
+check("wake in agy's shell links the conversation", "now wake alex/agyproj-agy" in r.stdout, r.stdout + r.stderr)
+check("…and the intro stops asking for it", " wake`" not in hook("agy", "session-start", agy))
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 out = run("send", "agyproj-agy", "agy: wake up")
-check("the sender hears agy is waiting", "delivered" in out, out)
-try:
-    out = listener.communicate(timeout=15)[0]
-except subprocess.TimeoutExpired:
-    listener.kill()
-    out = "(still waiting)"
-check("the listener prints the message and ends", "agy: wake up" in out and listener.returncode == 0, out)
-out = hook("agy", "post-tool-use", dict(agy, invocationNum=2))
+check("the sender hears the idle agy starts a turn", "starts a turn" in out, out)
+settle(lambda: calls("agy"))
+c = (calls("agy") or [{}])[-1]
+text = (c.get("args") or ["", "", "", ""])[3]
+check("…through agentapi into its conversation, with its server and token",
+      c.get("args", [])[:3] == ["agentapi", "send-message", "a-1"] and c.get("addr") == "127.0.0.1:1" and c.get("token") == "tok-1", c)
+check("…framed as a teammate's agent's, not the user's or the system's", "agy: wake up" in text and "not from your user or the system" in text, text)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
 check("…and the hooks don't deliver it twice", "wake up" not in out, out)
+out = run("send", "agyproj-agy", "agy: while you work")
+check("a busy agy gets mail through its hooks, not a new turn", "next tool call" in out and len(calls("agy")) == 1, out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=2))
+check("…at its next model call", "while you work" in out, out)
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+open(AGY_FAIL, "w").close()
+run("send", "agyproj-agy", "agy: are you there")
+settle(lambda: len(calls("agy")) == 2)
+time.sleep(0.5)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("a wake that fails leaves the mail to the hooks", "are you there" in out, out)
+check("…and asks agy to run wake again", '"ephemeralMessage"' in out and " wake` once now" in out, out)
+os.remove(AGY_FAIL)
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
+# Agents answering each other through routes stop after WAKE_BUDGET turns its person didn't start.
+outs = [run("send", "agyproj-agy", f"agy: ping {i}", "--from", "alex/proj-cursor") for i in range(7)]
+check("teammates' agents wake an idle agy up to the budget", all("starts a turn" in o for o in outs[:6]), outs)
+check("…then their mail waits for its person", "woken this session a lot" in outs[6], outs[6])
 
 # Copilot: camelCase sessionId
 cop ={"sessionId": "p-1", "cwd": proj, "timestamp": 1}
@@ -284,6 +355,38 @@ rpc(cx, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "
 got_back = json.dumps(reply(cx, 4))
 check("…and the message is there at the next check_inbox", "after the wait was cancelled" in got_back, got_back)
 cx.kill()
+
+# A Grok session its leader runs: the MCP server Grok starts for it says so (GROK_LEADER_SOCKET, or a leader parent),
+# and the daemon starts a turn in it through the leader while its TUI has it open.
+gk_dir = os.path.join(D, "grok-proj")
+os.makedirs(gk_dir)
+tui = subprocess.Popen(["sleep", "120"])
+def tui_has(*sessions):
+    with open(os.path.join(GROK_HOME, "active_sessions.json"), "w") as f:
+        json.dump([{"session_id": s_, "pid": tui.pid, "cwd": gk_dir} for s_ in sessions], f)
+tui_has("k-1")
+sock = os.path.join(GROK_HOME, "leader-t.sock")
+gk_env = dict(env, REASON_NETWORK_AGENT="grok", GROK_SESSION_ID="k-1", GROK_LEADER_SOCKET=sock)
+gk = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=gk_env, cwd=gk_dir, text=True)
+rpc(gk, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "grok-cli", "version": "1"}}})
+reply(gk, 1)
+rpc(gk, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+check("a leader's Grok session registers as push", settle(lambda: "grok-proj-grok" in run("who")), run("who"))
+out = run("send", "grok-proj-grok", "grok: wake up")
+check("the sender hears the idle Grok starts a turn", "starts a turn" in out, out)
+settle(lambda: any(c.get("rpc", {}).get("method") == "session/prompt" for c in calls("grok")))
+g = calls("grok")
+rpcs = [c["rpc"] for c in g if "rpc" in c]
+check("…through a client of its leader", g and g[0]["args"] == ["agent", "--leader", "--leader-socket", sock, "stdio"], g[:1])
+check("…which loads the session, then prompts it",
+      [m["method"] for m in rpcs] == ["initialize", "session/load", "session/prompt"] and rpcs[1]["params"]["sessionId"] == "k-1", rpcs)
+said = rpcs[-1]["params"]["prompt"][0]["text"] if rpcs else ""
+check("…with the message, framed as a teammate's agent's", "grok: wake up" in said and "not your user's instruction" in said, said)
+tui_has()
+out = run("send", "grok-proj-grok", "grok: after the TUI quit")
+check("a session whose TUI quit isn't woken: nobody would see the turn", "starts a turn" not in out and len(calls("grok")) == len(g), out)
+gk.kill()
+tui.kill()
 
 # Claude Code's `/clear`: the same process (and MCP server) goes on in a new conversation, which its registry names; the
 # variable the server started with still names the old one.

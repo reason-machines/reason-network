@@ -37,14 +37,14 @@ fn instructions() -> String {
     format!("Reason Network connects you with your teammates' coding agents.\n\n{rules}")
 }
 
-/// With the background listener for agents that need one (`setup` names the agent in their MCP config).
+/// With what Antigravity must do so that messages can wake it (`setup` names the agent in its MCP config).
 fn instructions_for(agent: Option<&str>) -> String {
     let mut text = instructions();
-    if agent::listener_key(agent, Some(String::new())).is_some()
+    if agent == Some("agy")
         && let Ok(exe) = crate::setup::exe()
     {
         text.push_str("\n\n");
-        text.push_str(&agent::listener_hint(&exe));
+        text.push_str(&agent::wake_hint(&exe));
     }
     text
 }
@@ -334,7 +334,13 @@ impl ReasonNetworkMcp {
             Some(id) => format!("{agent}:{id}"),
             None => format!("proc:{}", std::process::id()),
         };
-        let tier = if self.pushed(agent) { Tier::Push } else { Tier::Pull };
+        // A Grok session a leader runs: the daemon can prompt it through the leader.
+        let route = if agent == "grok" && id.is_some() {
+            crate::grok::leader_socket().map(|socket| Route::GrokLeader { socket })
+        } else {
+            None
+        };
+        let tier = if self.pushed(agent) || route.is_some() { Tier::Push } else { Tier::Pull };
         // Registered already, unless its inbox has turned up since (Claude Code may list it after starting us).
         if self.link.registered_tier(&key).is_some_and(|t| t == Tier::Push || tier != Tier::Push) {
             return Ok(key);
@@ -349,6 +355,7 @@ impl ReasonNetworkMcp {
             pid: if agent == agent::CLAUDE_CODE { agent::claude_pid() } else { Some(agent::agent_pid()) },
             tier,
             name: None,
+            route,
         };
         self.link.register(reg).await?;
         Ok(key)
@@ -458,10 +465,11 @@ mod tests {
     }
 
     #[test]
-    fn agents_that_need_a_listener_are_told_to_run_it() {
-        assert!(super::instructions_for(Some("agy")).contains(" listen` running as a background command"));
-        assert!(super::instructions_for(Some("grok")).contains(" listen` running as a background command"));
-        assert!(!super::instructions_for(Some("claude-code")).contains("background command"));
-        assert!(!super::instructions_for(None).contains("background command"));
+    fn antigravity_is_told_to_run_wake_once() {
+        assert!(super::instructions_for(Some("agy")).contains(" wake` once now"));
+        // Grok is reached through its leader, others through their own channels or hooks.
+        assert!(!super::instructions_for(Some("grok")).contains(" wake`"));
+        assert!(!super::instructions_for(Some("claude-code")).contains(" wake`"));
+        assert!(!super::instructions_for(None).contains(" wake`"));
     }
 }

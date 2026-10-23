@@ -186,6 +186,7 @@ impl Daemon {
                 pid: Some(c.pid),
                 tier: Tier::Push,
                 name: if named { c.label() } else { None },
+                route: None,
             };
             if let Err(e) = self.register(None, reg, git) {
                 super::log(&format!("adding the Claude session of process {}: {e:#}", c.pid));
@@ -520,6 +521,7 @@ mod tests {
                 pid: Some(pid),
                 tier: Tier::Push,
                 name: None,
+                route: None,
             };
             d.register(Some(conn), reg, GitInfo::default()).unwrap().name
         };
@@ -571,6 +573,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            route: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude-2");
         // The scan, again and again, leaves it alone.
@@ -598,6 +601,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: Some("terminal".into()),
+            route: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "terminal");
         let mut theirs = d.row("terminal", "cli", "/", None);

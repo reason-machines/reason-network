@@ -385,7 +385,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
 
 // ---- Grok CLI ----
 
-fn grok_home() -> PathBuf {
+pub fn grok_home() -> PathBuf {
     std::env::var_os("GROK_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".grok"))
 }
 
@@ -425,6 +425,13 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
     grok_allow(&mut doc, remove);
+    if grok_leader(&mut doc, remove) {
+        r.notes.push(
+            "Grok now runs its sessions in its shared leader process, so messages wake them while idle: restart Grok \
+             to start it. The leader keeps running after Grok quits; `grok leader kill` stops it."
+                .into(),
+        );
+    }
     r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
 
     let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
@@ -457,6 +464,22 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         r.lines.push(changed(&hooks_path, did));
     }
     Ok(Some(r))
+}
+
+/// Grok runs its sessions in a shared leader with `[cli] use_leader`, where the daemon can start a turn in one while
+/// it is idle (see `grok.rs`); off by default. A choice already made is left alone, also on remove: it is Grok's own
+/// setting. True when it was turned on now.
+fn grok_leader(doc: &mut toml_edit::DocumentMut, remove: bool) -> bool {
+    if remove {
+        return false;
+    }
+    let cli = doc.entry("cli").or_insert(toml_edit::table());
+    let Some(cli) = cli.as_table_like_mut() else { return false };
+    if cli.contains_key("use_leader") {
+        return false;
+    }
+    cli.insert("use_leader", toml_edit::value(true));
+    true
 }
 
 /// grok asks before every MCP tool call unless a rule allows it.

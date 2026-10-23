@@ -73,6 +73,18 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
     Some((ppid.trim().parse().ok()?, name.to_string()))
 }
 
+/// A running process's command line, its words joined by spaces.
+#[cfg(unix)]
+pub fn process_args(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
+pub fn process_args(_pid: u32) -> Option<String> {
+    None
+}
+
 /// The folder a running process works in.
 #[cfg(target_os = "linux")]
 pub fn process_cwd(pid: u32) -> Option<String> {

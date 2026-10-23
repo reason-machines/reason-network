@@ -21,7 +21,7 @@ use std::{
 };
 
 /// A hook-only session that hasn't fired a hook for this long is considered gone.
-const HOOK_TTL_MS: i64 = 6 * 3_600_000;
+pub(super) const HOOK_TTL_MS: i64 = 6 * 3_600_000;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
 pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
@@ -94,6 +94,13 @@ impl Daemon {
                 l.git = git;
             }
             l.reg.pid = reg.pid.or(l.reg.pid);
+            // A way to wake it, found now (a Grok leader's, its MCP server says).
+            if let Some(route) = reg.route {
+                l.reg.route = Some(route);
+                l.reg.tier = Tier::Push;
+                l.push_failed = false;
+                l.relink = false;
+            }
         } else {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
@@ -102,6 +109,7 @@ impl Daemon {
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+            let relink = reg.agent == "agy" && reg.route.is_none();
             g.live.insert(
                 key.clone(),
                 Live {
@@ -120,6 +128,10 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    woken: 0,
+                    pushed_at: None,
+                    human_at: now,
+                    relink,
                 },
             );
             self.presence_changed();
@@ -355,6 +367,7 @@ impl Daemon {
                 pid,
                 tier: Tier::Pull,
                 name,
+                route: None,
             };
             self.register_quiet(None, reg, git)?;
         }
@@ -387,9 +400,23 @@ impl Daemon {
         if pid.is_some() {
             l.reg.pid = pid;
         }
+        // A route whose person has been away too long goes before a turn now could count as theirs.
+        super::mail::lapse(l, now);
         let status = if matches!(event, "prompt" | "tool") { "busy" } else { "idle" };
+        let was_busy = l.status.as_ref().is_some_and(|(s, _)| s == "busy");
         if l.status.as_ref().is_none_or(|(s, _)| s != status) {
             l.status = Some((status.to_string(), now));
+        }
+        // A turn starting that no one here started: its person's (see `mail::WAKE_GRACE_MS`).
+        if (event == "prompt" || (status == "busy" && !was_busy))
+            && l.pushed_at.is_none_or(|t| now - t > super::mail::WAKE_GRACE_MS)
+        {
+            l.woken = 0;
+            l.human_at = now;
+        }
+        let relink = l.relink && l.reg.route.is_none() && matches!(event, "start" | "tool");
+        if relink {
+            l.relink = false;
         }
         let address = self.addr(&l.name);
         let agent_kind = l.reg.agent.clone();
@@ -407,10 +434,16 @@ impl Daemon {
         }
         // Its hooks hand it mail: it can be reached, and its name stays its own.
         if !ids.is_empty() {
+            // Mail at a stop keeps the turn going: that part of it is not its person's.
+            if event == "stop"
+                && let Some(l) = g.live.get_mut(&key)
+            {
+                l.pushed_at = Some(now);
+            }
             self.reached(g, &key);
         }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        Ok(HookReply { address: Some(address), text, ids, relink })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -446,6 +479,27 @@ impl Daemon {
             g.store.upsert_session(&r, &self.person)?;
         }
         Ok(key)
+    }
+
+    /// A way to wake `key`, from a process in that session (`reason-network wake`). Mail that waits goes through it.
+    pub(super) fn set_route(self: &Arc<Self>, key: &str, route: Route) -> Result<String> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(l) = g.live.get_mut(key) else {
+            bail!("this session isn't on Reason Network yet: its hooks register it, at its next turn")
+        };
+        log(&format!("session {} can be woken ({route:?})", self.addr(&l.name)));
+        l.reg.route = Some(route);
+        l.reg.tier = Tier::Push;
+        l.push_failed = false;
+        l.relink = false;
+        l.attached = true;
+        let address = self.addr(&l.name);
+        self.presence_changed();
+        let waiting: Vec<Message> = g.pending(&address)?.into_iter().filter(|m| m.wake).collect();
+        if !waiting.is_empty() {
+            self.deliver(&mut g, key, waiting, true);
+        }
+        Ok(address)
     }
 
     pub(super) fn drop_conn(&self, conn: u64) {
@@ -485,6 +539,9 @@ impl Daemon {
             if let Some(l) = g.live.remove(&key) {
                 let _ = g.store.touch_session(&l.name, now);
             }
+        }
+        for l in g.live.values_mut() {
+            super::mail::lapse(l, now);
         }
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
         if self.forgetting(now) {
@@ -630,6 +687,7 @@ mod tests {
             pid: None,
             tier: Tier::Push,
             name: None,
+            route: None,
         }
     }
 
@@ -642,6 +700,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: name.map(str::to_string),
+            route: None,
         }
     }
 
@@ -1376,6 +1435,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            route: None,
         };
         let err = d.register_quiet(None, reg("codex:1", "/work/private/notes"), GitInfo::default()).unwrap_err();
         assert_eq!(err.to_string(), OFF_HERE);
@@ -1397,6 +1457,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            route: None,
         };
         // Claude Code's `/clear`: its MCP server now registers the new conversation.
         assert_eq!(
@@ -1466,6 +1527,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            route: None,
         };
         assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
         // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.

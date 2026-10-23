@@ -7,6 +7,7 @@ mod daemon;
 mod doing;
 mod files;
 mod git;
+mod grok;
 mod hook;
 mod invite;
 mod ipc;
@@ -292,16 +293,18 @@ enum Cmd {
     /// Restart the daemon
     Stop,
     /// Wait for the next message to a named session, print it, and exit (for agents without Reason Network's tools, e.g.
-    /// cloud agents: run it again after replying). Run in the background in Antigravity's or Grok's shell, it waits for
-    /// that session's next message, however long, so the message wakes it
+    /// cloud agents: run it again after replying)
     Listen {
-        /// The session's name; reachable as <you>/<name> [default: agent]
-        #[arg(long = "as")]
-        name: Option<String>,
+        /// The session's name; reachable as <you>/<name>
+        #[arg(long = "as", default_value = "agent")]
+        name: String,
         /// Give up after this many seconds
         #[arg(long, default_value_t = 600)]
         wait: u64,
     },
+    /// Let messages wake this Antigravity conversation while it is idle: run once in agy's shell (it returns at once).
+    /// What that takes only agy's shell commands get, and the daemon keeps it in memory
+    Wake,
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
     /// The menu bar icon (macOS; the background service starts it)
@@ -593,27 +596,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 );
             }
         }
-        Cmd::Listen { name: None, .. }
-            if let Some(key) =
-                agent::detect_env().and_then(|a| agent::listener_key(Some(a), agent::env_session_id(a))) =>
-        {
-            // Nothing to print until a message comes: ending without one would wake the agent for nothing.
-            let i = loop {
-                let i: Inbox = link.call(Request::Inbox { key: key.clone(), wait_secs: 600, peek: true }).await?;
-                if !i.messages.is_empty() {
-                    break i;
-                }
-            };
-            println!("{}", i.text);
-            let ids = i.messages.iter().map(|m| m.id.clone()).collect();
-            link.call::<serde_json::Value>(Request::Delivered { key, ids }).await?;
-            println!(
-                "Start `{}` in the background again to hear the next one.",
-                setup::shell_cmd(&setup::exe()?, "listen")
-            );
-        }
         Cmd::Listen { name, wait } => {
-            let name = name.unwrap_or_else(|| "agent".into());
             let id = util::slug(&name);
             if id.is_empty() {
                 bail!("a session name needs letters or digits");
@@ -632,6 +615,15 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 // Busy until it listens again.
                 let _ = cli_session(&link, &id, "prompt").await;
             }
+        }
+        Cmd::Wake => {
+            let Some((key, route)) = agent::agy_shell() else {
+                bail!(
+                    "run this in Antigravity's shell (agy): it lets messages wake that conversation while it is idle"
+                );
+            };
+            let address: String = link.call(Request::Route { key, route }).await?;
+            println!("Done: teammates' messages now wake {address} while it is idle. Nothing keeps running.");
         }
         Cmd::Team { json: true } => {
             println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None).await?)?))

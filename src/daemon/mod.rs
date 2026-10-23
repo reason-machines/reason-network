@@ -183,6 +183,14 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// Turns the daemon started in it through its route since its person last started one (see `mail::WAKE_BUDGET`).
+    woken: u32,
+    /// When the daemon last started a turn in it, or a hook continued one with mail (ms).
+    pushed_at: Option<i64>,
+    /// When its person last started a turn in it, as far as anyone can tell: since it registered, if never (ms).
+    human_at: i64,
+    /// Ask its agent for a route at the next chance (Antigravity, whose route only its shell can give).
+    relink: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -342,6 +350,7 @@ impl Daemon {
                 Value::Null
             }
             Request::Hook(h) => json!(self.hook(h).await?),
+            Request::Route { key, route } => json!(self.set_route(&key, route)?),
             Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)?),
             Request::CreateTeam { name, person, relay, proof } => {
                 json!(self.create_team(&name, &person, relay, proof).await?)

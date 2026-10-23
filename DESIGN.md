@@ -309,6 +309,11 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 - **turn**: injected at the next tool call or at stop, but an idle session waits for its human.
 - **pull**: only when the agent checks (`check_inbox`, or the unread notice appended to every tool result).
 
+A route (a Grok leader, Antigravity's `agentapi`) starts a turn only in an idle session. Teammates' agents get
+`WAKE_BUDGET` (6) such turns per session until its person starts one again (a turn starting more than a minute after
+the daemon last started one, or a hook carried one on with mail); past that their mail waits for the person's turn.
+Unlike the per-pair loop guard, that stops agents answering each other in a ring of any size.
+
 | Agent | Tier | Mechanism |
 |---|---|---|
 | Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
@@ -317,11 +322,11 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | pi | push | Extension (`~/.pi/agent/extensions/reason-network.ts`): registers the MCP server per session (`deferred`, with `REASON_NETWORK_SESSION`), `sendUserMessage` (`deliverAs: "steer"` mid-run, a new turn when idle), busy/idle from `agent_start`/`agent_settled`, the session name as `doing`. |
 | Reason | push | Its agent runs in Reason's cloud: the daemon lists live sessions (`reason session list --json`, when `reason = true`) and sends with `reason session send`. Replies go through the CLI: `reason-network send <to> --from <its address>`. |
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
-| Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
+| Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
-| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: a background `reason-network listen` it is told to keep running (session start and MCP instructions); its end wakes the session. |
+| Antigravity CLI | push once linked, else turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: `agy agentapi send-message <conversation>` starts a turn. That needs the agy process's language server address and CSRF token, which only its shell commands get, so the agent is asked (session start, MCP instructions, an `ephemeralMessage` after a lapse) to run `reason-network wake` once: it hands them to the daemon, which keeps them in memory. The link lapses after 6 h without a turn its person started, or when a send fails. agy shows such a message to its model as a system message, so it starts with a note that it is a teammate's agent's, not the user's or the system's. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
-| Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. Idle: a background `reason-network listen` (MCP instructions), whose end wakes the session. |
+| Grok CLI | push in leader mode, else turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. Idle: with `[cli] use_leader = true` (setup sets it unless already set) the session runs in Grok's shared leader, and the daemon starts a turn in it as another client of the leader (`grok agent --leader stdio`, ACP `session/load` then `session/prompt`); the TUI shows that turn, and a prompt sent mid-turn waits for the turn to end. The MCP server knows a leader runs the session by `GROK_LEADER_SOCKET` or its parent `grok agent leader`; a session the TUI runs itself is never loaded through a leader (that would fork a second copy). Only while a TUI holds the session (`~/.grok/active_sessions.json`): the leader keeps sessions after their TUI quits. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 
