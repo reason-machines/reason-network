@@ -51,8 +51,9 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
   anything: what a session is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
-  up; Cursor, Gemini, Antigravity, Copilot and Grok at their next step; DeepSeek Harness when it checks its inbox (every tool
-  result says if mail is waiting). Claude sessions you already had open join without a restart.
+  up; Antigravity too, once it has run `reason-network wake` (it is asked to); Cursor, Gemini, Copilot and Grok at
+  their next step; DeepSeek Harness when it checks its inbox (every tool result says if mail is waiting). Claude
+  sessions you already had open join without a restart.
 - **The Antigravity IDE too.** It reads the same config as Antigravity CLI (`~/.gemini/config`), so its
   conversations join as `agy` sessions.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while

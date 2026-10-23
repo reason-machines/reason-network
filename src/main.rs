@@ -301,6 +301,9 @@ enum Cmd {
         #[arg(long, default_value_t = 600)]
         wait: u64,
     },
+    /// Let messages wake this Antigravity conversation while it is idle: run once in agy's shell (it returns at once).
+    /// What that takes only agy's shell commands get, and the daemon keeps it in memory
+    Wake,
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
     /// The menu bar icon (macOS; the background service starts it)
@@ -611,6 +614,15 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 // Busy until it listens again.
                 let _ = cli_session(&link, &id, "prompt").await;
             }
+        }
+        Cmd::Wake => {
+            let Some((key, route)) = agent::agy_shell() else {
+                bail!(
+                    "run this in Antigravity's shell (agy): it lets messages wake that conversation while it is idle"
+                );
+            };
+            let address: String = link.call(Request::Route { key, route }).await?;
+            println!("Done: teammates' messages now wake {address} while it is idle. Nothing keeps running.");
         }
         Cmd::Team { json: true } => {
             println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None).await?)?))

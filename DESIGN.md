@@ -309,6 +309,14 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 - **turn**: injected at the next tool call or at stop, but an idle session waits for its human.
 - **pull**: only when the agent checks (`check_inbox`, or the unread notice appended to every tool result).
 
+A route (Antigravity's `agentapi`) starts a turn only in an idle session. Teammates' agents get `WAKE_BUDGET` (6)
+such turns per session until its person starts one again; past that their mail waits for the person's turn. The daemon
+counts the turns it started (and those a Stop hook carried on with mail) that its hooks haven't seen start yet: while it
+owes any, a turn starting is one of those, however late its first hook fires; only a turn starting when it owes none is
+the person's. Unlike the per-pair loop guard, that stops agents answering each other in a ring of any size. A send that
+times out counts as delivered (the turn may have started with it), so hooks don't show it a second time; one that fails
+leaves the mail to the hooks and drops the route.
+
 | Agent | Tier | Mechanism |
 |---|---|---|
 | Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
@@ -319,7 +327,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
-| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step, mail headed by a note that it is not from the user or the system; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: waits for its human. |
+| Antigravity CLI | push once linked, else turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step, mail headed by a note that it is not from the user or the system; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: `agy agentapi send-message <conversation>` starts a turn. That needs the agy process's language server address and CSRF token, which only its shell commands get, so the agent is asked (session start, MCP instructions, an `ephemeralMessage` after a lapse) to run `reason-network wake` once: it hands them to the daemon, which keeps them in memory. The link lapses after 6 h without a turn its person started, or when a send fails. agy shows such a message to its model as a system message, so it starts with a note that it is a teammate's agent's, not the user's or the system's. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |

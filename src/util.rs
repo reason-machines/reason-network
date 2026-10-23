@@ -73,6 +73,24 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
     Some((ppid.trim().parse().ok()?, name.to_string()))
 }
 
+/// The folder a running process works in.
+#[cfg(target_os = "linux")]
+pub fn process_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.display().to_string())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn process_cwd(pid: u32) -> Option<String> {
+    let out =
+        std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix('n')).map(str::to_string)
+}
+
+#[cfg(windows)]
+pub fn process_cwd(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(windows)]
 pub fn process(pid: u32) -> Option<(u32, String)> {
     use windows_sys::Win32::{Foundation::*, System::Diagnostics::ToolHelp::*};
@@ -278,6 +296,15 @@ pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn a_process_folder() {
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let cwd = process_cwd(std::process::id()).map(|p| std::path::PathBuf::from(p).canonicalize().unwrap());
+        assert_eq!(cwd, Some(here));
+        assert_eq!(process_cwd(u32::MAX), None);
+    }
 
     #[test]
     fn slugs() {

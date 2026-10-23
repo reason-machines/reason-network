@@ -37,6 +37,18 @@ fn instructions() -> String {
     format!("Reason Network connects you with your teammates' coding agents.\n\n{rules}")
 }
 
+/// With what Antigravity must do so that messages can wake it (`setup` names the agent in its MCP config).
+fn instructions_for(agent: Option<&str>) -> String {
+    let mut text = instructions();
+    if agent == Some("agy")
+        && let Ok(exe) = crate::setup::exe()
+    {
+        text.push_str("\n\n");
+        text.push_str(&agent::wake_hint(&exe));
+    }
+    text
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListArgs {
     /// Only sessions matching this text (person, session, agent, repo, branch, directory or what it's doing).
@@ -248,7 +260,7 @@ impl ServerHandler for ReasonNetworkMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(crate::AGENT_NAME, env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions())
+            .with_instructions(instructions_for(self.env_agent))
     }
 
     /// A session that gets its messages pushed never needs check_inbox, so it isn't shown one: fewer tokens.
@@ -337,6 +349,7 @@ impl ReasonNetworkMcp {
             pid: if agent == agent::CLAUDE_CODE { agent::claude_pid() } else { Some(agent::agent_pid()) },
             tier,
             name: None,
+            route: None,
         };
         self.link.register(reg).await?;
         Ok(key)
@@ -443,5 +456,14 @@ mod tests {
     fn instructions_carry_the_skills_rules() {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
+    }
+
+    #[test]
+    fn antigravity_is_told_to_run_wake_once() {
+        assert!(super::instructions_for(Some("agy")).contains(" wake` once now"));
+        // Others are reached through their own channels or hooks.
+        assert!(!super::instructions_for(Some("grok")).contains(" wake`"));
+        assert!(!super::instructions_for(Some("claude-code")).contains(" wake`"));
+        assert!(!super::instructions_for(None).contains(" wake`"));
     }
 }
