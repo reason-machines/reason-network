@@ -48,6 +48,8 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
         "cursor"
     } else if has("gemini") {
         "gemini"
+    } else if has("antigravity") || n == "agy" {
+        "agy"
     } else if has("grok") {
         "grok"
     } else if has("opencode") {
@@ -78,7 +80,7 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
 
 /// Agents that run one MCP server process for many sessions, so the session must come from each call.
 pub fn multiplexed(agent: &str) -> bool {
-    matches!(agent, "codex" | "opencode" | "cursor")
+    matches!(agent, "codex" | "opencode" | "cursor" | "agy")
 }
 
 /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
@@ -106,9 +108,10 @@ pub fn env_session_id(agent: &str) -> Option<String> {
 }
 
 /// The session id carried in a tool call's `_meta`. Codex sends `sessionId` (the root thread, the same id its
-/// hooks see) and `threadId` (which differs inside subagents); opencode V2 sends `ai.opencode/sessionID`.
+/// hooks see) and `threadId` (which differs inside subagents); opencode V2 sends `ai.opencode/sessionID`; Antigravity
+/// sends the root conversation (the one its hooks see) beside a subagent's own.
 pub fn meta_session_id(meta: &serde_json::Map<String, Value>) -> Option<String> {
-    ["sessionId", "ai.opencode/sessionID", "threadId"]
+    ["sessionId", "ai.opencode/sessionID", "antigravity.google/root_conversation_id", "threadId"]
         .iter()
         .find_map(|k| meta.get(*k).and_then(Value::as_str))
         .filter(|s| !s.is_empty())
@@ -181,6 +184,7 @@ pub fn label(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
         "grok" => "Grok",
+        "agy" => "Antigravity",
         "reason" => "Reason",
         a => a,
     }
@@ -381,6 +385,21 @@ mod tests {
         assert_eq!(from_client_name("not-zcode"), None);
         assert_eq!(from_client_name("claude-ai"), Some("claude-desktop"));
         assert_eq!(from_client_name("example-client"), None);
+        assert_eq!(from_client_name("antigravity-client"), Some("agy"));
+        // What `setup` puts in REASON_NETWORK_AGENT.
+        assert_eq!(from_client_name("agy"), Some("agy"));
+        assert_eq!(from_client_name("legacy"), None);
+    }
+
+    #[test]
+    fn antigravity_names_the_root_conversation_in_meta() {
+        let meta = json!({
+            "antigravity.google/conversation_id": "sub",
+            "antigravity.google/root_conversation_id": "root",
+            "progressToken": "t:4",
+        });
+        assert_eq!(meta_session_id(meta.as_object().unwrap()).as_deref(), Some("root"));
+        assert!(multiplexed("agy"));
     }
 
     #[test]
