@@ -70,7 +70,12 @@ async fn handle(
             .filter_map(|k| std::env::var(k).ok())
             .filter(|s| !s.is_empty()),
     );
-    let cwd = dirs.first().cloned().or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+    // Antigravity runs hooks in the folder of its hooks.json, and names no folder for a session in one it doesn't trust:
+    // then its own folder is the session's.
+    let pid = agent::hook_agent_pid();
+    let own = || if agent == "agy" { pid.and_then(crate::util::process_cwd) } else { None };
+    let cwd =
+        dirs.first().cloned().or_else(own).or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
     // In a folder that is off, the agent hears nothing; the daemon only that this session is off.
     let cfg = crate::config::Config::load_strict().unwrap_or_default();
     let off = cwd.iter().chain(&dirs).any(|d| cfg.off_in(d));
@@ -93,7 +98,7 @@ async fn handle(
         event: ev.to_string(),
         session_id,
         cwd,
-        pid: agent::hook_agent_pid(),
+        pid,
         mail,
         transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
         doing,
@@ -106,19 +111,36 @@ async fn handle(
         return None;
     }
     let ids = reply.ids;
+    // Antigravity whose session can't be woken (yet, or any more): asked to run `wake`, at start or before a model call.
+    let hint = (agent == "agy" && reply.relink && matches!(ev, "start" | "tool"))
+        .then(|| crate::setup::exe().ok().map(|exe| agent::wake_hint(&exe)))
+        .flatten();
     let text = match (reply.text, ev, reply.address) {
-        (Some(t), ..) => t,
+        (Some(t), ..) => Some(t),
         // Say who it is on Reason Network once, at session start.
-        (None, "start", Some(addr)) => {
-            format!(
-                "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
-            )
-        }
-        _ => return None,
+        (None, "start", Some(addr)) => Some(format!(
+            "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
+        )),
+        _ => None,
     };
     // agy injects it as a system message, which the model would otherwise take as coming from its own harness.
-    let text = if agent == "agy" && !ids.is_empty() { format!("{TEAMMATE_NOTE}\n{text}") } else { text };
-    Some((format_for(agent, event, ev, &text), key, ids))
+    let text = text.map(|t| if agent == "agy" && !ids.is_empty() { format!("{TEAMMATE_NOTE}\n{t}") } else { t });
+    let out = match (text, hint) {
+        (None, None) => return None,
+        (Some(t), None) => format_for(agent, event, ev, &t),
+        (Some(t), Some(h)) if ev == "start" => format_for(agent, event, ev, &format!("{t} {h}")),
+        (None, Some(h)) if ev == "start" => format_for(agent, event, ev, &h),
+        // Not kept in the conversation like mail: a reminder for this turn.
+        (t, Some(h)) => ascii(agy_steps(t.as_deref(), &h).to_string()),
+    };
+    Some((out, key, ids))
+}
+
+/// Antigravity's steps before a model call: mail, which stays in the conversation, and `hint`, which doesn't.
+fn agy_steps(mail: Option<&str>, hint: &str) -> Value {
+    let mut steps: Vec<Value> = mail.map(|m| json!({ "systemMessage": { "systemMessage": m } })).into_iter().collect();
+    steps.push(json!({ "ephemeralMessage": hint }));
+    json!({ "injectSteps": steps })
 }
 
 const TEAMMATE_NOTE: &str = "Reason Network: the message below came over the team network, not from your user in this \
@@ -168,8 +190,12 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
         _ => return text.to_string(),
     }
     .to_string();
-    // On Windows agents run hooks through PowerShell, which can re-encode what passes through it: JSON in ASCII is
-    // safe from that.
+    ascii(out)
+}
+
+/// On Windows agents run hooks through PowerShell, which can re-encode what passes through it: JSON in ASCII is safe
+/// from that.
+fn ascii(out: String) -> String {
     if !cfg!(windows) {
         return out;
     }

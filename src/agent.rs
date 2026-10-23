@@ -22,6 +22,8 @@ pub fn detect_env() -> Option<&'static str> {
         Some("codex")
     } else if has("GROK_SESSION_ID") || has("GROK_WORKSPACE_ROOT") {
         Some("grok")
+    } else if has("ANTIGRAVITY_AGENT") {
+        Some("agy")
     } else if has("GEMINI_CLI") {
         Some("gemini")
     } else if has("CURSOR_AGENT") {
@@ -101,10 +103,29 @@ pub fn env_session_id(agent: &str) -> Option<String> {
         "gemini" => "GEMINI_SESSION_ID",
         "codex" => "CODEX_THREAD_ID",
         "grok" => "GROK_SESSION_ID",
+        "agy" => "ANTIGRAVITY_CONVERSATION_ID",
         "opencode" => "OPENCODE_SESSION_ID",
         _ => return None,
     };
     std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+/// What to tell Antigravity so that a message can wake it while idle: what that takes, only its shell commands get.
+pub fn wake_hint(exe: &Path) -> String {
+    format!(
+        "Teammates' messages reach you while you work. So that they can also wake you while idle, run `{}` once now as \
+         a shell command (it returns at once; nothing keeps running).",
+        crate::setup::shell_cmd(exe, "wake").trim_end()
+    )
+}
+
+/// Antigravity's conversation and language server, as its shell commands get them: what `reason-network wake` hands
+/// the daemon.
+pub fn agy_shell() -> Option<(String, crate::proto::Route)> {
+    let var = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let route =
+        crate::proto::Route::Agy { address: var("ANTIGRAVITY_LS_ADDRESS")?, token: var("ANTIGRAVITY_CSRF_TOKEN")? };
+    Some((format!("agy:{}", var("ANTIGRAVITY_CONVERSATION_ID")?), route))
 }
 
 /// The session id carried in a tool call's `_meta`. Codex sends `sessionId` (the root thread, the same id its
@@ -389,6 +410,13 @@ mod tests {
         // What `setup` puts in REASON_NETWORK_AGENT.
         assert_eq!(from_client_name("agy"), Some("agy"));
         assert_eq!(from_client_name("legacy"), None);
+    }
+
+    #[test]
+    fn antigravity_is_asked_to_run_wake_once() {
+        let hint = wake_hint(Path::new("/opt/rn/reason-network"));
+        assert!(hint.contains("`/opt/rn/reason-network wake`"), "{hint}");
+        assert!(hint.contains("once") && !hint.contains("background"), "{hint}");
     }
 
     #[test]
