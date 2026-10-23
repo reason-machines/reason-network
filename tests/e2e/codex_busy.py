@@ -10,6 +10,7 @@ through `codex queue`. Each fake rollout records turns the way Codex does (`task
 import json
 import os
 import queue
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -172,6 +173,53 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
               queued())
         check("interrupted with mail waiting: no hook shows it again", t.hook("post-tool-use") == "")
 
+    def daemon(request):
+        """One request straight over the daemon's socket, as a hook client sends it; returns its result."""
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(30)
+            sock.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.sock"))
+            sock.sendall((json.dumps({"id": 1, **request}) + "\n").encode())
+            reply = json.loads(sock.makefile().readline())
+        assert reply.get("ok"), reply
+        return reply.get("result")
+
+    def unconfirmed():
+        # A PostToolUse showed the mail, and its confirmation comes only after the turn was interrupted: while it may
+        # still come, the mail is left to that hook, not queued as well (which would show it twice).
+        t = Thread("late")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.send("confirmed late")
+        shown = daemon({"op": "hook", "agent": "codex", "event": "tool", "session_id": f"thread-{t.name}",
+                        "cwd": t.cwd, "transcript": t.rollout})
+        t.record("turn_aborted", turn_id="t", reason="interrupted")  # no Stop
+        time.sleep(6)
+        daemon({"op": "delivered", "key": f"codex:thread-{t.name}", "ids": shown["ids"]})
+        time.sleep(3)
+        check("confirmed late: the hook showed it, and it is not queued as well",
+              "confirmed late" in (shown["text"] or "") and read("confirmed late") and queued("confirmed late") == 0,
+              (shown, queued()))
+        # A PostToolUse took the mail but could not print it, so never confirms: queued once that is overdue (90 s).
+        u = Thread("unconfirmed")
+        u.start_turn()
+        u.hook("post-tool-use")
+        u.send("never confirmed")
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            payload = {"session_id": f"thread-{u.name}", "cwd": u.cwd, "transcript_path": u.rollout}
+            subprocess.run([BIN, "hook", "codex", "post-tool-use"], env=env, cwd=u.cwd, input=json.dumps(payload),
+                           text=True, stdout=w, stderr=subprocess.DEVNULL, timeout=30)
+        finally:
+            os.close(w)
+        u.record("turn_aborted", turn_id="t", reason="interrupted")  # no Stop
+        time.sleep(6)
+        check("never confirmed: not queued at the interrupt, while its confirmation may come",
+              queued("never confirmed") == 0, queued())
+        check("never confirmed: queued once that is overdue", queued_within("never confirmed", 100), queued())
+        time.sleep(3)
+        check("never confirmed: …once", read("never confirmed") and queued("never confirmed") == 1, queued())
+
     def no_rollout():
         # A thread whose hooks name no rollout (Codex has none for a remote thread store): as before, codex queue.
         t = Thread("norollout", transcript=False)
@@ -288,8 +336,8 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
             cx.kill()
             cx.wait()
 
-        scenarios = [busy, idle, ending, interrupted, interrupted_pending, failed, continued, no_rollout, long_call,
-                     long_gap, long_turn]
+        scenarios = [busy, idle, ending, interrupted, interrupted_pending, unconfirmed, failed, continued, no_rollout,
+                     long_call, long_gap, long_turn]
         print(f"Running {len(scenarios)} scenarios at once; the long ones wait {LONG} seconds", flush=True)
         threads = [threading.Thread(target=s) for s in scenarios]
         for th in threads:

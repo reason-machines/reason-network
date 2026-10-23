@@ -19,6 +19,10 @@ const CHUNK: u64 = 256 << 10;
 /// `None` when it can't be read. Remembers how far it read, so later calls read only what was appended.
 pub fn turn_running(path: &Path) -> Option<bool> {
     static SEEN: OnceLock<Mutex<HashMap<PathBuf, (u64, bool)>>> = OnceLock::new();
+    // Only a regular file: opening a pipe a hook named would wait for a writer.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -36,7 +40,8 @@ pub fn turn_running(path: &Path) -> Option<bool> {
 /// The last turn event in `from..to` (whole lines from `from`, which starts one), and where the last whole line in it
 /// ends: a line still being written is read next time.
 fn last_turn_event(file: &mut File, from: u64, to: u64) -> std::io::Result<(u64, Option<bool>)> {
-    let (mut end, mut whole_to, mut cut) = (to, None, Vec::new());
+    // `rest`: the pieces of a line that begins in a chunk before, last piece first.
+    let (mut end, mut whole_to, mut rest) = (to, None, Vec::<Vec<u8>>::new());
     while end > from {
         let start = end.saturating_sub(CHUNK).max(from);
         let mut buf = vec![0; (end - start) as usize];
@@ -50,15 +55,22 @@ fn last_turn_event(file: &mut File, from: u64, to: u64) -> std::io::Result<(u64,
             };
             whole_to = Some(start + i as u64 + 1);
             buf.truncate(i + 1);
+        } else if start > from && !buf.contains(&b'\n') {
+            // All of it is inside that line: put the line together once its start is read, not every chunk.
+            rest.push(buf);
+            end = start;
+            continue;
         } else {
-            buf.extend_from_slice(&cut);
+            for piece in rest.drain(..).rev() {
+                buf.extend_from_slice(&piece);
+            }
         }
         // The first line here may begin in the chunk before: keep it for then.
         let first = if start > from { buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1) } else { 0 };
         if let Some(running) = buf[first..].split(|&b| b == b'\n').rev().find_map(turn_event) {
             return Ok((whole_to.unwrap_or(from), Some(running)));
         }
-        cut = buf[..first].to_vec();
+        rest.push(buf[..first].to_vec());
         end = start;
     }
     Ok((whole_to.unwrap_or(from), None))
@@ -152,6 +164,21 @@ mod tests {
         let tail = CHUNK as usize - 10;
         append(&cut, &(format!(r#"{{"x":"{}"}}"#, "w".repeat(tail - 9)) + "\n"));
         assert_eq!(turn_running(&cut), Some(true), "the line across the boundary was put back together");
+        // A turn event across four chunks, its type in the middle one, read fresh: its pieces go back in order.
+        let spread = dir.join("spread.jsonl");
+        append(&spread, &event("task_started"));
+        let half = "m".repeat(3 * CHUNK as usize / 2);
+        let end = format!(r#"{{"type":"event_msg","payload":{{"a":"{half}","type":"task_complete","b":"{half}"}}}}"#);
+        append(&spread, &(end + "\n"));
+        assert_eq!(turn_running(&spread), Some(false), "the end, put back together");
+
+        // A pipe is not a rollout, and is not waited on.
+        #[cfg(unix)]
+        {
+            let pipe = dir.join("pipe");
+            assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+            assert_eq!(turn_running(&pipe), None);
+        }
 
         // Rewritten shorter: read again.
         std::fs::write(&path, event("task_started")).unwrap();

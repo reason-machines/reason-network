@@ -415,6 +415,8 @@ impl Daemon {
 
     /// Codex runs no Stop hook when a turn is interrupted or fails: until the turn `key` is in ends, checks its
     /// rollout, and once it has ended hands the wake mail no hook took to `codex queue`. One watch per session.
+    /// The watch is not kept across a daemon restart: if the daemon restarts while mail waits for a running turn, and
+    /// that turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt.
     fn watch_codex_turn(self: &Arc<Self>, g: &mut Inner, key: &str) {
         if !g.codex_watch.insert(key.to_string()) {
             return;
@@ -429,7 +431,7 @@ impl Daemon {
                     return;
                 };
                 let (address, transcript) = (this.addr(&l.name), l.transcript.clone());
-                if !g.store.unread(&address).unwrap_or_default().iter().any(|m| m.wake) {
+                if !g.store.unread_wakes(&address).unwrap_or_default() {
                     g.codex_watch.remove(&key);
                     return;
                 }
@@ -1066,6 +1068,43 @@ mod tests {
         assert_eq!(unread, ["one", "two"]);
         let r = send("three").await.unwrap();
         assert_eq!((r.recipients[0].state.as_str(), rx.try_recv().is_err()), ("queued", true));
+    }
+
+    #[tokio::test]
+    async fn a_codex_session_has_one_turn_watch_and_it_ends_once_its_wake_mail_is_read() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let reg = SessionReg { cwd: "/work/web".into(), ..codex("codex:2") };
+        let to = d.register(Some(2), reg, crate::git::GitInfo::default()).unwrap().address;
+        let send = |body: &'static str, wake| d.send("codex:1".into(), &to, body, None, wake, false, None, Vec::new());
+        send("fyi", false).await.unwrap();
+        send("wake", true).await.unwrap();
+        // Its turn runs.
+        let rollout = std::env::temp_dir().join(format!("reason-network-watch-{}.jsonl", Ulid::generate()));
+        std::fs::write(&rollout, "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n").unwrap();
+        d.inner.lock().unwrap().live.get_mut("codex:2").unwrap().transcript = Some(rollout.clone());
+
+        let tasks = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+        let watching = || d.inner.lock().unwrap().codex_watch.contains("codex:2");
+        let before = tasks();
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.watch_codex_turn(&mut g, "codex:2");
+            d.watch_codex_turn(&mut g, "codex:2");
+        }
+        assert_eq!(tasks(), before + 1, "more mail for the turn starts no second watch");
+        tokio::time::sleep(CODEX_TURN_POLL + Duration::from_millis(500)).await;
+        assert!(watching(), "watching while wake mail waits and the turn runs");
+        // A hook took the wake mail; the FYI mail is still unread, and keeps no watch going.
+        let wake: Vec<String> = {
+            let g = d.inner.lock().unwrap();
+            g.store.unread(&to).unwrap().into_iter().filter(|m| m.wake).map(|m| m.id).collect()
+        };
+        d.inner.lock().unwrap().store.mark_read(&wake, util::now_ms()).unwrap();
+        tokio::time::sleep(CODEX_TURN_POLL + Duration::from_millis(500)).await;
+        assert!(!watching(), "the watch ended");
+        assert!(tasks() <= before, "…and its task with it");
+        let _ = std::fs::remove_file(&rollout);
     }
 
     #[test]

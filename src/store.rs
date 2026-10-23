@@ -259,6 +259,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether a mailbox has unread mail that wakes its session.
+    pub fn unread_wakes(&self, recipient: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0 AND wake != 0)",
+            [recipient],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn unread_count(&self, recipient: &str) -> Result<u32> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL AND held = 0",
