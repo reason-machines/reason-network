@@ -103,6 +103,8 @@ router instead, set it in `~/.reason/network/config.toml` (per computer; the dae
 port = 41641
 ```
 
+Put `port` at the top of the file, above any `[table]` section such as `[inbound]`. The daemon ignores it under a table.
+
 It is bound on IPv4 and IPv6 (IPv4 alone on a computer without IPv6). If another program holds it on either, the
 daemon logs that and uses a random port, as without it; `port = 0` is the same as leaving it out.
 `reason-network doctor` shows the port in use. Relays work the same either way.
