@@ -319,9 +319,9 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
-| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: waits for its human. |
+| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: a background `reason-network listen` it is told to keep running (session start and MCP instructions); its end wakes the session. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
-| Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
+| Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. Idle: a background `reason-network listen` (MCP instructions), whose end wakes the session. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 

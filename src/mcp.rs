@@ -37,6 +37,18 @@ fn instructions() -> String {
     format!("Reason Network connects you with your teammates' coding agents.\n\n{rules}")
 }
 
+/// With the background listener for agents that need one (`setup` names the agent in their MCP config).
+fn instructions_for(agent: Option<&str>) -> String {
+    let mut text = instructions();
+    if agent::listener_key(agent, Some(String::new())).is_some()
+        && let Ok(exe) = crate::setup::exe()
+    {
+        text.push_str("\n\n");
+        text.push_str(&agent::listener_hint(&exe));
+    }
+    text
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListArgs {
     /// Only sessions matching this text (person, session, agent, repo, branch, directory or what it's doing).
@@ -248,7 +260,7 @@ impl ServerHandler for ReasonNetworkMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(crate::AGENT_NAME, env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions())
+            .with_instructions(instructions_for(self.env_agent))
     }
 
     /// A session that gets its messages pushed never needs check_inbox, so it isn't shown one: fewer tokens.
@@ -443,5 +455,13 @@ mod tests {
     fn instructions_carry_the_skills_rules() {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
+    }
+
+    #[test]
+    fn agents_that_need_a_listener_are_told_to_run_it() {
+        assert!(super::instructions_for(Some("agy")).contains(" listen` running as a background command"));
+        assert!(super::instructions_for(Some("grok")).contains(" listen` running as a background command"));
+        assert!(!super::instructions_for(Some("claude-code")).contains("background command"));
+        assert!(!super::instructions_for(None).contains("background command"));
     }
 }

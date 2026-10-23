@@ -90,6 +90,22 @@ check("agy pre-invocation → the mail as a system message", '"systemMessage"' i
 run("send", "agyproj-agy", "agy: and the docs")
 out = hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 check("agy stop at the end of a turn → decision continue", '"decision":"continue"' in out and "and the docs" in out, out)
+check("agy's intro tells it to keep a listener running", "listen` running as a background command" in hook("agy", "session-start", agy))
+# The listener, as agy runs it in its shell: quiet until a message comes, then prints it and ends, which wakes agy.
+shell = dict(env, ANTIGRAVITY_AGENT="1", ANTIGRAVITY_CONVERSATION_ID="a-1")
+listener = subprocess.Popen([BIN, "listen"], env=shell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+time.sleep(2)
+check("the listener waits quietly", listener.poll() is None)
+out = run("send", "agyproj-agy", "agy: wake up")
+check("the sender hears agy is waiting", "delivered" in out, out)
+try:
+    out = listener.communicate(timeout=15)[0]
+except subprocess.TimeoutExpired:
+    listener.kill()
+    out = "(still waiting)"
+check("the listener prints the message and ends", "agy: wake up" in out and listener.returncode == 0, out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=2))
+check("…and the hooks don't deliver it twice", "wake up" not in out, out)
 
 # Copilot: camelCase sessionId
 cop ={"sessionId": "p-1", "cwd": proj, "timestamp": 1}

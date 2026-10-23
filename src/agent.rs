@@ -22,6 +22,8 @@ pub fn detect_env() -> Option<&'static str> {
         Some("codex")
     } else if has("GROK_SESSION_ID") || has("GROK_WORKSPACE_ROOT") {
         Some("grok")
+    } else if has("ANTIGRAVITY_AGENT") {
+        Some("agy")
     } else if has("GEMINI_CLI") {
         Some("gemini")
     } else if has("CURSOR_AGENT") {
@@ -101,10 +103,28 @@ pub fn env_session_id(agent: &str) -> Option<String> {
         "gemini" => "GEMINI_SESSION_ID",
         "codex" => "CODEX_THREAD_ID",
         "grok" => "GROK_SESSION_ID",
+        "agy" => "ANTIGRAVITY_CONVERSATION_ID",
         "opencode" => "OPENCODE_SESSION_ID",
         _ => return None,
     };
     std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+/// The session a `listen` run in the agent's shell waits on: for agents that wake when a background command ends, but
+/// whose idle sessions nothing else can reach.
+pub fn listener_key(agent: Option<&str>, id: Option<String>) -> Option<String> {
+    let agent = agent.filter(|a| matches!(*a, "agy" | "grok"))?;
+    Some(format!("{agent}:{}", id?))
+}
+
+/// What to tell such an agent so a message wakes it while idle.
+pub fn listener_hint(exe: &Path) -> String {
+    format!(
+        "Teammates' messages reach you while you work. To hear them while idle too, keep `{}` running as a \
+         background command: start it now without waiting for it, and again each time it finishes (it prints the \
+         message that ended it).",
+        crate::setup::shell_cmd(exe, "listen")
+    )
 }
 
 /// The session id carried in a tool call's `_meta`. Codex sends `sessionId` (the root thread, the same id its
@@ -389,6 +409,17 @@ mod tests {
         // What `setup` puts in REASON_NETWORK_AGENT.
         assert_eq!(from_client_name("agy"), Some("agy"));
         assert_eq!(from_client_name("legacy"), None);
+    }
+
+    #[test]
+    fn a_background_listener_waits_on_its_agents_session() {
+        assert_eq!(listener_key(Some("agy"), Some("c-1".into())).as_deref(), Some("agy:c-1"));
+        assert_eq!(listener_key(Some("grok"), Some("g-1".into())).as_deref(), Some("grok:g-1"));
+        // Pushed agents need none; the others aren't known to wake when a background command ends.
+        assert_eq!(listener_key(Some(CLAUDE_CODE), Some("s".into())), None);
+        assert_eq!(listener_key(Some("cursor"), Some("s".into())), None);
+        assert_eq!(listener_key(Some("agy"), None), None);
+        assert_eq!(listener_key(None, None), None);
     }
 
     #[test]

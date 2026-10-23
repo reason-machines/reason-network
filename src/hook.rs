@@ -70,7 +70,12 @@ async fn handle(
             .filter_map(|k| std::env::var(k).ok())
             .filter(|s| !s.is_empty()),
     );
-    let cwd = dirs.first().cloned().or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
+    // Antigravity runs hooks in the folder of its hooks.json, and names no folder for a session in one it doesn't trust:
+    // then its own folder is the session's.
+    let pid = agent::hook_agent_pid();
+    let own = || if agent == "agy" { pid.and_then(crate::util::process_cwd) } else { None };
+    let cwd =
+        dirs.first().cloned().or_else(own).or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
     // In a folder that is off, the agent hears nothing; the daemon only that this session is off.
     let cfg = crate::config::Config::load_strict().unwrap_or_default();
     let off = cwd.iter().chain(&dirs).any(|d| cfg.off_in(d));
@@ -93,7 +98,7 @@ async fn handle(
         event: ev.to_string(),
         session_id,
         cwd,
-        pid: agent::hook_agent_pid(),
+        pid,
         mail,
         transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
         doing,
@@ -110,9 +115,16 @@ async fn handle(
         (Some(t), ..) => t,
         // Say who it is on Reason Network once, at session start.
         (None, "start", Some(addr)) => {
-            format!(
+            let mut intro = format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
-            )
+            );
+            if agent == "agy"
+                && let Ok(exe) = crate::setup::exe()
+            {
+                intro.push(' ');
+                intro.push_str(&agent::listener_hint(&exe));
+            }
+            intro
         }
         _ => return None,
     };
