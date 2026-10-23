@@ -139,15 +139,22 @@ fn home() -> String {
     paths::user_home().to_string_lossy().into_owned()
 }
 
-/// The `folders` entry that decides for `cwd`: of those that hold it, the deepest.
+/// The `folders` entry that decides for `cwd`: of those that hold it, the deepest. Either path counts as written or by
+/// where its links lead (a folder not yet made included), so a link can't take a session out of an off folder.
 fn folder_rule<'a>(folders: &'a BTreeMap<String, String>, home: &str, cwd: &str) -> Option<(&'a str, &'a str)> {
-    let at = parts(cwd, home);
+    let at = [parts(cwd, home), entry_parts(cwd, home)];
     folders
         .iter()
         .filter(|(k, v)| rule_holds(k, v, home))
-        .map(|(k, v)| (k, v, entry_parts(k, home)))
-        .filter(|(_, _, p)| at.starts_with(p))
-        .max_by_key(|(_, _, p)| p.len())
+        .filter_map(|(k, v)| {
+            let held = [parts(k, home), entry_parts(k, home)]
+                .into_iter()
+                .filter(|p| at.iter().any(|a| a.starts_with(p)))
+                .map(|p| p.len())
+                .max()?;
+            Some((k, v, held))
+        })
+        .max_by_key(|(_, _, depth)| *depth)
         .map(|(k, v, _)| (k.as_str(), v.as_str()))
 }
 
@@ -338,6 +345,32 @@ mod tests {
         assert!(cfg.off_in(&d.join("real").join("personal").join("sub").display().to_string()));
         assert!(cfg.off_in(&d.join("link").join("sub").display().to_string()));
         assert!(!cfg.off_in(&d.join("real").display().to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_inside_an_off_folder_does_not_take_its_sessions_out() {
+        let d = temp();
+        let personal = d.join("real").join("personal");
+        std::os::unix::fs::symlink(d.join("x"), personal.join("link")).unwrap();
+        let cfg = Config { folders: folders(&[(&personal.display().to_string(), "off")]), ..Config::default() };
+        // As written it is in the off folder, though it leads out of it; and the folder it leads to stays on.
+        assert!(cfg.off_in(&personal.join("link").join("work").display().to_string()));
+        assert!(cfg.off_in(&personal.join("link").display().to_string()));
+        assert!(!cfg.off_in(&d.join("x").join("work").display().to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_not_yet_made_under_a_link_is_held_by_where_the_link_leads() {
+        let d = temp();
+        std::os::unix::fs::symlink(d.join("real").join("personal"), d.join("link")).unwrap();
+        let entry = d.join("real").join("personal").display().to_string();
+        let cfg = Config { folders: folders(&[(&entry, "off")]), ..Config::default() };
+        // `new` doesn't exist, so the folder can't be looked up whole; the link above it still leads into `personal`.
+        assert!(cfg.off_in(&d.join("link").join("new").join("deeper").display().to_string()));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
