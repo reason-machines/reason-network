@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow};
 use iroh::SecretKey;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -150,6 +150,8 @@ struct Inner {
     quota: crate::files::Quota,
     /// Sessions whose hooks say they are in a folder that is off: whether each is mid-turn, and when it last said.
     off: HashMap<String, (bool, i64)>,
+    /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
+    codex_watch: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -223,6 +225,7 @@ impl Daemon {
                 swept: 0,
                 quota: Default::default(),
                 off: HashMap::new(),
+                codex_watch: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),

@@ -363,6 +363,12 @@ impl Daemon {
             self.mailbox(&key, now)?;
         }
 
+        // Read a Codex rollout that is new here now, not later while holding the lock (see `deliver`).
+        if agent == "codex"
+            && let Some(t) = &transcript
+        {
+            crate::codex::turn_running(std::path::Path::new(t));
+        }
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };

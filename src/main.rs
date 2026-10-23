@@ -1,6 +1,7 @@
 mod agent;
 mod claude;
 mod client;
+mod codex;
 mod config;
 mod daemon;
 mod doing;

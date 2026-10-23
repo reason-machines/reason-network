@@ -6,7 +6,7 @@
 
 use super::{Daemon, Inner, directory::Target, log};
 use crate::{
-    agent, claude,
+    agent, claude, codex,
     config::Policy,
     files,
     proto::*,
@@ -31,7 +31,8 @@ const LOOP_LIMIT: usize = 12;
 const LOOP_WINDOW: Duration = Duration::from_secs(600);
 /// A push or hook not confirmed within this long is shown through the inbox and hooks again.
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
-const CODEX_HOOK_WAIT: Duration = Duration::from_secs(120);
+/// How often a Codex session's rollout is checked while mail waits for a hook of its turn.
+const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
 
 /// How a session on this machine gets a message into its conversation.
 enum Channel {
@@ -328,17 +329,17 @@ impl Daemon {
             return ("queued".into(), "queued: Reason didn't take the last delivery; it is retried shortly".into());
         }
         let has = |bin: &str| !l.push_failed && agent::find_bin(bin).is_some();
+        // A Codex turn is running (and `codex queue` is there for when it ends).
+        let codex_turn = l.reg.agent == "codex"
+            && has("codex")
+            && l.transcript.as_deref().and_then(codex::turn_running) == Some(true);
         let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
             // Its MCP server knows its inbox; else (it may not yet) the daemon posts into the one Claude Code lists.
             (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {
                 Channel::ClaudeSocket(conn)
             }
-            _ if l.reg.agent == "codex"
-                && l.last_hook.is_some_and(|at| util::now_ms() - at < CODEX_HOOK_WAIT.as_millis() as i64)
-                && l.status.as_ref().is_some_and(|(s, _)| s == "busy") =>
-            {
-                Channel::Hook
-            }
+            // In a turn, its next PostToolUse (or Stop) shows it; `codex queue` would hold it until the turn ends.
+            (Tier::Push, _, Some(_)) if codex_turn => Channel::Hook,
             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
                 Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
             }
@@ -403,39 +404,49 @@ impl Daemon {
                 ("pushed".into(), note.into())
             }
             Channel::Hook => {
-                if l.reg.agent == "codex" && has("codex") {
-                    let this = self.clone();
-                    let key = key.to_string();
-                    tokio::spawn(async move {
-                        let mut ids = ids;
-                        // Codex can abort a turn without Stop. Don't leave its mail waiting for a hook forever.
-                        loop {
-                            tokio::time::sleep(CODEX_HOOK_WAIT).await;
-                            let mut g = this.inner.lock().unwrap();
-                            let Some(address) = g.live.get(&key).map(|l| this.addr(&l.name)) else { return };
-                            if !g.store.unread(&address).unwrap_or_default().iter().any(|m| ids.contains(&m.id)) {
-                                return;
-                            }
-                            let waiting: Vec<_> = g
-                                .pending(&address)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|m| m.wake && ids.contains(&m.id))
-                                .collect();
-                            if !waiting.is_empty() {
-                                ids.retain(|id| !waiting.iter().any(|m| &m.id == id));
-                                this.deliver(&mut g, &key, waiting, true);
-                                if ids.is_empty() {
-                                    return;
-                                }
-                            }
-                        }
-                    });
+                if codex_turn {
+                    self.watch_codex_turn(g, key);
                 }
                 ("queued".into(), hook_note.into())
             }
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
         }
+    }
+
+    /// Codex runs no Stop hook when a turn is interrupted or fails: until the turn `key` is in ends, checks its
+    /// rollout, and once it has ended hands the wake mail no hook took to `codex queue`. One watch per session.
+    fn watch_codex_turn(self: &Arc<Self>, g: &mut Inner, key: &str) {
+        if !g.codex_watch.insert(key.to_string()) {
+            return;
+        }
+        let (this, key) = (self.clone(), key.to_string());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CODEX_TURN_POLL).await;
+                let mut g = this.inner.lock().unwrap();
+                let Some(l) = g.live.get(&key) else {
+                    g.codex_watch.remove(&key);
+                    return;
+                };
+                let (address, transcript) = (this.addr(&l.name), l.transcript.clone());
+                if !g.store.unread(&address).unwrap_or_default().iter().any(|m| m.wake) {
+                    g.codex_watch.remove(&key);
+                    return;
+                }
+                if transcript.as_deref().and_then(codex::turn_running) == Some(true) {
+                    continue;
+                }
+                // What a hook showed and hasn't confirmed yet is left to it until its confirmation is overdue.
+                let waiting: Vec<Message> =
+                    g.pending(&address).unwrap_or_default().into_iter().filter(|m| m.wake).collect();
+                if waiting.is_empty() {
+                    continue;
+                }
+                g.codex_watch.remove(&key);
+                this.deliver(&mut g, &key, waiting, true);
+                return;
+            }
+        });
     }
 
     /// A session's MCP server had no inbox to push `ids` into: they are unread again, for the session to read when it

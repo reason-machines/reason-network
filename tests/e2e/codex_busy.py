@@ -1,23 +1,37 @@
-"""Codex delivery routing against an isolated daemon and a queue-accepting CLI.
+"""Codex delivery routing against an isolated daemon, a queue-accepting fake CLI and fake rollouts.
 
-The fake CLI records accepted queue commands; it does not prove that real Codex
-supports `queue`, resumes a thread, or displays the message.
+Mail to a Codex turn that is still running waits for its next PostToolUse (or Stop), however long the turn runs.
+Mail to a thread whose last turn ended (completed, interrupted or failed: the last two run no Stop hook) wakes it
+through `codex queue`. Each fake rollout records turns the way Codex does (`task_started`, then `task_complete` or
+`turn_aborted`); the fake CLI records queue commands. Neither proves what real Codex shows.
 
-    cargo build && python3 tests/e2e/codex_busy.py
+    cargo build && python3 tests/e2e/codex_busy.py     # about 2.5 minutes: it waits out real two-minute gaps
 """
 import json
 import os
 import queue
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
+LONG = 130  # past two minutes, the bound the hooks alone could tell
 
-with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
+results = []
+lock = threading.Lock()
+
+
+def check(name, ok, detail=""):
+    with lock:
+        results.append(ok)
+        print(f"{'PASS' if ok else 'FAIL'}: {name}" + ("" if ok else f"\n      {detail}"), flush=True)
+
+
+with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
     queue_log = os.path.join(d, "queue.log")
     fake = os.path.join(d, "codex")
     with open(fake, "w") as f:
@@ -27,135 +41,274 @@ with tempfile.TemporaryDirectory(prefix="reason-network-codex-") as d:
     env.update(REASON_NETWORK_HOME=os.path.join(d, "home"), REASON_NETWORK_NO_MDNS="1",
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_MACHINE="box",
                REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue_log)
-    proj = os.path.join(d, "proj")
-    os.makedirs(proj)
 
-    def run(*args, payload=None):
-        r = subprocess.run([BIN, *args], env=env, cwd=proj, input=json.dumps(payload) if payload else None,
+    def run(*args, payload=None, cwd=d):
+        r = subprocess.run([BIN, *args], env=env, cwd=cwd, input=json.dumps(payload) if payload else None,
                            capture_output=True, text=True, timeout=30)
         assert r.returncode == 0, r.stdout + r.stderr
         return (r.stdout + r.stderr).strip()
 
-    def hook(event, session="busy-thread", cwd=proj):
-        return run("hook", "codex", event, payload={"session_id": session, "cwd": cwd})
+    class Thread:
+        """One Codex thread: its folder (so its name, `<folder>-codex`), its hooks and its rollout."""
 
-    def queued():
-        if not os.path.exists(queue_log):
-            return ""
-        with open(queue_log) as f:
-            return f.read()
+        def __init__(self, name, transcript=True):
+            self.name, self.cwd = f"{name}-codex", os.path.join(d, name)
+            os.makedirs(self.cwd)
+            self.rollout = os.path.join(d, f"rollout-{name}.jsonl") if transcript else None
+            if self.rollout:
+                self.record("session_meta", top=True)
 
-    def rpc(p, request):
-        p.stdin.write(json.dumps(request) + "\n")
-        p.stdin.flush()
-        if "id" not in request:
-            return None
-        responses = queue.Queue()
+        def record(self, kind, top=False, **extra):
+            line = {"timestamp": "2026-10-22T00:00:00.000Z"}
+            if top:
+                line.update(type=kind, payload={"id": self.name})
+            else:
+                line.update(type="event_msg", payload={"type": kind, **extra})
+            with open(self.rollout, "a") as f:
+                f.write(json.dumps(line) + "\n")
 
-        def receive():
-            while line := p.stdout.readline():
-                response = json.loads(line)
-                if response.get("id") == request["id"]:
-                    responses.put(response)
-                    return
+        def hook(self, event):
+            payload = {"session_id": f"thread-{self.name}", "cwd": self.cwd}
+            if self.rollout:
+                payload["transcript_path"] = self.rollout
+            return run("hook", "codex", event, payload=payload, cwd=self.cwd)
 
-        threading.Thread(target=receive, daemon=True).start()
-        return responses.get(timeout=10)
+        def start_turn(self):
+            self.record("task_started", turn_id="t")
+            self.hook("user-prompt-submit")
 
-    cx = None
+        def send(self, body, *flags):
+            return run("send", self.name, *flags, body)
+
+    def queued(body=None):
+        """How many queue commands carried `body`; without one, the bodies queued so far (for failure details)."""
+        text = open(queue_log).read() if os.path.exists(queue_log) else ""
+        if body is not None:
+            return text.count(body)
+        return [line for line in text.splitlines() if line and not line.startswith(("queue ", "<", "From "))]
+
+    def queued_within(body, secs):
+        deadline = time.monotonic() + secs
+        while not queued(body) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return queued(body) > 0
+
+    def read(body, secs=5):
+        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
+            deadline = time.monotonic() + secs
+            while True:
+                row = db.execute("SELECT read_at FROM messages WHERE body = ?", (body,)).fetchone()
+                if (row and row[0] is not None) or time.monotonic() >= deadline:
+                    return bool(row and row[0] is not None)
+                time.sleep(0.05)
+
+    def shown_once(t, body, event="post-tool-use"):
+        out = t.hook(event)
+        again = t.hook("post-tool-use")
+        return body in out and body not in again, f"{event}: {out!r}; next: {again!r}"
+
+    # Each scenario runs in its own thread against the one daemon, so the real waits overlap.
+
+    def busy():
+        t = Thread("busy")
+        t.start_turn()
+        t.send("busy message")
+        run("who")  # a queue command, if one were started, finishes meanwhile
+        ok, detail = shown_once(t, "busy message")
+        check("busy: the next PostToolUse shows the message, once", ok and '"PostToolUse"' in detail, detail)
+        check("busy: …and it is not queued as well", queued("busy message") == 0, queued())
+
+    def idle():
+        t = Thread("idle")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.hook("stop")
+        t.record("task_complete", turn_id="t")
+        out = t.send("idle message")
+        check("idle: the sender hears it is queued into Codex", "queued into the Codex session" in out, out)
+        check("idle: woken through codex queue", queued_within("idle message", 5), queued())
+        check("idle: the queue's success counts as delivered", read("idle message"))
+        check("idle: …and no hook shows it again", t.hook("post-tool-use") == "")
+
+    def ending():
+        # Mail that lands between Stop and the turn's end in the rollout.
+        t = Thread("ending")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.hook("stop")
+        t.send("ending message")
+        time.sleep(0.5)
+        t.record("task_complete", turn_id="t")
+        check("turn ending: queued once the rollout records the end", queued_within("ending message", 10), queued())
+        check("turn ending: …once", read("ending message") and queued("ending message") == 1, queued())
+
+    def interrupted():
+        t = Thread("interrupted")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.record("turn_aborted", turn_id="t", reason="interrupted")  # no Stop
+        t.send("after interrupt")
+        check("interrupted: new mail wakes through codex queue right away", queued_within("after interrupt", 10),
+              queued())
+        check("interrupted: …once, and no hook shows it again",
+              read("after interrupt") and queued("after interrupt") == 1 and t.hook("post-tool-use") == "")
+
+    def interrupted_pending():
+        t = Thread("pending")
+        t.start_turn()
+        t.hook("post-tool-use")
+        bodies = [f"waiting at interrupt {i}" for i in range(3)]
+        for body in bodies:
+            t.send(body)
+        time.sleep(1)
+        check("interrupted with mail waiting: held for the hook while the turn runs",
+              all(queued(b) == 0 for b in bodies), queued())
+        t.record("turn_aborted", turn_id="t", reason="interrupted")  # no Stop
+        check("interrupted with mail waiting: queued within seconds of the interrupt",
+              all(queued_within(b, 10) for b in bodies), queued())
+        time.sleep(3)
+        check("interrupted with mail waiting: each once, in one queue command",
+              all(read(b) and queued(b) == 1 for b in bodies) and queued("--thread thread-pending-codex ") == 1,
+              queued())
+        check("interrupted with mail waiting: no hook shows it again", t.hook("post-tool-use") == "")
+
+    def no_rollout():
+        # A thread whose hooks name no rollout (Codex has none for a remote thread store): as before, codex queue.
+        t = Thread("norollout", transcript=False)
+        t.hook("user-prompt-submit")
+        t.hook("post-tool-use")
+        t.send("no rollout message")
+        check("no rollout known: woken through codex queue, as before", queued_within("no rollout message", 5),
+              queued())
+
+    def failed():
+        t = Thread("failed")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.record("task_complete", turn_id="t", last_agent_message=None,
+                 error={"message": "stream disconnected"})  # a failed turn: no Stop
+        t.send("after failure")
+        check("failed turn: mail wakes through codex queue right away", queued_within("after failure", 10), queued())
+
+    def continued():
+        # Stop hands over mail (decision: block), so the turn goes on; mail for it still waits for the hook.
+        t = Thread("continued")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.send("first message")
+        out = t.hook("stop")
+        check("continued: Stop shows the first message as a block", "first message" in out and '"block"' in out, out)
+        t.send("second message")
+        time.sleep(3)
+        check("continued: the second message is not queued while the turn goes on", queued("second message") == 0,
+              queued())
+        ok, detail = shown_once(t, "second message")
+        check("continued: the next PostToolUse shows the second message, once", ok, detail)
+
+    def long_call():
+        # One tool call runs past two minutes (a long build); mail arrives during it.
+        t = Thread("longcall")
+        t.start_turn()
+        t.hook("post-tool-use")
+        time.sleep(LONG)
+        t.send("during the long call")
+        time.sleep(3)
+        check("long tool call: mail during it is not queued behind the turn", queued("during the long call") == 0,
+              queued())
+        ok, detail = shown_once(t, "during the long call")
+        check("long tool call: the PostToolUse after it shows the mail, once", ok, detail)
+
+    def long_gap():
+        # Mail arrives just after a tool call; the next one comes more than two minutes later (long thinking).
+        t = Thread("longgap")
+        t.start_turn()
+        t.hook("post-tool-use")
+        t.send("early in the gap")
+        time.sleep(LONG)
+        check("long gap: mail is still waiting for the hook, not queued", queued("early in the gap") == 0, queued())
+        ok, detail = shown_once(t, "early in the gap")
+        check("long gap: the next PostToolUse shows it, once", ok, detail)
+
+    def long_turn():
+        # A turn with many short tool calls, longer than any bound: every message arrives at the next tool call.
+        t = Thread("longturn")
+        t.start_turn()
+        started, sent, missed = time.monotonic(), 0, []
+        while time.monotonic() - started < LONG:
+            body = f"long turn message {sent}"
+            t.send(body)
+            sent += 1
+            time.sleep(10)
+            out = t.hook("post-tool-use")
+            if body not in out:
+                missed.append((body, out))
+            time.sleep(10)
+            t.hook("post-tool-use")
+        check(f"long turn: all {sent} messages arrived at the next PostToolUse", not missed, missed)
+        check("long turn: none queued", queued("long turn message") == 0, queued())
+
     try:
         run("init", "codex-test", "--as", "alex", "--no-setup")
-        hook("session-start")
-        hook("user-prompt-submit")
-        out = run("send", "proj-codex", "busy message")
-        # A later command round trip lets a successful queue command finish before the hook reads.
-        run("who")
-        out = hook("post-tool-use")
-        assert "busy message" in out and '"PostToolUse"' in out, f"busy hook lost the message: {out!r}; queue={queued()!r}"
-        assert "busy message" not in queued(), "busy mail must not also be queued as a follow-up"
-        assert hook("post-tool-use") == "", "busy mail must arrive once"
-        print("PASS: busy Codex gets mail through PostToolUse once, without a queued follow-up")
 
-        hook("stop")
-        out = run("send", "proj-codex", "idle message")
-        assert "queued into the Codex session" in out, out
-        deadline = time.monotonic() + 5
-        while "idle message" not in queued() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert "idle message" in queued(), "idle session must still wake via codex queue"
-        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                read_at = db.execute("SELECT read_at FROM messages WHERE body = ?", ("idle message",)).fetchone()[0]
-                if read_at is not None:
-                    break
-                time.sleep(0.02)
-            assert read_at is not None, "queue success must be acknowledged, not merely in flight"
-        assert hook("post-tool-use") == "", "queued mail must not also arrive through the hook"
-        print("PASS: idle Codex still wakes through codex queue, without duplicate hook delivery")
+        # FYI mail never wakes: it waits for check_inbox (or a pause).
+        fyi = Thread("fyi")
+        fyi.start_turn()
+        cx = subprocess.Popen([BIN, "mcp"], env=env, cwd=fyi.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True)
+        try:
+            def rpc(request):
+                cx.stdin.write(json.dumps(request) + "\n")
+                cx.stdin.flush()
+                if "id" not in request:
+                    return None
+                responses = queue.Queue()
 
-        cx = subprocess.Popen([BIN, "mcp"], env=env, cwd=proj, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        rpc(cx, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
-        rpc(cx, {"jsonrpc": "2.0", "method": "notifications/initialized"})
-        tools = rpc(cx, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
-        assert any(t["name"] == "check_inbox" for t in tools["result"]["tools"]), tools
-        out = run("send", "proj-codex", "--fyi", "polled FYI")
-        assert "queued as FYI" in out, out
-        assert hook("post-tool-use") == "", "FYI must not interrupt at PostToolUse"
-        response = rpc(cx, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "check_inbox", "arguments": {}, "_meta": {"sessionId": "busy-thread"}}})
-        assert "polled FYI" in json.dumps(response), response
-        assert "polled FYI" not in queued(), "FYI must not wake the session"
-        print("PASS: --fyi plus explicit check_inbox returns mail without a queue wake")
+                def receive():
+                    while line := cx.stdout.readline():
+                        response = json.loads(line)
+                        if response.get("id") == request["id"]:
+                            responses.put(response)
+                            return
 
-        # Both turns abort after a tool hook: neither emits Stop or another mail-consuming hook.
-        quiet_proj = os.path.join(d, "quiet")
-        os.makedirs(quiet_proj)
-        hook("session-start", session="quiet-thread", cwd=quiet_proj)
-        hook("user-prompt-submit", session="quiet-thread", cwd=quiet_proj)
-        assert hook("post-tool-use", session="quiet-thread", cwd=quiet_proj) == ""
-        hook("user-prompt-submit")
-        assert hook("post-tool-use") == ""
-        started = time.monotonic()
-        run("send", "proj-codex", "aborted turn pending message")
-        run("who")
-        assert "aborted turn pending message" not in queued(), "fresh busy mail must wait for a hook"
-        print("Waiting 125 seconds for unconsumed busy mail and quiet busy status to expire", flush=True)
-        time.sleep(max(0, started + 125 - time.monotonic()))
-        pending_queued = "aborted turn pending message" in queued()
+                threading.Thread(target=receive, daemon=True).start()
+                return responses.get(timeout=10)
 
-        # This mailbox had no pending mail during the entire stale-busy interval.
-        out = run("send", "quiet-codex", "quiet stale busy message")
-        deadline = time.monotonic() + 5
-        while "quiet stale busy message" not in queued() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        late_queued = "quiet stale busy message" in queued()
-        failures = []
-        if not pending_queued:
-            failures.append("unconsumed busy mail never fell back to codex queue after 125 seconds")
-        if not late_queued:
-            failures.append(f"mail after quiet stale busy status did not wake through codex queue: {out!r}")
-        assert not failures, "; ".join(failures)
-
-        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                unread = db.execute("SELECT COUNT(*) FROM messages WHERE body IN (?, ?) AND read_at IS NULL",
-                                    ("aborted turn pending message", "quiet stale busy message")).fetchone()[0]
-                if unread == 0:
-                    break
-                time.sleep(0.02)
-            assert unread == 0, "aborted-turn queue successes must be acknowledged"
-        assert hook("post-tool-use") == "", "fallback mail must not also arrive through the hook"
-        assert hook("post-tool-use", session="quiet-thread", cwd=quiet_proj) == "", "late mail must arrive once"
-        assert queued().count("aborted turn pending message") == 1, "pending fallback must queue once"
-        assert queued().count("quiet stale busy message") == 1, "quiet stale session must queue once"
-        print("PASS: aborted turn falls back after 120 seconds, including mail after quiet stale busy status")
-    finally:
-        if cx:
+            rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
+            rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            out = fyi.send("polled FYI", "--fyi")
+            check("fyi: queued as FYI", "queued as FYI" in out, out)
+            check("fyi: not shown at PostToolUse", fyi.hook("post-tool-use") == "")
+            response = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "check_inbox", "arguments": {}, "_meta": {"sessionId": f"thread-{fyi.name}"}}})
+            check("fyi: check_inbox returns it", "polled FYI" in json.dumps(response), response)
+            check("fyi: never queued", queued("polled FYI") == 0, queued())
+        finally:
             cx.kill()
             cx.wait()
+
+        scenarios = [busy, idle, ending, interrupted, interrupted_pending, failed, continued, no_rollout, long_call,
+                     long_gap, long_turn]
+        print(f"Running {len(scenarios)} scenarios at once; the long ones wait {LONG} seconds", flush=True)
+        threads = [threading.Thread(target=s) for s in scenarios]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        # A daemon restart while mail waits for a running turn: the next PostToolUse still shows it, once.
+        r = Thread("restart")
+        r.start_turn()
+        r.hook("post-tool-use")
+        r.send("across a restart")
         run("stop")
+        ok, detail = shown_once(r, "across a restart")
+        check("restart: mail waiting for a running turn reaches the next PostToolUse", ok, detail)
+        check("restart: …and is not queued", queued("across a restart") == 0, queued())
+    finally:
+        run("stop")
+
+    failed_count = results.count(False)
+    print(f"\n{len(results) - failed_count}/{len(results)} passed")
+    sys.exit(1 if failed_count else 0)
