@@ -137,6 +137,22 @@ fn write_json(path: &Path, v: &Value, dry: bool) -> Result<bool> {
     write_file(path, &(serde_json::to_string_pretty(v)? + "\n"), dry)
 }
 
+/// Writes `v`, or deletes the file when removing Reason Network left nothing else in it.
+fn write_or_drop(path: &Path, v: &Value, remove: bool, dry: bool, r: &mut Report) -> Result<()> {
+    if remove && hollow(v) {
+        if path.exists() {
+            if !dry {
+                std::fs::remove_file(path)?;
+            }
+            r.lines.push(format!("removed {}", crate::util::tilde(&path.display().to_string())));
+        }
+    } else {
+        let did = write_json(path, v, dry)?;
+        r.lines.push(changed(path, did));
+    }
+    Ok(())
+}
+
 /// Only empty objects and arrays.
 fn hollow(v: &Value) -> bool {
     match v {
@@ -445,17 +461,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         ("SessionEnd", group("session-end", false, 3)),
     ];
     merge_hook_groups(obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?, "grok", groups, remove);
-    if remove && hollow(&v) {
-        if hooks_path.exists() {
-            if !dry {
-                std::fs::remove_file(&hooks_path)?;
-            }
-            r.lines.push(format!("removed {}", crate::util::tilde(&hooks_path.display().to_string())));
-        }
-    } else {
-        let did = write_json(&hooks_path, &v, dry)?;
-        r.lines.push(changed(&hooks_path, did));
-    }
+    write_or_drop(&hooks_path, &v, remove, dry, &mut r)?;
     Ok(Some(r))
 }
 
@@ -585,15 +591,16 @@ fn agy(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     } else {
         servers.insert(
             AGENT_NAME.into(),
-            json!({ "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "agy" } }),
+            // check_inbox can wait up to 11 minutes.
+            json!({ "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "agy" }, "timeoutSeconds": 660 }),
         );
     }
-    r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
+    write_or_drop(&mcp_path, &v, remove, dry, &mut r)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut v = read_json(&hooks_path)?;
     agy_hooks(&mut v, exe, remove)?;
-    r.lines.push(changed(&hooks_path, write_json(&hooks_path, &v, dry)?));
+    write_or_drop(&hooks_path, &v, remove, dry, &mut r)?;
     Ok(Some(r))
 }
 

@@ -319,7 +319,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
-| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: waits for its human. |
+| Antigravity CLI | turn | `PreInvocation` (before every model call) and `SessionStart` inject a `systemMessage` step, mail headed by a note that it is not from the user or the system; `Stop` `decision:continue`, only when the turn finished (`NO_TOOL_CALL`). Its PostToolUse can't add context. Idle: waits for its human. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
