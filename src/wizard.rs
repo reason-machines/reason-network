@@ -192,7 +192,7 @@ pub async fn agents_and_preferences() -> Result<()> {
     let found = setup::detect(&exe);
     let chosen: Vec<&str> = if found.is_empty() {
         log::warning(format!(
-            "No coding agents found here (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason). Install one, then run `{CLI} setup`."
+            "No coding agents found here (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Antigravity CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason). Install one, then run `{CLI} setup`."
         ))?;
         Vec::new()
     } else {

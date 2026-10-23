@@ -1,4 +1,4 @@
-"""Hook flows for Cursor, Gemini, Copilot and opencode against one isolated daemon.
+"""Hook flows for Cursor, Gemini, Antigravity, Copilot and opencode against one isolated daemon.
 
     cargo build && python3 tests/e2e/hooks.py
 """
@@ -76,8 +76,23 @@ run("send", gem_name, "gemini: run the tests")
 out = hook("gemini", "stop", gem)
 check("gemini stop → decision block with the message", '"decision":"block"' in out and "run the tests" in out, out)
 
+# Antigravity: camelCase conversationId + workspacePaths, mail as an injected step, Stop only on a finished turn
+agy_dir = os.path.join(D, "agyproj")
+os.makedirs(agy_dir)
+agy = {"conversationId": "a-1", "workspacePaths": [agy_dir], "transcriptPath": os.path.join(D, "agy.jsonl")}
+out = hook("agy", "session-start", agy)
+check("agy start → injected intro naming the session", '"injectSteps"' in out and "agyproj-agy" in out, out)
+run("send", "agyproj-agy", "agy: check the build")
+out = hook("agy", "stop", dict(agy, terminationReason="USER_CANCELED"))
+check("agy stop after a cancel → nothing, the mail waits", out == "", out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("agy pre-invocation → the mail as a system message", '"systemMessage"' in out and "check the build" in out, out)
+run("send", "agyproj-agy", "agy: and the docs")
+out = hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+check("agy stop at the end of a turn → decision continue", '"decision":"continue"' in out and "and the docs" in out, out)
+
 # Copilot: camelCase sessionId
-cop = {"sessionId": "p-1", "cwd": proj, "timestamp": 1}
+cop ={"sessionId": "p-1", "cwd": proj, "timestamp": 1}
 out = hook("copilot", "session-start", cop)
 check("copilot start → additionalContext intro", '"additionalContext"' in out and "proj-copilot" in out, out)
 run("send", "proj-copilot", "copilot: hello")
