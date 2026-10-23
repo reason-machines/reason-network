@@ -80,7 +80,7 @@ impl Daemon {
         let team = self.team_state().ok_or_else(|| anyhow!("not in a team"))?;
         self.stop_net_now().await;
         let relay = team.meta.body.relay.as_deref();
-        let endpoint = net::bind(self.key.clone(), relay, self.cfg.lan(), self.cfg.port).await?;
+        let endpoint = net::bind(self.key.clone(), relay, self.cfg.lan(), self.cfg.port()).await?;
         // Last known presence of each machine, so `who --all` shows offline teammates after a restart.
         let mut remote = HashMap::new();
         {

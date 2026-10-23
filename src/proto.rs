@@ -418,6 +418,9 @@ pub struct UdpPort {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed: Option<u16>,
+    /// `fixed` couldn't be bound, so `port` is a random one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fell_back: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -520,7 +523,7 @@ mod tests {
             machines: vec![],
             features: vec![],
             messages: vec![DayCount { day: "2026-10-20".into(), sent: 3, received: 1 }],
-            udp: Some(UdpPort { port: 41641, fixed: Some(41641) }),
+            udp: Some(UdpPort { port: 41641, fixed: Some(41641), fell_back: false }),
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["team_id"], "00112233445566778899aabbccddeeff");

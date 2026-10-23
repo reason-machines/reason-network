@@ -120,6 +120,11 @@ impl Config {
         self.lan && crate::paths::env_var_os("NO_MDNS").is_none()
     }
 
+    /// The fixed UDP port, if one is set; `0` (any port) is the same as none.
+    pub fn port(&self) -> Option<u16> {
+        self.port.filter(|&p| p != 0)
+    }
+
     pub fn tray(&self) -> bool {
         cfg!(target_os = "macos") && self.tray && crate::paths::env_var_os("NO_TRAY").is_none()
     }
@@ -321,6 +326,9 @@ mod tests {
         let parsed: Config = toml::from_str("port = 41641\n").unwrap();
         assert_eq!(parsed.port, Some(41641));
         assert!(toml::to_string_pretty(&parsed).unwrap().contains("port = 41641"));
+        assert_eq!(parsed.port(), Some(41641));
+        let parsed: Config = toml::from_str("port = 0\n").unwrap();
+        assert_eq!(parsed.port(), None, "0: random, as unset");
         for bad in ["port = 70000", "port = -1", "port = \"41641\""] {
             assert!(toml::from_str::<Config>(bad).is_err(), "{bad}");
         }

@@ -13,7 +13,7 @@ use futures_lite::{StreamExt, stream::Boxed};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher,
     address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item},
-    endpoint::{BindOpts, Builder, ConnectError, ConnectWithOptsError, Connection, RecvStream, SendStream, presets},
+    endpoint::{Builder, ConnectError, ConnectWithOptsError, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -287,29 +287,41 @@ async fn endpoint(
         }
         Ok(b)
     };
-    let endpoint = match port {
-        // Taken (or refused): a random port, as without one, rather than no network.
-        Some(p) => match on_port(builder()?, p)?.bind().await {
-            Ok(e) => e,
-            Err(e) => {
-                log(&format!("couldn't bind UDP port {p} ({e:#}): using a random one"));
-                builder()?.bind().await?
+    let fixed = match port {
+        Some(p) => {
+            // IPv6 that works here at all gets the port too, else (taken, refused) a random port on both, as without
+            // one: neither no network nor no IPv6.
+            let v6 = ipv6_works();
+            if !v6 {
+                log(&format!("no IPv6 here: UDP port {p} on IPv4 only"));
             }
-        },
+            match on_port(builder()?, p, v6)?.bind().await {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    log(&format!("couldn't bind UDP port {p} ({e:#}): using a random one"));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let fell_back = port.is_some() && fixed.is_none();
+    let endpoint = match fixed {
+        Some(e) => e,
         None => builder()?.bind().await?,
     };
-    let udp = UdpPort { port: udp_port(&endpoint), fixed: port };
-    if port == Some(udp.port) && !endpoint.bound_sockets().iter().any(|a| a.is_ipv6()) {
-        log(&format!("UDP port {} on IPv4 only: IPv6 couldn't have it", udp.port));
-    }
-    Ok(Bound { endpoint, proxy, at, udp })
+    Ok(Bound { udp: UdpPort { port: udp_port(&endpoint), fixed: port, fell_back }, endpoint, proxy, at })
 }
 
-/// `b`, on UDP `port` on every address in place of a random port: IPv4, and IPv6 if it can (if IPv6 alone can't, the
-/// endpoint goes on without it).
-fn on_port(b: Builder, port: u16) -> Result<Builder> {
-    let v6 = BindOpts::default().set_is_required(false);
-    Ok(b.bind_addr((Ipv4Addr::UNSPECIFIED, port))?.bind_addr_with_opts((Ipv6Addr::UNSPECIFIED, port), v6)?)
+/// `b`, on UDP `port` on IPv4, and IPv6 if `v6`, in place of a random port.
+fn on_port(b: Builder, port: u16, v6: bool) -> Result<Builder> {
+    let b = b.bind_addr((Ipv4Addr::UNSPECIFIED, port))?;
+    Ok(if v6 { b.bind_addr((Ipv6Addr::UNSPECIFIED, port))? } else { b })
+}
+
+/// Whether this machine can open an IPv6 UDP socket at all.
+fn ipv6_works() -> bool {
+    std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).is_ok()
 }
 
 /// The UDP port `endpoint` is on: IPv4's, which it always binds.
@@ -1377,19 +1389,64 @@ mod tests {
         let relay = Some("https://relay.example.com");
         let free = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
         let b = bind(SecretKey::generate(), relay, false, Some(free)).await.unwrap();
-        assert_eq!(b.udp, UdpPort { port: free, fixed: Some(free) });
+        assert_eq!(b.udp, UdpPort { port: free, fixed: Some(free), fell_back: false });
         assert!(b.endpoint.bound_sockets().iter().all(|a| a.port() == free), "{:?}", b.endpoint.bound_sockets());
+        assert_eq!(b.endpoint.bound_sockets().iter().any(|a| a.is_ipv6()), ipv6_works());
         b.endpoint.close().await;
         // Something else holds it: the network still starts, on a random port, and says what it wanted.
         let taken = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = taken.local_addr().unwrap().port();
         let b = bind(SecretKey::generate(), relay, false, Some(port)).await.unwrap();
-        assert!(b.udp.port != port && b.udp.port != 0 && b.udp.fixed == Some(port), "{:?}", b.udp);
+        assert!(b.udp.port != port && b.udp.port != 0 && b.udp.fixed == Some(port) && b.udp.fell_back, "{:?}", b.udp);
         b.endpoint.close().await;
         // None set: random, as before.
         let b = bind(SecretKey::generate(), relay, false, None).await.unwrap();
-        assert!(b.udp.port != 0 && b.udp.fixed.is_none());
+        assert!(b.udp.port != 0 && b.udp.fixed.is_none() && !b.udp.fell_back);
         b.endpoint.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fixed_port_taken_on_ipv6_alone_falls_back_and_keeps_ipv6() {
+        let Some(taken) = v6_only_udp() else {
+            eprintln!("skipped: no IPv6 here");
+            return;
+        };
+        let port = taken.local_addr().unwrap().port();
+        // IPv4 has it free (else the case isn't the one under test).
+        drop(std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("IPv4 side free"));
+        let b = bind(SecretKey::generate(), Some("https://relay.example.com"), false, Some(port)).await.unwrap();
+        let socks = b.endpoint.bound_sockets();
+        assert!(b.udp.fell_back && b.udp.port != port && b.udp.fixed == Some(port), "{:?}", b.udp);
+        assert!(socks.iter().any(|a| a.is_ipv6()) && socks.iter().all(|a| a.port() != port), "{socks:?}");
+        b.endpoint.close().await;
+    }
+
+    /// A UDP socket on a random port of IPv6 alone (`IPV6_V6ONLY`), or None without IPv6.
+    #[cfg(unix)]
+    fn v6_only_udp() -> Option<std::net::UdpSocket> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a fresh socket, owned (and closed) by the UdpSocket made from it; the option and address are
+        // initialised values of the sizes passed.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return None;
+            }
+            let sock = std::net::UdpSocket::from_raw_fd(fd);
+            let on: libc::c_int = 1;
+            let len = std::mem::size_of_val(&on) as libc::socklen_t;
+            if libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (&raw const on).cast(), len) != 0 {
+                return None;
+            }
+            let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+            addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            let len = std::mem::size_of_val(&addr) as libc::socklen_t;
+            if libc::bind(fd, (&raw const addr).cast(), len) != 0 {
+                return None;
+            }
+            Some(sock)
+        }
     }
 
     #[test]
