@@ -357,9 +357,6 @@ pub struct Directory {
     pub machine: String,
     pub machines: Vec<MachineInfo>,
     pub sessions: Vec<SessionInfo>,
-    /// `Join the Reason Network: <team link>`, for agents to pass on.
-    #[serde(default)]
-    pub invite_line: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

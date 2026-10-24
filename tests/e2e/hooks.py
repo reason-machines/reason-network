@@ -2,7 +2,7 @@
 
     cargo build && python3 tests/e2e/hooks.py
 """
-import json, os, socket, subprocess, tempfile, threading, time
+import base64, json, os, re, socket, subprocess, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
@@ -238,11 +238,44 @@ cx_dir = os.path.join(D, "cancel-proj")
 os.makedirs(cx_dir)
 cx = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cx_dir, text=True)
 rpc(cx, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
-reply(cx, 1)
+initialized = json.dumps(reply(cx, 1))
 rpc(cx, {"jsonrpc": "2.0", "method": "notifications/initialized"})
 cmeta = {"sessionId": "cancel-1", "threadId": "cancel-1"}
+
+# The team link is a standing way into the team: what agents read never carries it, and they point their user to it.
+link = run("link")
+ticket = re.search(r"#(rn1-[A-Za-z0-9_-]+)", link).group(1)
+secret = base64.urlsafe_b64decode(ticket[4:] + "=" * (-len(ticket[4:]) % 4))[16:32].hex()
+check("link still prints the invite line", "Join the Reason Network: https://reasonmachines.com/network/join/#rn1-" in link, link)
+invite = re.search(r"Join the Reason Network: \S+", link).group(0)
+# A first prompt that is the pasted invite line: the session's title, or its task, is made from it.
+pasted = os.path.join(D, "pasted-transcript.jsonl")
+with open(pasted, "w") as f:
+    f.write(json.dumps({"type": "ai-title", "aiTitle": invite}) + "\n")
+pasted_cur = {"conversation_id": "c-pasted", "workspace_roots": [proj], "hook_event_name": "sessionStart"}
+hook("cursor", "session-start", pasted_cur)
+hook("cursor", "post-tool-use", dict(pasted_cur, transcript_path=pasted))
+run("hook", "opencode", "status", "--session", "o-pasted", "--state", "busy", cwd=oc)
+run("hook", "opencode", "doing", "--session", "o-pasted", "--doing", f"{invite} and fix CI", cwd=oc)
 rpc(cx, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": cmeta}})
-reply(cx, 2)
+listing = json.dumps(reply(cx, 2))
+check("a session titled with a pasted invite line shows it without the link",
+      "doing: Join the Reason Network: (team link)" in listing and "doing: Join the Reason Network: (team link) and fix CI" in listing, listing)
+agent_env = dict(env, AI_AGENT="1")
+seen = {
+    "list_team": listing,
+    "team --json in an agent's shell": subprocess.run([BIN, "team", "--json"], env=agent_env, capture_output=True, text=True, timeout=30).stdout,
+    "who in an agent's shell": subprocess.run([BIN, "who"], env=agent_env, capture_output=True, text=True, timeout=30).stdout,
+    "who --json in an agent's shell": subprocess.run([BIN, "who", "--json"], env=agent_env, capture_output=True, text=True, timeout=30).stdout,
+    "who in a person's terminal": run("who"),
+    "a session-start hook": hook("codex", "session-start", {"session_id": "link-1", "cwd": proj, "hook_event_name": "SessionStart"}),
+}
+rpc(cx, {"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+seen["the tools' descriptions"] = json.dumps(reply(cx, 9))
+seen["the MCP instructions"] = initialized
+for what, out in seen.items():
+    check(f"{what}: no team link, nor its secret", "rn1-" not in out and "tincan1" not in out and secret not in out, out)
+check("list_team says who invites people", "your user runs `reason-network invite` on one of their computers" in listing, listing)
 rpc(cx, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "check_inbox", "arguments": {"wait_secs": 60}, "_meta": cmeta}})
 time.sleep(1.5)
 rpc(cx, {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3, "reason": "user pressed Esc"}})

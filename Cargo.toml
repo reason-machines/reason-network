@@ -1,6 +1,6 @@
 [package]
 name = "reason-network"
-version = "0.12.11"
+version = "0.12.12"
 edition = "2024"
 description = "Reason Network: the team directory and message bus behind reason network, for coding agents across machines"
 license = "MIT OR Apache-2.0"

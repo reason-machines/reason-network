@@ -40,7 +40,7 @@ pub fn of(s: &Source) -> Option<String> {
         (None, Some(k)) => k,
         (None, None) => return None,
     };
-    Some(clip(&line))
+    Some(clip(&crate::team::without_tickets(&line)))
 }
 
 fn clip(s: &str) -> String {
@@ -261,6 +261,21 @@ mod tests {
         let g = dir.join("chat.json");
         std::fs::write(&g, r#"{"messages":[{"toolCalls":[{"name":"write_todos","args":{"todos":[{"description":"Fix login","status":"in_progress"}]}}]}]}"#).unwrap();
         assert_eq!(scan(&g).task, Some(Some("Fix login".into())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_title_or_task_made_from_a_pasted_invite_line_leaves_the_link_out() {
+        let dir = std::env::temp_dir().join(format!("reason-network-doing-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        let ticket = format!("rn1-{}", "AbCd_-09".repeat(12));
+        let title = format!("Join the Reason Network: https://reasonmachines.com/network/join/#{ticket}");
+        let line = |v: Value| format!("{v}\n");
+        let todo = serde_json::json!({"todos": [{"content": format!("join {ticket}"), "status": "in_progress"}]});
+        std::fs::write(&p, line(serde_json::json!({"type": "ai-title", "aiTitle": title})) + &line(todo)).unwrap();
+        let s = Source { agent: "cursor".into(), session: None, transcript: Some(p) };
+        assert_eq!(of(&s).as_deref(), Some("Join the Reason Network: (team link) · join (team link)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

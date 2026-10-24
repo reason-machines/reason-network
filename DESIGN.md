@@ -159,7 +159,8 @@ That is the "HTTPS and local network, MagicDNS style" requirement with one stack
   all machines converge on the same roster.
 - *members*: each machine's latest entry (person, machine name, active or removed), last writer wins.
 - *invites*: `hash(secret)`, expiry, optional "for this person's own machine", and who used it.
-- *meta*: team name and optional relay.
+- *meta*: team name and optional relay. The name is kept whole, but shown (and carried in links) cut to 60
+  characters.
 
 Any member may invite and remove. No machine can admit itself; it can sign its own departure. Invites die with
 the machine that made them and are single use. Entries stamped more than a day ahead are refused. A removed
@@ -178,7 +179,9 @@ sign in with Reason, and their computer joins with a sign-in proof (see below). 
 without signing in. A code can't show the joiner which team answers it (whoever listens on
 the code's key knows the code, so could make up a team), so a sign-in never joins with one: only with a link, which
 names the team. Links are `rn1-…` (older builds wrote `tincan1…`, with the same payload; both are read). After `init`
-and `join` the CLI prints the invite line, `Join the Reason Network: <team link>`, and agents get it from `list_team`.
+and `join` the CLI prints the invite line, `Join the Reason Network: <team link>`, and `link` (or `invite`) shows it
+again. Agents never get it from `list_team`, `who` or `team --json`: a reusable way in has no place in an agent's
+context, which ends up in its provider's logs; `list_team` tells them their user runs `reason-network invite`.
 
 **Sign-in proofs.** Signed in with Reason, a machine carries a proof: a compact JWS from Reason's cloud-access
 issuer (`iss` `https://reasonmachines.com/network`), RS256 only, saying this endpoint id belongs to account `sub`,
@@ -213,7 +216,9 @@ protected on that machine only.
 **Messages.** `Envelope{id: ulid, from, to, reply_to, thread, body, sent_at}` sent directly to each target
 machine on ALPN `tincan/1`, length-prefixed JSON frames. The receiver persists, then acks with
 `stored | delivered | held | refused`; later receipts (`delivered`, `read`) flow back. The sender keeps an
-outbox and retries when the target machine comes back. Mail for an offline session waits in the target
+outbox and retries when the target machine comes back. A message's text is at most 64 KB; the receiver holds a
+teammate's message to that as well (and its files to theirs, below): one past it is refused, not retried, and none of it
+is kept. Mail for an offline session waits in the target
 machine's mailbox under the session name, for a day: a session gone longer is forgotten, with the mail it never
 read (not the person's own `listen` mailboxes, such as `terminal`, nor mail held for them; and nothing in the
 hours after the daemon starts, while live sessions register again). Until then the mail waits for that session, and the
@@ -371,7 +376,9 @@ session's title (Claude Code's `ai-title` transcript entries, Codex's thread nam
 (Claude Code's `~/.claude/tasks/<session>/`, TodoWrite, Codex's `update_plan`, Gemini's `write_todos`,
 Cursor's `todo_write`, opencode 1.x's todos). Transcripts come from hooks (`transcript_path`) or, for Claude Code,
 from its session id; only what was appended since the last look is read. A Claude Code session renamed with
-`/rename` keeps that name on Reason Network.
+`/rename` keeps that name on Reason Network. A team link in a title or task (a first prompt that was a pasted invite
+line) is taken out before it is kept or shared, and shows as `(team link)`; one from a teammate on an earlier build is
+taken out when it arrives.
 
 Incoming messages are framed as peer input, never as the user:
 

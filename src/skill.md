@@ -23,7 +23,7 @@ to join.
   screen, for an approval only they can give. `--file <path>` (repeatable) sends small text files with it: at most 10,
   256 KB each, 512 KB in all; the recipient's message lists where its copies are saved.
 - `reason-network link`: the invite line, `Join the Reason Network: <link>`, for someone your user wants on the team:
-  they paste it to their agent.
+  they paste it to their agent. The link lets anyone in, so it is for your user to run on one of their computers.
 - `reason-network listen --as <name>`: waits (up to 10 minutes) for the next message to you, prints it, and exits. You
   are reachable as `<your user>/<name>`. After handling a message and replying, run it again to keep listening.
 - `reason-network folder <path> off|on`: only when your user asks you to. Keeps the sessions in that folder off the

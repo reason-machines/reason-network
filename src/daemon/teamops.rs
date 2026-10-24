@@ -360,8 +360,8 @@ impl Daemon {
         }
         let info = TeamInfo {
             id: state.id.clone(),
-            name: state.shown_name(),
-            team_name: state.shown_name(),
+            name: state.whole_name(),
+            team_name: state.whole_name(),
             relay: state.meta.body.relay.clone(),
             relay_connected: None,
             person: person.clone(),
@@ -487,14 +487,7 @@ impl Daemon {
         }
         let secret = state.link_secret().expect("just made").to_string();
         let ticket = self.ticket(&state, secret).encode();
-        Ok(LinkInfo { team: state.shown_name(), url: crate::join_url(&ticket), ticket })
-    }
-
-    /// The team link as it is now, without making one (for `list_team`).
-    pub(super) fn current_link(&self) -> Option<String> {
-        let state = self.team_state()?;
-        let secret = state.link_secret()?.to_string();
-        Some(crate::join_url(&self.ticket(&state, secret).encode()))
+        Ok(LinkInfo { team: state.whole_name(), url: crate::join_url(&ticket), ticket })
     }
 
     pub(super) fn team_info(&self) -> Result<TeamInfo> {
@@ -503,8 +496,8 @@ impl Daemon {
             .ok_or_else(|| anyhow!("not in a team yet: `{CLI} init <team>` or `{CLI} join <invite>`"))?;
         Ok(TeamInfo {
             id: team.id.clone(),
-            name: team.shown_name(),
-            team_name: team.shown_name(),
+            name: team.whole_name(),
+            team_name: team.whole_name(),
             relay: team.meta.body.relay.clone(),
             relay_connected: self.net().map(|n| n.relay_connected()),
             person: self.person.clone(),

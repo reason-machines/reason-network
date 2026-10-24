@@ -1448,7 +1448,7 @@ pub async fn doctor() -> Result<()> {
         Ok(t) => {
             let online = t.machines.iter().filter(|m| !m.is_me && m.online).count();
             let others = t.machines.len().saturating_sub(1);
-            let team = crate::shown(&t.name);
+            let team = crate::shown(&crate::team::shown_name(&t.name));
             println!("✓ daemon running; team {team} with {others} other machine(s), {online} connected");
             print!("{}", crate::shown(&render::team(&t)).lines().skip(1).map(|l| format!("{l}\n")).collect::<String>());
             if let Some(u) = &t.udp {

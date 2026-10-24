@@ -268,7 +268,7 @@ impl Daemon {
         }
         let live = g.live.get_mut(key).ok_or_else(|| anyhow!("this session is not registered"))?;
         if let Some(d) = doing {
-            let d = d.trim();
+            let d = crate::team::without_tickets(d.trim());
             live.doing = (!d.is_empty()).then(|| d.chars().take(200).collect());
         }
         if let Some(n) = new_name
@@ -378,7 +378,8 @@ impl Daemon {
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
             if let Some(d) = doing {
-                l.doing = Some(d.trim().chars().take(200).collect::<String>()).filter(|d| !d.is_empty());
+                let d = crate::team::without_tickets(d.trim());
+                l.doing = Some(d.chars().take(200).collect::<String>()).filter(|d| !d.is_empty());
             }
             return Ok(HookReply::default());
         }
@@ -729,6 +730,65 @@ mod tests {
         // Resumed hours later, the conversation is still api-claude, with its mail.
         let a = join(&d, claude("a"));
         assert_eq!((a.name.as_str(), a.unread), ("api-claude", 1));
+    }
+
+    #[tokio::test]
+    async fn a_pasted_invite_line_never_reaches_teammates_through_what_a_session_is_doing() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let mut team = crate::team::TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.new_link(&d.key);
+        let secret = team.link_secret().expect("a team link").to_string();
+        d.inner.lock().unwrap().team = Some(team);
+        let l = d.link(false).await.unwrap();
+        let line = crate::invite_line(&l.url);
+        // `status <doing>` from an agent's shell; a `doing` hook; a session kept by a build that stored the line.
+        join(&d, claude("a"));
+        d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
+        join(&d, claude("b"));
+        let doing = HookCall {
+            agent: "claude-code".into(),
+            event: "doing".into(),
+            session_id: "b".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: Some(line.clone()),
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        d.hook(doing).await.unwrap();
+        let old = Remembered {
+            name: "old".into(),
+            key: "claude-code:old".into(),
+            agent: "claude-code".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: Some(line.clone()),
+            tier: Tier::Push,
+            last_seen: util::now_ms() - 60_000,
+            attached: true,
+            mailbox: false,
+        };
+        d.inner.lock().unwrap().store.upsert_session(&old, &d.person).unwrap();
+
+        let dir = d.who(None, None, true).await.unwrap();
+        let presence = serde_json::to_string(&d.presence().await).unwrap();
+        let stored = format!("{:?}", d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap());
+        let agent = crate::render::directory_for_agent(&dir);
+        for out in [&serde_json::to_string(&dir).unwrap(), &agent, &presence, &stored] {
+            assert!(!out.contains("rn1-") && !out.contains(&l.ticket) && !out.contains(&secret), "{out}");
+        }
+        let doings: Vec<_> = dir.sessions.iter().filter_map(|s| s.doing.as_deref()).collect();
+        assert_eq!(
+            doings.iter().filter(|d| d.starts_with("Join the Reason Network: (team link)")).count(),
+            3,
+            "{doings:?}"
+        );
+        assert!(agent.contains("doing: Join the Reason Network: (team link) then fix CI"), "{agent}");
     }
 
     #[tokio::test]

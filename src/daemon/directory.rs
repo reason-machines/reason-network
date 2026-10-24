@@ -282,7 +282,8 @@ impl Daemon {
                 let mut row = self.row(&r.name, &r.agent, &r.cwd, Some(&git));
                 row.status = "offline".into();
                 row.since = Some(r.last_seen);
-                row.doing = r.doing.clone();
+                // Kept by a build that left team links in.
+                row.doing = r.doing.as_deref().map(crate::team::without_tickets);
                 row.tier = r.tier;
                 row.unread = g.store.unread_count(&row.address)?;
                 rows.push(row);
@@ -335,7 +336,6 @@ impl Daemon {
             machine: self.machine.clone(),
             machines,
             sessions: rows,
-            invite_line: self.current_link().map(|l| crate::invite_line(&l)),
         })
     }
 
@@ -580,6 +580,48 @@ mod tests {
         let mut live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
         live.sort();
         assert_eq!(live, ["claude-code:inner", "claude-code:outer"]);
+    }
+
+    #[tokio::test]
+    async fn the_directory_never_carries_the_team_link() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let mut team = crate::team::TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.new_link(&d.key);
+        let secret = team.link_secret().expect("a team link").to_string();
+        d.inner.lock().unwrap().team = Some(team);
+        let ticket = d.link(false).await.unwrap().ticket;
+        let dir = d.who(None, None, false).await.unwrap();
+        // `list_team`; `who --json` (an agent's shell, and the Reason CLI's relay for hosted assistants); `who`.
+        let json = serde_json::to_string(&dir).unwrap();
+        let agent = crate::render::directory_for_agent(&dir);
+        let person = crate::render::directory(&dir, false, crate::render::Paint::PLAIN);
+        for out in [&json, &agent, &person] {
+            assert!(!out.contains("rn1-") && !out.contains(&ticket) && !out.contains(&secret), "{out}");
+        }
+        assert!(agent.contains("your user runs `reason-network invite`"), "{agent}");
+    }
+
+    #[tokio::test]
+    async fn a_long_team_name_is_shown_cut_and_given_whole_to_the_reason_cli() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let long = format!("acme {}", "y".repeat(200));
+        let mut team = crate::team::TeamState::found(&long, &d.person, &d.machine, &d.key);
+        team.new_link(&d.key);
+        d.inner.lock().unwrap().team = Some(team);
+        let dir = d.who(None, None, false).await.unwrap();
+        let shown = dir.team.clone().unwrap();
+        assert!(shown.chars().count() == 60 && shown.starts_with("acme yyy") && shown.ends_with('…'), "{shown}");
+        let agent = crate::render::directory_for_agent(&dir);
+        let t = d.team_info().unwrap();
+        let person = crate::render::team(&t);
+        for out in [&agent, &person] {
+            assert!(out.contains(&shown) && !out.contains(&"y".repeat(60)), "{out}");
+        }
+        // The Reason CLI compares the name with the ones it kept: it gets it whole, as before.
+        assert_eq!((t.name.as_str(), t.team_name.as_str()), (long.as_str(), long.as_str()));
+        assert_eq!(d.link(false).await.unwrap().team, long);
     }
 
     #[test]

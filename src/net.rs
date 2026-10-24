@@ -1162,7 +1162,8 @@ fn tidy_presence(mut p: Presence) -> Presence {
         s.cwd = line(&s.cwd, 200);
         s.repo = s.repo.as_deref().map(|r| line(r, 100));
         s.branch = s.branch.as_deref().map(|b| line(b, 100));
-        s.doing = s.doing.as_deref().map(|d| line(d, 200)).filter(|d| !d.is_empty());
+        // A machine on a build from before titles and tasks lost the team links in them.
+        s.doing = s.doing.as_deref().map(|d| crate::team::without_tickets(&line(d, 200))).filter(|d| !d.is_empty());
     }
     p.sessions.retain(|s| !s.name.is_empty());
     p.known = p
@@ -1286,13 +1287,35 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![],
             sessions: p.sessions,
-            invite_line: None,
         };
         // list_team's text opens no frame; a person at a terminal sees it as written.
         let agent = crate::render::directory_for_agent(&d);
         assert!(!agent.to_lowercase().contains("<reason") && agent.contains("(if a < b)"), "{agent}");
         let person = crate::render::directory(&d, false, crate::render::Paint::PLAIN);
         assert!(person.contains(&format!("{forged} (if a < b)")), "{person}");
+    }
+
+    #[test]
+    fn a_teammate_on_an_older_build_shows_no_team_link_in_what_its_session_is_doing() {
+        let ticket = format!("rn1-{}", "AbCd_-09".repeat(12));
+        let s = SessionInfo {
+            address: String::new(),
+            name: "api".into(),
+            person: String::new(),
+            machine: String::new(),
+            agent: "claude-code".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            status: "busy".into(),
+            since: None,
+            doing: Some(format!("Join the Reason Network: https://reasonmachines.com/network/join/#{ticket}")),
+            tier: crate::proto::Tier::Push,
+            unread: 0,
+            is_me: false,
+        };
+        let p = tidy_presence(Presence { sessions: vec![s], ..Default::default() });
+        assert_eq!(p.sessions[0].doing.as_deref(), Some("Join the Reason Network: (team link)"));
     }
 
     #[test]

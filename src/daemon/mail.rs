@@ -23,6 +23,7 @@ use std::{
 };
 use ulid::Ulid;
 
+/// The most text a message carries, in bytes. A teammate's machine is held to it too (see [`clean`]).
 const MAX_BODY: usize = 64 * 1024;
 /// Messages per minute accepted from one teammate's machine; more are deferred, not dropped.
 const RATE_LIMIT: usize = 60;
@@ -126,14 +127,7 @@ impl Daemon {
         if notify && is_group(to) {
             bail!("notify is for one session or one person, not a group");
         }
-        if body.len() > MAX_BODY {
-            // A path means nothing on the recipient's computer.
-            bail!(
-                "message is {} KB; the limit is {} KB (send a small text file with `files`, or a link)",
-                body.len().div_ceil(1024),
-                MAX_BODY / 1024
-            );
-        }
+        fits(body)?;
         let files = files::check(files)?;
         let now = util::now_ms();
         let net = self.net();
@@ -784,6 +778,19 @@ pub(super) fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId
     size <= 2000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
 }
 
+/// A message's text within [`MAX_BODY`].
+fn fits(body: &str) -> Result<()> {
+    if body.len() > MAX_BODY {
+        // A path means nothing on the recipient's computer.
+        bail!(
+            "message is {} KB; the limit is {} KB (send a small text file with `files`, or a link)",
+            body.len().div_ceil(1024),
+            MAX_BODY / 1024
+        );
+    }
+    Ok(())
+}
+
 /// Validates a message from a peer and strips its metadata down to safe characters.
 fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
@@ -794,6 +801,8 @@ fn clean(m: Message) -> Result<Message> {
     if !canonical || !ok(&m.from, "-/") || !ok(&m.to, "-/") {
         bail!("malformed message");
     }
+    // Held to what its sender's machine checks (as are its files, below): past that, it is refused and nothing kept.
+    fits(&m.body)?;
     Ok(Message {
         from_agent: m.from_agent.as_deref().and_then(|s| tidy(s, "-", 30)),
         from_repo: m.from_repo.as_deref().and_then(|s| tidy(s, "-_./", 100)),
@@ -1207,5 +1216,81 @@ mod tests {
         }
         let wire = serde_json::to_string(&msg("port = 1")).unwrap();
         assert_eq!(serde_json::from_str::<Older>(&wire).unwrap().body, "the config");
+    }
+
+    /// A daemon for alex, with bob's machine on the team and a session here. Returns it, bob's key and the session.
+    fn with_teammate() -> (Arc<Daemon>, SecretKey, String) {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        (d, bob, to)
+    }
+
+    fn from_bob(to: &str, body: String, files: Vec<Attachment>) -> Message {
+        Message {
+            id: Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: to.into(),
+            via: None,
+            reply_to: None,
+            body,
+            wake: false,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files,
+        }
+    }
+
+    /// Takes `msg` from bob's machine: its error, if refused, after checking nothing of it was kept.
+    fn refused(d: &Arc<Daemon>, bob: &SecretKey, to: &str, msg: Message) -> String {
+        let id = msg.id.clone();
+        let e = d.receive(bob.public(), msg).expect_err("refused").to_string();
+        let g = d.inner.lock().unwrap();
+        assert!(!g.store.has(&id).unwrap() && g.store.unread(to).unwrap().is_empty(), "kept: {e}");
+        e
+    }
+
+    #[test]
+    fn a_teammates_message_is_held_to_the_size_limit_it_was_sent_under() {
+        let (d, bob, to) = with_teammate();
+        // Past the limit (an engine changed to skip its own check): refused, and none of it kept or shown.
+        let e = refused(&d, &bob, &to, from_bob(&to, "x".repeat(MAX_BODY + 1), Vec::new()));
+        assert_eq!(e, "message is 65 KB; the limit is 64 KB (send a small text file with `files`, or a link)");
+        let e = refused(&d, &bob, &to, from_bob(&to, "x".repeat(4 << 20), Vec::new()));
+        assert!(e.starts_with("message is 4096 KB; the limit is 64 KB"), "{e}");
+        // At the limit, as an honest engine may send it: taken as before.
+        let (state, _) = d.receive(bob.public(), from_bob(&to, "x".repeat(MAX_BODY), Vec::new())).unwrap();
+        assert_eq!(state, "queued");
+        let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!(got.iter().map(|m| m.body.len()).collect::<Vec<_>>(), [MAX_BODY]);
+    }
+
+    #[test]
+    fn a_teammates_files_are_held_to_the_limits_they_were_sent_under() {
+        use files::{MAX_FILE, MAX_FILES, MAX_TOTAL};
+        let (d, bob, to) = with_teammate();
+        let file =
+            |i: usize, bytes: usize| Attachment { name: format!("{i}.txt"), content: "x".repeat(bytes), path: None };
+        let msg = |files: Vec<Attachment>| from_bob(&to, "the logs".into(), files);
+        let e = refused(&d, &bob, &to, msg((0..=MAX_FILES).map(|i| file(i, 1)).collect()));
+        assert_eq!(e, format!("{} files; a message carries at most {MAX_FILES}", MAX_FILES + 1));
+        let e = refused(&d, &bob, &to, msg(vec![file(0, MAX_FILE + 1)]));
+        assert!(e.starts_with("0.txt is 257 KB; a file can be at most 256 KB"), "{e}");
+        let e = refused(&d, &bob, &to, msg(vec![file(0, MAX_FILE), file(1, MAX_FILE), file(2, 1)]));
+        assert!(e.starts_with("the files come to more than 512 KB"), "{e}");
+        // The most an honest engine sends in one message: the most text, the most files, as many bytes as files carry.
+        let mut most: Vec<Attachment> = (0..MAX_FILES - 2).map(|i| file(i, 0)).collect();
+        most.extend([file(8, MAX_FILE), file(9, MAX_TOTAL - MAX_FILE)]);
+        let (state, _) = d.receive(bob.public(), from_bob(&to, "x".repeat(MAX_BODY), most)).unwrap();
+        assert_eq!(state, "queued");
+        let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!((got.len(), got[0].body.len(), got[0].files.len()), (1, MAX_BODY, MAX_FILES));
     }
 }

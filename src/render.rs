@@ -111,8 +111,10 @@ pub fn directory(d: &Directory, agent: bool, paint: Paint) -> String {
     if !quiet.is_empty() {
         let _ = writeln!(out, "no sessions: {}", quiet.join(", "));
     }
-    if agent && let Some(line) = &d.invite_line {
-        let _ = writeln!(out, "Invite people with this line: {line}");
+    // Never the team link itself: it is a standing way into the team, and an agent's context ends up in its provider's
+    // logs.
+    if agent && d.team.is_some() {
+        let _ = writeln!(out, "To invite people, your user runs `{} invite` on one of their computers.", crate::CLI);
     }
     if !d.sessions.is_empty() {
         if agent {
@@ -216,7 +218,7 @@ pub fn team(t: &TeamInfo) -> String {
     let now = util::now_ms();
     let mut out = String::new();
     let relay = t.relay.clone().unwrap_or_else(default_relays);
-    let _ = writeln!(out, "team {} · relay: {relay}", t.name);
+    let _ = writeln!(out, "team {} · relay: {relay}", crate::team::shown_name(&t.name));
     let pw = t.machines.iter().map(|m| person(m).chars().count()).max().unwrap_or(0);
     let mw = t.machines.iter().map(|m| m.machine.chars().count()).max().unwrap_or(0);
     for m in &t.machines {
@@ -497,7 +499,6 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![machine],
             sessions: vec![session],
-            invite_line: None,
         }
     }
 
@@ -518,6 +519,17 @@ mod tests {
         assert!(agent.starts_with("team vibes · you are alex on mbp\nbob · box · direct 4ms\n"), "{agent}");
         assert!(agent.contains("  web  claude-code  busy  acme/api@fix<b>  push\n"), "{agent}");
         assert!(agent.contains("doing: compare a<b, then <div>\n"), "{agent}");
+    }
+
+    #[test]
+    fn agents_are_told_who_invites_people() {
+        let mut d = bobs("vibes", "bob", "acme/api", "main", "x");
+        let pointer = "To invite people, your user runs `reason-network invite` on one of their computers.\n";
+        assert!(directory_for_agent(&d).contains(pointer), "{}", directory_for_agent(&d));
+        assert!(!directory(&d, false, Paint::PLAIN).contains("invite"));
+        // With no team yet, there is no one to invite to.
+        d.team = None;
+        assert!(!directory_for_agent(&d).contains("invite"));
     }
 
     #[test]

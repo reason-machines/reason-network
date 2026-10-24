@@ -497,12 +497,12 @@ async fn cli(cmd: Cmd) -> Result<()> {
         Cmd::Link { new, json } => {
             let l: LinkInfo = link.call(Request::Link { new }).await?;
             if json {
-                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None).await?)?));
+                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None, true).await?)?));
                 return Ok(());
             }
             let line = invite_line(&l.url);
             let copied = wizard::interactive() && wizard::copy(&line);
-            let team = shown(&l.team);
+            let team = shown(&team::shown_name(&l.team));
             println!("Team link for {team}{}:\n\n{line}\n", if copied { " (on your clipboard)" } else { "" });
             println!("Whoever pastes this line to their coding agent joins the team. `{CLI} link --new` replaces it.");
         }
@@ -519,10 +519,11 @@ async fn cli(cmd: Cmd) -> Result<()> {
             wait_exit(daemon_pid()).await;
             if json {
                 let agents = if no_setup { None } else { Some(setup::quietly().await?) };
-                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&Link::new(None), agents).await?)?));
+                let j = team_json(&Link::new(None), agents, true).await?;
+                println!("{}", shown(&serde_json::to_string_pretty(&j)?));
                 return Ok(());
             }
-            println!("Created team {}. You are {} on {}.", t.name, t.person, t.machine);
+            println!("Created team {}. You are {} on {}.", team::shown_name(&t.name), t.person, t.machine);
             if !no_setup {
                 println!();
                 setup::run(false, false, false).await?;
@@ -537,7 +538,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             wait_exit(daemon_pid()).await;
             let agents = if no_setup || !json { None } else { Some(setup::quietly().await?) };
             if !json {
-                println!("Joined team {} as {} on {}.", shown(&t.name), t.person, t.machine);
+                println!("Joined team {} as {} on {}.", shown(&team::shown_name(&t.name)), t.person, t.machine);
             }
             if !no_setup && !json {
                 println!();
@@ -554,7 +555,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 }
             }
             if json {
-                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&fresh, agents).await?)?));
+                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&fresh, agents, true).await?)?));
                 return Ok(());
             }
             if let Ok(t) = fresh.call::<TeamInfo>(Request::Team).await {
@@ -613,7 +614,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Team { json: true } => {
-            println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None).await?)?))
+            println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None, false).await?)?))
         }
         Cmd::Team { json: false } => {
             let t: TeamInfo = link.call(Request::Team).await?;
@@ -697,14 +698,19 @@ async fn cli(cmd: Cmd) -> Result<()> {
     Ok(())
 }
 
-/// The team as `--json` gives it, for the Reason CLI: `set_up_for` names the agents set up, when setup ran.
-async fn team_json(link: &std::sync::Arc<Link>, set_up_for: Option<Vec<&str>>) -> Result<serde_json::Value> {
+/// The team as `--json` gives it: `set_up_for` names the agents set up, when setup ran. `with_link`: with the team link
+/// and invite line, for `init`, `join` and `link`; never for `team`, which agents run to see the team.
+async fn team_json(
+    link: &std::sync::Arc<Link>,
+    set_up_for: Option<Vec<&str>>,
+    with_link: bool,
+) -> Result<serde_json::Value> {
     let t: TeamInfo = link.call(Request::Team).await?;
-    let l: LinkInfo = link.call(Request::Link { new: false }).await?;
-    team_value(&t, &l, set_up_for)
+    let l: Option<LinkInfo> = if with_link { Some(link.call(Request::Link { new: false }).await?) } else { None };
+    team_value(&t, l.as_ref(), set_up_for)
 }
 
-fn team_value(t: &TeamInfo, l: &LinkInfo, set_up_for: Option<Vec<&str>>) -> Result<serde_json::Value> {
+fn team_value(t: &TeamInfo, l: Option<&LinkInfo>, set_up_for: Option<Vec<&str>>) -> Result<serde_json::Value> {
     // A daemon from before team ids were in its reply (it was running when this binary was updated).
     if t.id.is_empty() {
         bail!(
@@ -722,9 +728,13 @@ fn team_value(t: &TeamInfo, l: &LinkInfo, set_up_for: Option<Vec<&str>>) -> Resu
         })
         .collect();
     let mut out = serde_json::json!({
-        "team_id": t.id, "team_name": t.name, "link": l.url, "invite_line": invite_line(&l.url),
+        "team_id": t.id, "team_name": team::shown_name(&t.name),
         "person": t.person, "machine": t.machine, "endpoint": endpoint, "members": members,
     });
+    if let Some(l) = l {
+        out["link"] = serde_json::json!(l.url);
+        out["invite_line"] = serde_json::json!(invite_line(&l.url));
+    }
     if let Some(agents) = set_up_for {
         out["set_up_for"] = serde_json::json!(agents);
     }
@@ -920,9 +930,9 @@ mod tests {
             udp: None,
         };
         let l = LinkInfo { team: "vibes".into(), url: join_url("rn1-AAAA"), ticket: "rn1-AAAA".into() };
-        assert!(team_value(&t, &l, None).unwrap_err().to_string().contains("restart the Reason Network daemon"));
+        assert!(team_value(&t, Some(&l), None).unwrap_err().to_string().contains("restart the Reason Network daemon"));
         t.id = "00112233445566778899aabbccddeeff".into();
-        let v = team_value(&t, &l, Some(vec!["Claude Code"])).unwrap();
+        let v = team_value(&t, Some(&l), Some(vec!["Claude Code"])).unwrap();
         assert_eq!(
             (v["team_id"].as_str(), v["team_name"].as_str()),
             (Some("00112233445566778899aabbccddeeff"), Some("vibes"))
@@ -933,5 +943,12 @@ mod tests {
             (Some(true), Some(true))
         );
         assert_eq!(v["set_up_for"], serde_json::json!(["Claude Code"]));
+        // `team --json`, which agents run: the team without its link, and its name as it is shown.
+        t.name = format!("vibes {}", "z".repeat(100));
+        let v = team_value(&t, None, None).unwrap();
+        assert!(v.get("link").is_none() && v.get("invite_line").is_none(), "{v}");
+        assert!(!v.to_string().contains("rn1-"), "{v}");
+        assert_eq!(v["team_name"].as_str(), Some(team::shown_name(&t.name).as_str()));
+        assert_eq!(v["team_name"].as_str().unwrap().chars().count(), 60);
     }
 }

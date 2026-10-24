@@ -122,7 +122,7 @@ impl Daemon {
             let Some(id) = s["session_id"].as_str().or(s["id"].as_str()) else { continue };
             let key = format!("reason:{id}");
             let text = |k: &str| s[k].as_str().filter(|v| !v.is_empty()).map(str::to_string);
-            let title = text("title");
+            let title = text("title").map(|t| crate::team::without_tickets(&t));
             seen.insert(key.clone());
             if !self.inner.lock().unwrap().live.contains_key(&key) {
                 let git = GitInfo { root: None, repo: text("repo"), branch: text("branch") };
@@ -208,13 +208,18 @@ mod tests {
 
     impl Stub {
         fn new(narrow_err: &str, plain_err: Option<&str>) -> Stub {
-            let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::generate()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let (bin, calls) = (dir.join("reason"), dir.join("calls"));
             let plain = match plain_err {
                 Some(e) => format!("echo '{e}' >&2; exit 1"),
                 None => r#"echo '{"items":[{"session_id":"r-1","status":"running","title":"Fix flaky billing test","finished_at":null,"is_archived":false}]}'"#.into(),
             };
+            Stub::running(narrow_err, plain)
+        }
+
+        /// The same, with the plain list running `plain`.
+        fn running(narrow_err: &str, plain: String) -> Stub {
+            let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (bin, calls) = (dir.join("reason"), dir.join("calls"));
             let script = format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *' --fields '*) echo '{narrow_err}' >&2; exit 1;; esac\n{plain}\n",
                 calls.display()
@@ -255,6 +260,18 @@ mod tests {
         d.sync_from(&stub.bin).await.unwrap();
         assert_eq!(stub.calls(), [true, false, false, true, false]);
         assert!(d.inner.lock().unwrap().live.contains_key("reason:r-1"));
+    }
+
+    #[tokio::test]
+    async fn a_reason_session_titled_with_an_invite_line_shows_it_without_the_link() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let ticket = format!("rn1-{}", "AbCd_-09".repeat(12));
+        let title = format!("Join the Reason Network: https://reasonmachines.com/network/join/#{ticket}");
+        let item = serde_json::json!({"session_id": "r-1", "status": "running", "title": title, "finished_at": null});
+        let stub = Stub::running("no", format!("echo '{}'", serde_json::json!({ "items": [item] })));
+        d.sync_from(&stub.bin).await.unwrap();
+        let doing = d.inner.lock().unwrap().live["reason:r-1"].doing.clone();
+        assert_eq!(doing.as_deref(), Some("Join the Reason Network: (team link)"));
     }
 
     #[tokio::test]

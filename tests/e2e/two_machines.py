@@ -167,7 +167,8 @@ check("a team without a relay of its own is on Reason's: the link names the one 
       and "relay: Reason's (the default)" in out, out)
 j = as_json(cli("alex", "team", "--json"))
 check("team --json marks people verified, and each machine's proof", [(m["verified"], m["has_proof"]) for m in j.get("members", [])] == [(True, True)] * 2
-      and j.get("link", "").startswith("https://") and j.get("team_name") == "vibes" and len(j.get("team_id", "")) == 32, j)
+      and j.get("team_name") == "vibes" and len(j.get("team_id", "")) == 32, j)
+check("…and leaves out the team link (agents run it)", "link" not in j and "invite_line" not in j and "rn1-" not in json.dumps(j), j)
 j = as_json(cli("alex", "link", "--json"))
 check("link --json gives the invite line", j.get("invite_line", "").startswith("Join the Reason Network: https://reasonmachines.com/network/join/#rn1-"), j)
 out = cli("alex", "link")
@@ -263,6 +264,54 @@ out = subprocess.run([BIN, "link"], env=bob, capture_output=True, text=True, tim
 check("any member can show the same team link", link.group(1).split("#")[1][:40] in out.replace("\n", ""), out)
 subprocess.run([BIN, "stop"], env=bob, capture_output=True)
 
+# --- a team with a long name: shown cut, but whole where the Reason CLI keeps and compares it ---
+LONG = "Acme platform and infrastructure engineering, west coast + EMEA" + " (2026)" * 3
+CUT = LONG[:59] + "…"
+lena = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "lena"), REASON_NETWORK_MACHINE="ws")
+lou = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "lou"), REASON_NETWORK_MACHINE="pad")
+
+
+def over_socket(e, req):
+    import socket
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(90)
+        sock.connect(os.path.join(e["REASON_NETWORK_HOME"], "network.sock"))
+        sock.sendall((json.dumps(dict(id=1, **req)) + "\n").encode())
+        return as_json(sock.makefile().readline()).get("result") or {}
+
+
+_, out = run(lena, "init", LONG, "--as", "lena", "--no-setup")
+check("init with a long team name prints it cut", f"Created team {CUT}." in out and LONG not in out, out)
+lj = as_json(run(lena, "link", "--json")[0])
+check("…link --json too, with the link", lj.get("team_name") == CUT and lj.get("link", "").startswith("https://"), lj)
+run(lou, "who", "--json")  # starts lou's daemon
+joined = over_socket(lou, {"op": "join", "ticket": lj.get("link", ""), "person": "lou"})
+check("the join reply over the socket names the team whole (the Reason CLI keeps it)",
+      joined.get("team_name") == LONG and joined.get("name") == LONG, joined)
+# Its daemon restarts onto the team once it has answered (the Reason CLI waits for that too): wait for the new one.
+for _ in range(60):
+    run(lou, "who", "--json")
+    if "as lou@pad" in open(os.path.join(lou["REASON_NETWORK_HOME"], "daemon.log")).read():
+        break
+    time.sleep(0.5)
+for want, got in (("team", over_socket(lou, {"op": "team"}).get("name")), ("link", over_socket(lou, {"op": "link", "new": False}).get("team"))):
+    check(f"…as do {want} over the socket on the joined machine, the same as the join reply", got == LONG, got)
+tj = as_json(run(lou, "team", "--json")[0])
+check("team --json on the joined machine: cut, and no link", tj.get("team_name") == CUT and "link" not in tj, tj)
+check("…who --json too", as_json(run(lou, "who", "--json")[0]).get("team") == CUT)
+for _ in range(30):
+    if re.search(r"lou\s+pad\s+(direct|relay)", run(lena, "team")[1]):
+        break
+    time.sleep(1)
+_, out = run(lena, "team")
+check("the joined machine connects to the founder's", re.search(r"lou\s+pad\s+(direct|relay)", out) is not None and CUT in out and LONG not in out, out)
+run(lena, "listen", "--as", "notes", "--wait", "0")
+_, out = run(lou, "send", "lena/notes", "hello across a team with a long name")
+_, out = run(lena, "listen", "--as", "notes", "--wait", "30")
+check("…and a message reaches it", "hello across a team with a long name" in out, out)
+for e in (lena, lou):
+    subprocess.run([BIN, "stop"], env=e, capture_output=True)
+
 # --- removal while online: the removed machine never gets the link that replaces the one it knew ---
 eve = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "eve"), REASON_NETWORK_MACHINE="tab")
 eve_link = re.search(r"(https://\S+#rn1-\S+)", cli("alex", "link")).group(1)
@@ -317,7 +366,7 @@ time.sleep(7)  # Claude's session registers after 3s; presence propagates every 
 out = codex.tool("list_team", {}, meta)
 claude_name = os.path.basename(ROOT).lower() + "-claude"
 check("alice's agent sees alex's session across machines", claude_name in out and "alex (verified) · laptop" in out, out)
-check("list_team gives the invite line", "Invite people with this line: Join the Reason Network: https://reasonmachines.com/network/join/#rn1-" in out, out)
+check("list_team gives no team link, and says who invites people", "rn1-" not in out and "your user runs `reason-network invite`" in out, out)
 check("…but not the one in alex's folder that is off", "private-claude" not in out, out)
 out = hidden.tool("list_team", {})
 check("in a folder that is off, the tools say so", out == "Your user turned Reason Network off for this folder", out)

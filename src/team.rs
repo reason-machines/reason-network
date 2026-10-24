@@ -243,9 +243,14 @@ impl TeamState {
         &self.meta.body.name
     }
 
-    /// The name as it is shown: one line. The founder picked it, and any member's machine can sign a new one.
+    /// The name as it is shown: see `shown_name`.
     pub fn shown_name(&self) -> String {
-        self.name().replace(|c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'), " ")
+        shown_name(self.name())
+    }
+
+    /// The whole name, in one line, for the Reason CLI, which compares it with the names it keeps (`team`, `link`).
+    pub fn whole_name(&self) -> String {
+        one_line(self.name())
     }
 
     /// Drops member entries with names no real client writes (see `plain_names`), kept by a build from before they
@@ -539,6 +544,92 @@ pub struct Ticket {
     pub hint_relay: Option<String>,
     pub hint_ips: Vec<SocketAddr>,
     pub peers: Vec<EndpointId>,
+}
+
+/// How much of a team's name is shown, as much as its links carry.
+pub const SHOWN_NAME: usize = 60;
+
+/// A team's name as it is shown to people and agents: one line, cut to `SHOWN_NAME` characters. The founder picked it,
+/// and any member's machine can sign a new one, of any length: it is kept whole, so a team with a long one works as
+/// before.
+pub fn shown_name(name: &str) -> String {
+    let line = one_line(name);
+    if line.chars().count() <= SHOWN_NAME {
+        return line;
+    }
+    format!("{}…", line.chars().take(SHOWN_NAME - 1).collect::<String>())
+}
+
+fn one_line(name: &str) -> String {
+    name.replace(|c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'), " ")
+}
+
+/// `text` with each team link or ticket in it (`rn1-…`, earlier builds' `tincan1…`, and the link around one) taken out.
+/// A session's title and task are read from its transcript and shown to teammates, and an invite line pasted in a
+/// prompt can end up in them.
+pub fn without_tickets(text: &str) -> String {
+    if !Ticket::is_ticket(&text.replace(unseen, "")) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let word = piece.trim_end_matches(char::is_whitespace);
+        if holds_ticket(word) {
+            out.push_str("(team link)");
+            out.push_str(&piece[word.len()..]);
+        } else {
+            out.push_str(piece);
+        }
+    }
+    out
+}
+
+/// Of a ticket's payload, how much is only the team's id (16 bytes: 21 base64url characters hold 126 of its 128 bits):
+/// one more already holds part of the link's secret.
+const TICKET_ID_CHARS: usize = 21;
+
+/// Whether a word holds a ticket, or enough of one to hold part of its secret: its prefix, not right after an ASCII
+/// letter (`turn1-`), then more of the payload than the team's id. Whatever comes before it otherwise (a digit, `%23`
+/// where a link's `#` was encoded, a word in another script, a character nobody sees) doesn't make it any less one, nor
+/// do characters slipped into it that nobody sees (a zero-width space, a soft hyphen, a direction mark) or a Markdown
+/// escape's `\`.
+fn holds_ticket(word: &str) -> bool {
+    // The word as it reads: each character that shows, and whether one that doesn't came right before it.
+    let mut shown = Vec::new();
+    let mut after_unseen = false;
+    for c in word.chars() {
+        if unseen(c) {
+            after_unseen = true;
+        } else {
+            shown.push((c, after_unseen));
+            after_unseen = false;
+        }
+    }
+    [TICKET_PREFIX, OLD_TICKET_PREFIX].iter().any(|prefix| {
+        let n = prefix.chars().count();
+        // Each check only where the one before it passed, and the payload counted no further than it needs to be: a
+        // long word stays quick.
+        (0..shown.len().saturating_sub(n - 1)).any(|at| {
+            let before = if shown[at].1 { None } else { at.checked_sub(1).map(|i| shown[i].0) };
+            shown[at..at + n].iter().map(|(c, _)| *c).eq(prefix.chars())
+                && before.is_none_or(|c| !c.is_ascii_alphabetic())
+                && shown[at + n..]
+                    .iter()
+                    .take_while(|(c, _)| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                    .take(TICKET_ID_CHARS + 1)
+                    .count()
+                    > TICKET_ID_CHARS
+        })
+    })
+}
+
+/// Characters that show as nothing (Unicode's default-ignorable ones, a zero-width space or a direction mark among
+/// them), and a Markdown escape's `\`.
+fn unseen(c: char) -> bool {
+    matches!(c, '\\' | '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{E0000}'..='\u{E0FFF}')
 }
 
 /// What a ticket starts with. The payload after it is shared with every peer (and earlier builds): never change it.
@@ -924,6 +1015,160 @@ mod tests {
         // Other spaces stay as typed.
         assert_eq!(TeamState::found("開発\u{3000}チーム", "alex", "mbp", &a).shown_name(), "開発\u{3000}チーム");
         assert_eq!(TeamState::found("Acme  Team <dev> & co", "alex", "mbp", &a).shown_name(), "Acme  Team <dev> & co");
+    }
+
+    #[test]
+    fn a_long_team_name_is_shown_cut_and_kept_whole() {
+        let (a, b) = (key(), key());
+        let long = format!("vibes {}", "x".repeat(300));
+        let mut sa = TeamState::found(&long, "alex", "mbp", &a);
+        let shown = sa.shown_name();
+        assert_eq!(shown.chars().count(), SHOWN_NAME, "{shown}");
+        assert!(shown.starts_with("vibes xxx") && shown.ends_with('…'), "{shown}");
+        // Kept whole, and a machine joining takes it as it is: a team with a long name works as before.
+        assert_eq!(sa.whole_name(), long);
+        sa.put_member(&a, b.public(), "alice", "xps", true);
+        let sb = TeamState::verified(&sa).unwrap();
+        assert!(sb.is_active(&b.public()) && sb.name() == long);
+        // Up to the cut, as typed.
+        let exact = "y".repeat(SHOWN_NAME);
+        assert_eq!(TeamState::found(&exact, "alex", "mbp", &a).shown_name(), exact);
+        assert_eq!(shown_name("開発\nチーム"), "開発 チーム");
+    }
+
+    #[test]
+    fn team_links_are_taken_out_of_what_teammates_see() {
+        let t = Ticket {
+            team: "00112233445566778899aabbccddeeff".into(),
+            name: "vibes".into(),
+            secret: random_secret(),
+            relay: None,
+            hint_relay: None,
+            hint_ips: vec![],
+            peers: vec![key().public()],
+        };
+        let enc = t.encode();
+        let payload = enc.strip_prefix(TICKET_PREFIX).unwrap();
+        let url = format!("https://reasonmachines.com/network/join/#{enc}");
+        for (text, want) in [
+            (format!("Join the Reason Network: {url}"), "Join the Reason Network: (team link)".to_string()),
+            (format!("{enc} please"), "(team link) please".into()),
+            (format!("join ({url}), then fix CI"), "join (team link) then fix CI".into()),
+            (format!("old tincan1{payload}"), "old (team link)".into()),
+            (format!("https://tincan.example/join#tincan1{payload} and more"), "(team link) and more".into()),
+            // Cut off where a title or task is shortened, it still holds the secret.
+            (
+                format!("Join the Reason Network: {}", &url[..url.len() - 40]),
+                "Join the Reason Network: (team link)".into(),
+            ),
+            (format!("a\t{enc}\nb"), "a\t(team link)\nb".into()),
+        ] {
+            let got = without_tickets(&text);
+            assert_eq!(got, want, "{text}");
+            assert!(!got.contains(payload) && !got.contains(&payload[..32]));
+        }
+        // Glued to whatever comes before it that isn't an ASCII letter, or with the link's `#` percent-encoded (as
+        // mail link wrappers write it), it is still one.
+        for before in [
+            "邀请码",
+            "é",
+            "1",
+            "%23",
+            "https://safelinks.example/?url=https%3A%2F%2Freasonmachines.com%2Fnetwork%2Fjoin%2F%23",
+        ] {
+            for ticket in [enc.clone(), format!("tincan1{payload}")] {
+                let got = without_tickets(&format!("see {before}{ticket} now"));
+                assert_eq!(got, "see (team link) now", "{before}{ticket}");
+            }
+        }
+        // Words that only look like one stay: after an ASCII letter, or with no more than the team's id after the
+        // prefix (no part of the secret).
+        let id_only = &payload[..TICKET_ID_CHARS];
+        for text in [
+            "turn1-left at the light".to_string(),
+            "burn1-".to_string() + payload,
+            "rn1- notes".into(),
+            "tincan1 notes".into(),
+            "fix rn1 and tincan1.".into(),
+            "plain text".into(),
+            "rn1-2".into(),
+            "rn1-beta".into(),
+            "fix-rn1-prefix".into(),
+            "x/rn1-tickets".into(),
+            "docs/rn1-notes/for/the/whole/story.md".into(),
+            "tincan10".into(),
+            format!("#rn1-{id_only}"),
+            format!("tincan1{id_only}"),
+        ] {
+            assert_eq!(without_tickets(&text), text);
+        }
+        // Characters a paste or an editor can slip into a link without anyone seeing them (a zero-width space, a soft
+        // hyphen, a direction mark, a Markdown `\_`) don't hide it.
+        let marks = [
+            "\u{200B}",
+            "\u{200C}",
+            "\u{200D}",
+            "\u{2060}",
+            "\u{FEFF}",
+            "\u{00AD}",
+            "\\",
+            "\u{200E}",
+            "\u{200F}",
+            "\u{061C}",
+            "\u{202E}",
+            "\u{2066}",
+            "\u{2063}",
+            "\u{FE0F}",
+            "\u{E0041}",
+            "\u{3164}",
+        ];
+        for mark in marks {
+            for at in [1, 8, 20] {
+                let mangled = format!("rn1-{}{mark}{}", &payload[..at], &payload[at..]);
+                assert_eq!(without_tickets(&format!("see {mangled} now")), "see (team link) now", "{mangled:?}");
+            }
+            // Nor in the prefix, nor right before it.
+            for prefix in ["rn1-", "tincan1"] {
+                for at in 1..prefix.len() {
+                    let mangled = format!("{}{mark}{}{payload}", &prefix[..at], &prefix[at..]);
+                    assert_eq!(without_tickets(&format!("see {mangled} now")), "see (team link) now", "{mangled:?}");
+                }
+            }
+            assert_eq!(without_tickets(&format!("a{mark}rn1-{payload}")), "(team link)", "{mark:?}");
+            // A mark doesn't make a word that only looks like one into a link.
+            let text = format!("turn1-{mark}{payload}");
+            assert_eq!(without_tickets(&text), text);
+            let text = format!("rn1-{}{mark}", &payload[..TICKET_ID_CHARS]);
+            assert_eq!(without_tickets(&text), text);
+        }
+        // A long word with no spaces is gone through quickly, whatever is in it.
+        let started = std::time::Instant::now();
+        for long in [format!("x{}rn1-", "A".repeat(50_000)), "arn1-".repeat(10_000), "rn1\u{200B}".repeat(10_000)] {
+            assert_eq!(without_tickets(&long), long);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        // One character more holds part of the secret.
+        assert_eq!(without_tickets(&format!("#rn1-{}", &payload[..TICKET_ID_CHARS + 1])), "(team link)");
+        assert_eq!(without_tickets(&format!("tincan1{}", &payload[..TICKET_ID_CHARS + 1])), "(team link)");
+    }
+
+    #[test]
+    fn a_tickets_first_characters_are_only_the_team_id() {
+        let t = |team: &str, secret: &str| Ticket {
+            team: team.into(),
+            name: "vibes".into(),
+            secret: secret.into(),
+            relay: None,
+            hint_relay: None,
+            hint_ips: vec![],
+            peers: vec![key().public()],
+        };
+        let team = "00112233445566778899aabbccddeeff";
+        let (a, b) = (t(team, &"00".repeat(16)).encode(), t(team, &"ff".repeat(16)).encode());
+        let at = TICKET_PREFIX.len() + TICKET_ID_CHARS;
+        // The same team id: the same first 21 characters, whatever the secret; the 22nd already differs with it.
+        assert_eq!(a[..at], b[..at]);
+        assert_ne!(a[at..at + 1], b[at..at + 1]);
     }
 
     #[test]

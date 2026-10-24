@@ -7,7 +7,9 @@ use crate::{
     config::{Config, Policy},
     install_lines, invite,
     proto::*,
-    render, setup, util,
+    render, setup,
+    team::shown_name,
+    util,
 };
 use anyhow::{Result, anyhow};
 use cliclack::{confirm, input, intro, log, multiselect, note, outro, outro_cancel, select, spinner};
@@ -59,7 +61,7 @@ pub async fn onboard(
     intro(format!(" {CLI} "))?;
     let link = Link::new(None);
     if let Ok(t) = link.call::<TeamInfo>(Request::Team).await {
-        log::info(crate::shown(&format!("You're in team {} as {} on {}.", t.name, t.person, t.machine)))?;
+        log::info(crate::shown(&format!("You're in team {} as {} on {}.", shown_name(&t.name), t.person, t.machine)))?;
         outro(format!("`{CLI}` shows who's around; `{CLI} invite` gives you the team link."))?;
         return Ok(());
     }
@@ -88,7 +90,7 @@ pub async fn onboard(
             .await
             .inspect_err(|e| sp.error(crate::shown(&format!("{e:#}"))))?;
         crate::wait_exit(crate::daemon_pid()).await;
-        sp.stop(crate::shown(&format!("Created team {}. You are {} on {}.", t.name, t.person, t.machine)));
+        sp.stop(crate::shown(&format!("Created team {}. You are {} on {}.", shown_name(&t.name), t.person, t.machine)));
     } else {
         let mut invite = invite;
         loop {
@@ -107,7 +109,12 @@ pub async fn onboard(
             {
                 Ok(t) => {
                     crate::wait_exit(crate::daemon_pid()).await;
-                    sp.stop(crate::shown(&format!("Joined team {} as {} on {}.", t.name, t.person, t.machine)));
+                    sp.stop(crate::shown(&format!(
+                        "Joined team {} as {} on {}.",
+                        shown_name(&t.name),
+                        t.person,
+                        t.machine
+                    )));
                     break;
                 }
                 Err(e) if e.to_string().starts_with("already in team") => {
@@ -244,7 +251,7 @@ pub async fn agents_and_preferences() -> Result<()> {
 pub async fn show_link(new: bool) -> Result<String> {
     let l: LinkInfo = Link::new(None).call(Request::Link { new }).await?;
     let copied = copy(&l.url);
-    let team = crate::shown(&l.team);
+    let team = crate::shown(&shown_name(&l.team));
     let title =
         if copied { format!("Team link for {team} (on your clipboard)") } else { format!("Team link for {team}") };
     note(
