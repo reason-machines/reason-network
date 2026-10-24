@@ -356,9 +356,8 @@ impl ReasonNetworkMcp {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 id = self.linked(agent).await;
             }
-            if id.is_some() {
-                self.hooks_linked.store(true, Ordering::Relaxed);
-            }
+            // Waited for once per gap: a next conversation that never starts doesn't slow every later call.
+            self.hooks_linked.store(id.is_some(), Ordering::Relaxed);
         }
         let key = match &id {
             Some(id) => format!("{agent}:{id}"),
