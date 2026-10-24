@@ -49,7 +49,8 @@ pub struct ListArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendArgs {
-    /// "person/session@machine"; run list_team first to get it.
+    /// "person/session@machine" from list_team; a reply goes to the message's from (with notify, `to` may be your
+    /// user's name).
     pub to: String,
     /// The message, with the point in the first line.
     pub message: String,
@@ -443,7 +444,8 @@ mod tests {
     fn instructions_carry_the_skills_rules() {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
-        assert!(text.contains("- One task = one session.") && text.contains("`person/session@machine`"), "{text}");
-        assert!(text.contains("- If the target session is busy with a different task"), "{text}");
+        assert!(text.contains("- One task per session:") && text.contains("`person/session@machine`"), "{text}");
+        assert!(text.contains("- If that session is busy with a different task"), "{text}");
+        assert!(text.contains("Reply to a message's `from` as given."), "{text}");
     }
 }
