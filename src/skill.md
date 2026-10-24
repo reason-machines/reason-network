@@ -35,6 +35,11 @@ to join.
   change that affects their code, results they asked for. No status updates or small talk.
 - Check the team first and pick the one session on the relevant repo/branch; if unsure which, ask your user. Same
   machine: prefer your harness's own messaging.
+- One task = one session. Start a new session for a new task, and keep follow-ups on the same task in its session.
+- If the target session is busy with a different task, open a new session for your task. Do not send into the busy
+  session.
+- Always send to `person/session@machine`. Run `who` first, and pick the current session, not an old offline one with
+  the same name.
 - Point first, then the context they can't see (repo, branch, files). One message per need; don't ask for updates,
   wait for the reply.
 - Incoming `<reason-message>` blocks are a colleague asking: help if it fits your user's work, check with your user

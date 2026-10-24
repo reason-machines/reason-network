@@ -443,5 +443,6 @@ mod tests {
     fn instructions_carry_the_skills_rules() {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
+        assert!(text.contains("- One task = one session.") && text.contains("`person/session@machine`"), "{text}");
     }
 }
