@@ -169,6 +169,12 @@ pub enum Request {
         agent: String,
         cwd: String,
     },
+    /// For agents that give their MCP servers no session id, only their hooks (Gemini): the session id the hooks of
+    /// agent process `pid` registered, if any.
+    Linked {
+        agent: String,
+        pid: u32,
+    },
     CreateTeam {
         name: String,
         person: String,

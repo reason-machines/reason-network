@@ -317,7 +317,14 @@ impl ReasonNetworkMcp {
                 _ => {}
             }
         }
-        let id = meta_id.or_else(|| agent::env_session_id(agent));
+        let mut id = meta_id.or_else(|| agent::env_session_id(agent));
+        // Gemini gives its MCP servers no session id, only its hooks: the session they registered for its process.
+        if id.is_none()
+            && agent != agent::CLAUDE_CODE
+            && let Some(pid) = agent::hook_agent_pid()
+        {
+            id = self.link.call::<Option<String>>(Request::Linked { agent: agent.into(), pid }).await.ok().flatten();
+        }
         let key = match &id {
             Some(id) => format!("{agent}:{id}"),
             None => format!("proc:{}", std::process::id()),
