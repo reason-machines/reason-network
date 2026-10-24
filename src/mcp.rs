@@ -49,7 +49,7 @@ pub struct ListArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendArgs {
-    /// "person/session" (or just "session").
+    /// "person/session@machine"; run list_team first to get it.
     pub to: String,
     /// The message, with the point in the first line.
     pub message: String,
