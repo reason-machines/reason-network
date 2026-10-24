@@ -444,5 +444,6 @@ mod tests {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
         assert!(text.contains("- One task = one session.") && text.contains("`person/session@machine`"), "{text}");
+        assert!(text.contains("- If the target session is busy with a different task"), "{text}");
     }
 }
