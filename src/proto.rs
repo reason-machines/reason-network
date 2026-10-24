@@ -53,6 +53,26 @@ pub struct SessionReg {
     pub tier: Tier,
     #[serde(default)]
     pub name: Option<String>,
+    /// How the daemon can start a turn in the session while it is idle, when its agent offers a way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Route>,
+}
+
+/// A way into an idle session that its agent opens to other processes on this machine.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "via", rename_all = "snake_case")]
+pub enum Route {
+    /// An Antigravity conversation: `agy agentapi send-message`, with the address and token of the agy process's
+    /// language server, which only the agent's shell commands get (`reason-network wake`). Kept in memory only.
+    Agy { address: String, token: String },
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Route::Agy { address, .. } => write!(f, "Agy({address})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +169,11 @@ pub enum Request {
     /// was waiting for the usual way.
     StopWaiting {
         key: String,
+    },
+    /// A way to wake the session `key`, found by a process in it (`reason-network wake` in Antigravity's shell).
+    Route {
+        key: String,
+        route: Route,
     },
     /// The client injected these messages into its agent's conversation.
     Delivered {
@@ -457,6 +482,9 @@ pub struct HookReply {
     /// Their ids, to acknowledge with `Delivered` once shown.
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Ask the agent to run `reason-network wake`: its session has no way to be woken (any more).
+    #[serde(default)]
+    pub relink: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

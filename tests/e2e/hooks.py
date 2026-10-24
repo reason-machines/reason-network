@@ -1,8 +1,8 @@
-"""Hook flows for Cursor, Gemini, Copilot and opencode against one isolated daemon.
+"""Hook flows for Cursor, Gemini, Antigravity, Copilot and opencode against one isolated daemon.
 
     cargo build && python3 tests/e2e/hooks.py
 """
-import json, os, socket, subprocess, tempfile, threading, time
+import json, os, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
@@ -15,7 +15,38 @@ os.makedirs(os.path.join(CLAUDE, "sessions"))
 with open(os.path.join(CLAUDE, ".claude.json"), "w") as f:
     json.dump({"mcpServers": {"reason-network": {"type": "stdio", "command": BIN, "args": ["mcp"]}}}, f)
 env["CLAUDE_CONFIG_DIR"] = CLAUDE
+# A stand-in for agy, which the daemon runs to wake its sessions: it logs how it was run.
+CALLS = os.path.join(D, "calls.jsonl")
+AGY_FAIL = os.path.join(D, "agy-fails")
+AGY_HANG = os.path.join(D, "agy-hangs")
+FAKE_AGY = os.path.join(D, "fake-agy")
+with open(FAKE_AGY, "w") as f:
+    f.write(f"""#!{sys.executable}
+import json, os, sys
+with open({CALLS!r}, "a") as f:
+    f.write(json.dumps({{"bin": "agy", "args": sys.argv[1:], "addr": os.environ.get("ANTIGRAVITY_LS_ADDRESS"),
+                        "token": os.environ.get("ANTIGRAVITY_CSRF_TOKEN")}}) + "\\n")
+if os.path.exists({AGY_HANG!r}):
+    import time; time.sleep(45)
+sys.exit(1 if os.path.exists({AGY_FAIL!r}) else 0)
+""")
+os.chmod(FAKE_AGY, 0o755)
+env.update(REASON_NETWORK_AGY_BIN=FAKE_AGY)
 results = []
+
+
+def calls(bin_):
+    try:
+        return [c for c in map(json.loads, open(CALLS)) if c["bin"] == bin_]
+    except FileNotFoundError:
+        return []
+
+
+def settle(pred, secs=10):
+    end = time.time() + secs
+    while time.time() < end and not pred():
+        time.sleep(0.2)
+    return pred()
 
 
 def check(name, ok, detail=""):
@@ -75,6 +106,111 @@ gem_name = next(w for w in run("who").split() if w.endswith("-gemini"))
 run("send", gem_name, "gemini: run the tests")
 out = hook("gemini", "stop", gem)
 check("gemini stop → decision block with the message", '"decision":"block"' in out and "run the tests" in out, out)
+
+# Antigravity: camelCase conversationId + workspacePaths, mail as an injected step, Stop only on a finished turn
+agy_dir = os.path.join(D, "agyproj")
+os.makedirs(agy_dir)
+agy = {"conversationId": "a-1", "workspacePaths": [agy_dir], "transcriptPath": os.path.join(D, "agy.jsonl")}
+out = hook("agy", "session-start", agy)
+check("agy start → injected intro naming the session", '"injectSteps"' in out and "agyproj-agy" in out, out)
+check("…which asks it to run wake once", " wake` once now" in out, out)
+run("send", "agyproj-agy", "agy: check the build")
+out = hook("agy", "stop", dict(agy, terminationReason="USER_CANCELED"))
+check("agy stop after a cancel → nothing, the mail waits", out == "", out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("agy pre-invocation → the mail as a system message", '"systemMessage"' in out and "check the build" in out, out)
+check("…saying it is a teammate's agent, not the user", "not from your user" in out, out)
+run("send", "agyproj-agy", "agy: and the docs")
+out = hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+check("agy stop at the end of a turn → decision continue", '"decision":"continue"' in out and "and the docs" in out, out)
+check("…with the same note", "not from your user" in out, out)
+
+# agy setup in a home of its own: the MCP entry waits as long as check_inbox can, and removing leaves nothing behind
+# that setup created, but keeps what others put there.
+sh = os.path.join(D, "setuphome")
+os.makedirs(os.path.join(sh, ".gemini", "antigravity-cli"))
+senv = {k: v for k, v in env.items() if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "GROK_HOME", "PI_CODING_AGENT_DIR", "DSH_HOME")}
+senv.update(HOME=sh, PATH="/usr/bin:/bin")
+setup = lambda *a: subprocess.run([BIN, "setup", "--no-service", *a], env=senv, capture_output=True, text=True, timeout=60)
+agy_cfg = os.path.join(sh, ".gemini", "config")
+setup()
+mcp_cfg = json.load(open(os.path.join(agy_cfg, "mcp_config.json")))["mcpServers"]["reason-network"]
+check("agy setup → MCP entry with check_inbox's long timeout", mcp_cfg.get("timeoutSeconds") == 660, mcp_cfg)
+setup("--remove")
+left = [f for f in ("mcp_config.json", "hooks.json") if os.path.exists(os.path.join(agy_cfg, f))]
+check("agy setup --remove → no empty config files left", not left, left)
+other = {"other-tool": {"Stop": [{"type": "command", "command": "true"}]}}
+with open(os.path.join(agy_cfg, "hooks.json"), "w") as f:
+    json.dump(other, f)
+setup()
+setup("--remove")
+kept = json.load(open(os.path.join(agy_cfg, "hooks.json")))
+check("…but a hooks file with others' hooks stays, without ours", kept == other, kept)
+
+# Waking an idle agy: `wake` in its shell hands the daemon its language server, and the daemon runs `agy agentapi`.
+out = run("wake")
+check("wake outside agy's shell says where to run it", "Antigravity's shell" in out, out)
+shell = dict(env, ANTIGRAVITY_AGENT="1", ANTIGRAVITY_CONVERSATION_ID="a-1", ANTIGRAVITY_LS_ADDRESS="127.0.0.1:1",
+             ANTIGRAVITY_CSRF_TOKEN="tok-1")
+r = subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
+check("wake in agy's shell links the conversation", "now wake alex/agyproj-agy" in r.stdout, r.stdout + r.stderr)
+check("…and the intro stops asking for it", " wake`" not in hook("agy", "session-start", agy))
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+out = run("send", "agyproj-agy", "agy: wake up")
+check("the sender hears the idle agy starts a turn", "starts a turn" in out, out)
+settle(lambda: calls("agy"))
+c = (calls("agy") or [{}])[-1]
+text = (c.get("args") or ["", "", "", ""])[3]
+check("…through agentapi into its conversation, with its server and token",
+      c.get("args", [])[:3] == ["agentapi", "send-message", "a-1"] and c.get("addr") == "127.0.0.1:1" and c.get("token") == "tok-1", c)
+check("…framed as a teammate's agent's, not the user's or the system's", "agy: wake up" in text and "not from your user or the system" in text, text)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("…and the hooks don't deliver it twice", "wake up" not in out, out)
+out = run("send", "agyproj-agy", "agy: while you work")
+check("a busy agy gets mail through its hooks, not a new turn", "next tool call" in out and len(calls("agy")) == 1, out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=2))
+check("…at its next model call", "while you work" in out, out)
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+open(AGY_FAIL, "w").close()
+run("send", "agyproj-agy", "agy: are you there")
+settle(lambda: len(calls("agy")) == 2)
+time.sleep(0.5)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("a wake that fails leaves the mail to the hooks", "are you there" in out, out)
+check("…and asks agy to run wake again", '"ephemeralMessage"' in out and " wake` once now" in out, out)
+os.remove(AGY_FAIL)
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
+# Agents answering each other through routes stop after WAKE_BUDGET turns its person didn't start. Each woken turn's
+# own hooks don't count as its person's turn, however late the first one fires (Grok's can come only after its first
+# tool): only a turn starting that the daemon didn't start resets the budget.
+woken_turn = lambda: (hook("agy", "post-tool-use", dict(agy, invocationNum=1)), hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL")))
+outs = []
+for i in range(5):
+    outs.append(run("send", "agyproj-agy", f"agy: ping {i}", "--from", "alex/proj-cursor"))
+    woken_turn()
+outs.append(run("send", "agyproj-agy", "agy: ping 5", "--from", "alex/proj-cursor"))
+check("teammates' agents wake an idle agy up to the budget", all("starts a turn" in o for o in outs), outs)
+time.sleep(61)
+woken_turn()
+out = run("send", "agyproj-agy", "agy: ping 6", "--from", "alex/proj-cursor")
+check("…then their mail waits for its person, though the last woken turn's first hook came a minute late", "woken this session a lot" in out, out)
+woken_turn()  # its person's turn: nothing here started it
+out = run("send", "agyproj-agy", "agy: ping 7", "--from", "alex/proj-cursor")
+check("its person's turn gives teammates' agents the budget again", "starts a turn" in out, out)
+woken_turn()
+# A wake that times out may have started the turn: the mail counts as read, so hooks don't show it a second time.
+n = len(calls("agy"))
+open(AGY_HANG, "w").close()
+out = run("send", "agyproj-agy", "agy: slow wake")
+check("a wake goes out", "starts a turn" in out, out)
+time.sleep(33)
+os.remove(AGY_HANG)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("…and when agentapi times out, hooks don't deliver it again", "slow wake" not in out and len(calls("agy")) == n + 1, out)
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+out = run("send", "agyproj-agy", "agy: after the slow one")
+check("…and the link stays", "starts a turn" in out, out)
 
 # Copilot: camelCase sessionId
 cop = {"sessionId": "p-1", "cwd": proj, "timestamp": 1}

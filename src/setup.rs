@@ -137,6 +137,22 @@ fn write_json(path: &Path, v: &Value, dry: bool) -> Result<bool> {
     write_file(path, &(serde_json::to_string_pretty(v)? + "\n"), dry)
 }
 
+/// Writes `v`, or deletes the file when removing Reason Network left nothing else in it.
+fn write_or_drop(path: &Path, v: &Value, remove: bool, dry: bool, r: &mut Report) -> Result<()> {
+    if remove && hollow(v) {
+        if path.exists() {
+            if !dry {
+                std::fs::remove_file(path)?;
+            }
+            r.lines.push(format!("removed {}", crate::util::tilde(&path.display().to_string())));
+        }
+    } else {
+        let did = write_json(path, v, dry)?;
+        r.lines.push(changed(path, did));
+    }
+    Ok(())
+}
+
 /// Only empty objects and arrays.
 fn hollow(v: &Value) -> bool {
     match v {
@@ -445,17 +461,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         ("SessionEnd", group("session-end", false, 3)),
     ];
     merge_hook_groups(obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?, "grok", groups, remove);
-    if remove && hollow(&v) {
-        if hooks_path.exists() {
-            if !dry {
-                std::fs::remove_file(&hooks_path)?;
-            }
-            r.lines.push(format!("removed {}", crate::util::tilde(&hooks_path.display().to_string())));
-        }
-    } else {
-        let did = write_json(&hooks_path, &v, dry)?;
-        r.lines.push(changed(&hooks_path, did));
-    }
+    write_or_drop(&hooks_path, &v, remove, dry, &mut r)?;
     Ok(Some(r))
 }
 
@@ -560,6 +566,61 @@ fn gemini(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         r.notes.push("Gemini CLI only runs Reason Network in trusted folders (`/permissions trust`).".into());
     }
     Ok(Some(r))
+}
+
+// ---- Antigravity CLI (agy) ----
+
+fn agy_config() -> PathBuf {
+    home().join(".gemini").join("config")
+}
+
+/// agy reads every session's MCP servers from `mcp_config.json` and its hooks from `hooks.json`, both in its global
+/// config folder. It has no prompt-submit hook and its PostToolUse can't add context, but PreInvocation runs before
+/// every model call, after a tool's too.
+fn agy(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+    if agent::find_bin("agy").is_none() && !home().join(".gemini/antigravity-cli").exists() {
+        return Ok(None);
+    }
+    let mut r = Report { agent: "Antigravity CLI", lines: Vec::new(), notes: Vec::new() };
+    let dir = agy_config();
+    let mcp_path = dir.join("mcp_config.json");
+    let mut v = read_json(&mcp_path)?;
+    let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
+    if remove {
+        servers.remove(AGENT_NAME);
+    } else {
+        servers.insert(
+            AGENT_NAME.into(),
+            // check_inbox can wait up to 11 minutes.
+            json!({ "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "agy" }, "timeoutSeconds": 660 }),
+        );
+    }
+    write_or_drop(&mcp_path, &v, remove, dry, &mut r)?;
+
+    let hooks_path = dir.join("hooks.json");
+    let mut v = read_json(&hooks_path)?;
+    agy_hooks(&mut v, exe, remove)?;
+    write_or_drop(&hooks_path, &v, remove, dry, &mut r)?;
+    Ok(Some(r))
+}
+
+/// agy keeps each tool's hooks under a name of its own, so ours are all under `reason-network`.
+fn agy_hooks(v: &mut Value, exe: &Path, remove: bool) -> Result<()> {
+    let hooks = obj(v)?;
+    if remove {
+        hooks.remove(AGENT_NAME);
+        return Ok(());
+    }
+    let handler = |event: &str| json!([{ "type": "command", "command": shell_cmd(exe, &format!("hook agy {event}")), "timeout": 10 }]);
+    hooks.insert(
+        AGENT_NAME.into(),
+        json!({
+            "SessionStart": handler("session-start"),
+            "PreInvocation": handler("post-tool-use"),
+            "Stop": handler("stop"),
+        }),
+    );
+    Ok(())
 }
 
 // ---- GitHub Copilot CLI ----
@@ -1204,7 +1265,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 11] = [
+const AGENTS: [Agent; 12] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -1267,6 +1328,16 @@ const AGENTS: [Agent; 11] = [
         installed: || gemini_home().exists() || agent::find_bin("gemini").is_some(),
         wired: |exe| has(gemini_home().join("settings.json"), &me(exe)),
         apply: gemini,
+    },
+    Agent {
+        id: "agy",
+        name: "Antigravity CLI",
+        hint: "sees messages at its next step",
+        installed: || agent::find_bin("agy").is_some() || home().join(".gemini/antigravity-cli").exists(),
+        wired: |exe| {
+            has(agy_config().join("mcp_config.json"), &me(exe)) && has(agy_config().join("hooks.json"), "hook agy")
+        },
+        apply: agy,
     },
     Agent {
         id: "copilot",
@@ -1414,7 +1485,7 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
     println!("{verb} ({}):", crate::util::tilde(&exe.display().to_string()));
     if found.is_empty() && !remove {
         println!(
-            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
+            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Antigravity CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
         );
     }
     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
@@ -1540,6 +1611,20 @@ mod tests {
         merge_hook_groups(&mut hooks, "codex", vec![], true);
         assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
         assert!(!hooks.contains_key("PostToolUse"));
+    }
+
+    #[test]
+    fn agy_hooks_sit_under_our_name_beside_others() {
+        let exe = Path::new("/x/reason-network");
+        let mut v = json!({ "lint": { "PostToolUse": [{ "matcher": "*", "hooks": [{ "command": "lint" }] }] } });
+        agy_hooks(&mut v, exe, false).unwrap();
+        let ours = &v[AGENT_NAME];
+        assert_eq!(ours["SessionStart"][0]["command"], "/x/reason-network hook agy session-start");
+        assert_eq!(ours["PreInvocation"][0]["command"], "/x/reason-network hook agy post-tool-use");
+        assert_eq!(ours["Stop"][0]["command"], "/x/reason-network hook agy stop");
+        assert!(v["lint"].is_object(), "keeps other hooks");
+        agy_hooks(&mut v, exe, true).unwrap();
+        assert_eq!(v, json!({ "lint": { "PostToolUse": [{ "matcher": "*", "hooks": [{ "command": "lint" }] }] } }));
     }
 
     const DSH_PATCH: &str = "# Your patch layer\n\n- id: agent-loop\n  config:\n    maxParallelToolCalls: 20\n";

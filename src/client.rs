@@ -358,6 +358,7 @@ mod tests {
             pid: None,
             tier: crate::proto::Tier::Pull,
             name: None,
+            route: None,
         };
         let mut regs = super::HashMap::new();
         super::remember(&mut regs, reg("claude-code:before-clear", "claude-code"));

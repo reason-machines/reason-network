@@ -141,6 +141,7 @@ impl Daemon {
                     pid: None,
                     tier: Tier::Push,
                     name,
+                    route: None,
                 };
                 self.register(None, reg, git)?;
             }
