@@ -1,4 +1,4 @@
-"""Hook flows for Cursor, Gemini, Copilot and opencode against one isolated daemon.
+"""Hook flows for Cursor, Gemini, Antigravity, Copilot and opencode against one isolated daemon.
 
     cargo build && python3 tests/e2e/hooks.py
 """
@@ -75,6 +75,45 @@ gem_name = next(w for w in run("who").split() if w.endswith("-gemini"))
 run("send", gem_name, "gemini: run the tests")
 out = hook("gemini", "stop", gem)
 check("gemini stop → decision block with the message", '"decision":"block"' in out and "run the tests" in out, out)
+
+# Antigravity: camelCase conversationId + workspacePaths, mail as an injected step, Stop only on a finished turn
+agy_dir = os.path.join(D, "agyproj")
+os.makedirs(agy_dir)
+agy = {"conversationId": "a-1", "workspacePaths": [agy_dir], "transcriptPath": os.path.join(D, "agy.jsonl")}
+out = hook("agy", "session-start", agy)
+check("agy start → injected intro naming the session", '"injectSteps"' in out and "agyproj-agy" in out, out)
+run("send", "agyproj-agy", "agy: check the build")
+out = hook("agy", "stop", dict(agy, terminationReason="USER_CANCELED"))
+check("agy stop after a cancel → nothing, the mail waits", out == "", out)
+out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+check("agy pre-invocation → the mail as a system message", '"systemMessage"' in out and "check the build" in out, out)
+check("…saying it is a teammate's agent, not the user", "not from your user" in out, out)
+run("send", "agyproj-agy", "agy: and the docs")
+out = hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+check("agy stop at the end of a turn → decision continue", '"decision":"continue"' in out and "and the docs" in out, out)
+check("…with the same note", "not from your user" in out, out)
+
+# agy setup in a home of its own: the MCP entry waits as long as check_inbox can, and removing leaves nothing behind
+# that setup created, but keeps what others put there.
+sh = os.path.join(D, "setuphome")
+os.makedirs(os.path.join(sh, ".gemini", "antigravity-cli"))
+senv = {k: v for k, v in env.items() if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME", "GROK_HOME", "PI_CODING_AGENT_DIR", "DSH_HOME")}
+senv.update(HOME=sh, PATH="/usr/bin:/bin")
+setup = lambda *a: subprocess.run([BIN, "setup", "--no-service", *a], env=senv, capture_output=True, text=True, timeout=60)
+agy_cfg = os.path.join(sh, ".gemini", "config")
+setup()
+mcp_cfg = json.load(open(os.path.join(agy_cfg, "mcp_config.json")))["mcpServers"]["reason-network"]
+check("agy setup → MCP entry with check_inbox's long timeout", mcp_cfg.get("timeoutSeconds") == 660, mcp_cfg)
+setup("--remove")
+left = [f for f in ("mcp_config.json", "hooks.json") if os.path.exists(os.path.join(agy_cfg, f))]
+check("agy setup --remove → no empty config files left", not left, left)
+other = {"other-tool": {"Stop": [{"type": "command", "command": "true"}]}}
+with open(os.path.join(agy_cfg, "hooks.json"), "w") as f:
+    json.dump(other, f)
+setup()
+setup("--remove")
+kept = json.load(open(os.path.join(agy_cfg, "hooks.json")))
+check("…but a hooks file with others' hooks stays, without ours", kept == other, kept)
 
 # Copilot: camelCase sessionId
 cop = {"sessionId": "p-1", "cwd": proj, "timestamp": 1}

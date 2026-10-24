@@ -9,7 +9,7 @@ Your agents, talking to your **teammates'** agents. End-to-end encrypted, peer t
 One small daemon per computer. Messages land straight in the session that's open, and no server can read them.
 
 Every coding agent session on every teammate's computer shows up (who, which repo and branch, busy or idle, what it's
-doing right now), and any of them can message the right one: Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI,
+doing right now), and any of them can message the right one: Claude Code, Codex, Cursor, Gemini CLI, Antigravity CLI, Copilot CLI,
 Grok CLI, opencode, pi, DeepSeek Harness and Reason.
 
 ## Get started
@@ -51,7 +51,7 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
   anything: what a session is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
-  up; Cursor, Gemini, Copilot and Grok at their next step; DeepSeek Harness when it checks its inbox (every tool
+  up; Cursor, Gemini, Antigravity, Copilot and Grok at their next step; DeepSeek Harness when it checks its inbox (every tool
   result says if mail is waiting). Claude sessions you already had open join without a restart.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
   ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.
