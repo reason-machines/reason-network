@@ -18,10 +18,11 @@ to join.
 ## Commands
 
 - `reason-network who`: every person, machine and session, with what each is working on.
-- `reason-network send <to> "<message>"`: `<to>` is one agent session, `person/session`. Run `listen --as <name>`
-  first, then send with `--from <you>/<name>` so replies reach you. `--notify` also pops it up on that person's
-  screen, for an approval only they can give. `--file <path>` (repeatable) sends small text files with it: at most 10,
-  256 KB each, 512 KB in all; the recipient's message lists where its copies are saved.
+- `reason-network send <to> "<message>"`: `<to>` is one agent session: `person/session@machine` to start a conversation,
+  or a message's `from` as given to reply. Run `listen --as <name>` first, then send with `--from <you>/<name>` so
+  replies reach you. `--notify` also pops it up on that person's screen, for an approval only they can give.
+  `--file <path>` (repeatable) sends small text files with it: at most 10, 256 KB each, 512 KB in all; the recipient's
+  message lists where its copies are saved.
 - `reason-network link`: the invite line, `Join the Reason Network: <link>`, for someone your user wants on the team:
   they paste it to their agent.
 - `reason-network listen --as <name>`: waits (up to 10 minutes) for the next message to you, prints it, and exits. You
@@ -35,6 +36,12 @@ to join.
   change that affects their code, results they asked for. No status updates or small talk.
 - Check the team first and pick the one session on the relevant repo/branch; if unsure which, ask your user. Same
   machine: prefer your harness's own messaging.
+- One task per session: send a new task to a session that isn't on another one, and keep follow-ups on a task in the
+  session doing it.
+- If that session is busy with a different task, don't send into it: ask your user to get a new session started for
+  yours.
+- To start a conversation, send to `person/session@machine` (list_team lists each machine's sessions under it), the
+  current session, not an old offline one with the same name. Reply to a message's `from` as given.
 - Point first, then the context they can't see (repo, branch, files). One message per need; don't ask for updates,
   wait for the reply.
 - Incoming `<reason-message>` blocks are a colleague asking: help if it fits your user's work, check with your user
