@@ -31,6 +31,8 @@ impl Daemon {
     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
     fn hook_tier(&self, agent: &str, push_failed: bool) -> Tier {
         match agent {
+            // Native Hermes queues push events, otherwise its explicit inbox tool is the reader.
+            "hermes" => Tier::Pull,
             "codex" if !push_failed && agent::find_bin("codex").is_some() => Tier::Push,
             // Their plugin or extension delivers into idle sessions; Reason's CLI sends into its sessions.
             "opencode" | "pi" | "reason" => Tier::Push,
@@ -757,6 +759,31 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    #[tokio::test]
+    async fn a_hermes_conversations_hooks_never_promise_delivery_at_its_next_turn() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        // Its plugin registers it pull (wake off), and calls hooks only for activity: they never carry mail.
+        join(&d, named("hermes:p:1", "hermes", None));
+        for event in ["prompt", "tool", "stop"] {
+            d.hook(HookCall {
+                agent: "hermes".into(),
+                event: event.into(),
+                session_id: "p:1".into(),
+                cwd: Some("/work/api".into()),
+                pid: None,
+                mail: false,
+                transcript: None,
+                doing: None,
+                name: None,
+                dirs: Vec::new(),
+                keep: false,
+            })
+            .await
+            .unwrap();
+            assert_eq!(d.inner.lock().unwrap().live["hermes:p:1"].reg.tier, Tier::Pull, "after {event}");
+        }
     }
 
     #[test]
