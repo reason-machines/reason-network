@@ -390,8 +390,9 @@ not approve. Nothing changes how an agent works when it isn't messaging.
 
 - Only roster machines can connect (iroh handshake proves the key; hook rejects the rest).
 - Peer text is framed as peer input. Agents are told not to treat it as user instructions.
-- Per-machine inbound policy: `accept` (default within the team), `hold` (you approve with
-  `reason-network held` / `reason-network approve`), `refuse`; overridable per person. Claude Code adds its own
+- Per-machine inbound policy for messages arriving from other machines: `accept` (default within the team), `hold`
+  (you approve with `reason-network held` / `reason-network approve`), `refuse`; overridable per person. Messages
+  between sessions on the same machine are delivered directly and don't pass through it. Claude Code adds its own
   `crossSessionInbound` setting on top: a session that skips permission prompts holds a message from a stranger for
   its user unless the setting is `accept`. A session without a `reason-network mcp` of its own (open before setup, or
   its server turned off or crashed) gets the daemon's post directly, as a stranger; `send` says so when the transcript
