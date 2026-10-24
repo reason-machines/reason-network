@@ -23,7 +23,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -91,6 +94,8 @@ pub struct ReasonNetworkMcp {
     claude: Arc<Mutex<Option<Arc<ClaudeSocket>>>>,
     /// The agent named by the client's `clientInfo`, once known.
     client_agent: Arc<Mutex<Option<&'static str>>>,
+    /// Gemini: it has gone by its hooks' session (so between two conversations, the next is waited for).
+    hooks_linked: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -101,6 +106,7 @@ pub async fn run() -> Result<()> {
         env_agent: agent::detect_env(),
         claude: Default::default(),
         client_agent: Default::default(),
+        hooks_linked: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
     let service = server.clone().serve(stdio()).await?;
@@ -118,11 +124,31 @@ pub async fn run() -> Result<()> {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let agent = s.agent(&peer, None);
-        if !agent::multiplexed(agent)
-            && !off_here()
-            && let Err(e) = s.session(agent, None).await
-        {
-            eprintln!("reason-network: registering session: {e:#}");
+        if agent::multiplexed(agent) || off_here() {
+            return;
+        }
+        // Gemini's hooks name its session, and can take seconds to run (PowerShell on Windows): they are waited for
+        // a while before it is registered by process.
+        let hooks = agent::session_from_hooks(agent);
+        for _ in 0..if hooks { 40 } else { 0 } {
+            if s.linked(agent).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        match s.session(agent, None).await {
+            Err(e) => eprintln!("reason-network: registering session: {e:#}"),
+            // Registered by process after all: once its hooks turn up, it goes by their session.
+            Ok(key) if hooks && key.starts_with("proc:") => {
+                for _ in 0..60 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if s.linked(agent).await.is_some() {
+                        let _ = s.session(agent, None).await;
+                        break;
+                    }
+                }
+            }
+            Ok(_) => {}
         }
     });
 
@@ -319,11 +345,20 @@ impl ReasonNetworkMcp {
         }
         let mut id = meta_id.or_else(|| agent::env_session_id(agent));
         // Gemini gives its MCP servers no session id, only its hooks: the session they registered for its process.
-        if id.is_none()
-            && agent != agent::CLAUDE_CODE
-            && let Some(pid) = agent::hook_agent_pid()
-        {
-            id = self.link.call::<Option<String>>(Request::Linked { agent: agent.into(), pid }).await.ok().flatten();
+        // Asked each time, so a new conversation in the same window (`/clear`) is followed.
+        if id.is_none() && agent::session_from_hooks(agent) {
+            id = self.linked(agent).await;
+            // Between one conversation's end and the next one's start (`/clear`): the next, a moment.
+            for _ in 0..if self.hooks_linked.load(Ordering::Relaxed) { 10 } else { 0 } {
+                if id.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                id = self.linked(agent).await;
+            }
+            if id.is_some() {
+                self.hooks_linked.store(true, Ordering::Relaxed);
+            }
         }
         let key = match &id {
             Some(id) => format!("{agent}:{id}"),
@@ -341,12 +376,25 @@ impl ReasonNetworkMcp {
             agent_session_id: id,
             // Claude Code's own process, as its registry names it: the daemon's scan of the registry matches it. None
             // when that isn't known: any other process (a parent's) would get this session ended as that one moves on.
-            pid: if agent == agent::CLAUDE_CODE { agent::claude_pid() } else { Some(agent::agent_pid()) },
+            pid: if agent == agent::CLAUDE_CODE {
+                agent::claude_pid()
+            } else if agent::session_from_hooks(agent) {
+                // The process its hooks name (past a shell), so the two are told to be one.
+                agent::agent_process()
+            } else {
+                Some(agent::agent_pid())
+            },
             tier,
             name: None,
         };
         self.link.register(reg).await?;
         Ok(key)
+    }
+
+    /// The session id the hooks of our agent process registered, if any (an older daemon doesn't know the request).
+    async fn linked(&self, agent: &str) -> Option<String> {
+        let pid = agent::agent_process()?;
+        self.link.call::<Option<String>>(Request::Linked { agent: agent.into(), pid }).await.ok().flatten()
     }
 
     /// Tool result text, plus a note about unread mail so pull-only agents notice it, and how to join a team on a

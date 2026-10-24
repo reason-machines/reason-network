@@ -155,6 +155,18 @@ fn executable(p: &Path) -> bool {
     p.is_file()
 }
 
+/// Agents that give their MCP servers no session id, only their hooks: their MCP server goes by the session the hooks
+/// of its own agent process registered. Gemini (`GEMINI_SESSION_ID` is in its hooks' env only).
+pub fn session_from_hooks(agent: &str) -> bool {
+    agent == "gemini"
+}
+
+/// The agent process we serve, as [`hook_agent_pid`] finds it for a hook: found once (each step up can run `ps`).
+pub fn agent_process() -> Option<u32> {
+    static PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *PID.get_or_init(hook_agent_pid)
+}
+
 /// The agent process behind a hook: our parent, skipping the shell some agents run hooks through.
 pub fn hook_agent_pid() -> Option<u32> {
     let mut pid = util::parent_pid();
@@ -395,6 +407,14 @@ mod tests {
         assert_eq!(registry_session_id(&dir, 4343), None);
         assert_eq!(registry_session_id(&dir, 4444), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_geminis_mcp_server_goes_by_its_hooks_session() {
+        assert!(session_from_hooks("gemini"));
+        for a in [CLAUDE_CODE, "codex", "cursor", "opencode", "copilot", "grok", "pi", "zed", ""] {
+            assert!(!session_from_hooks(a), "{a}");
+        }
     }
 
     #[test]

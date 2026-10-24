@@ -80,6 +80,18 @@ impl Daemon {
                 .collect();
             self.moved_on(g, before, now);
         }
+        // A Gemini window is in one conversation at a time: its hooks starting another (`/clear`, `/new`) end the one
+        // before, which its MCP server, outliving it, may still have. Never one registered by process (an older MCP
+        // server's).
+        if conn.is_none() && agent::session_from_hooks(&reg.agent) && reg.pid.is_some() && !g.live.contains_key(&key) {
+            let before: Vec<String> = g
+                .live
+                .iter()
+                .filter(|(k, l)| l.reg.agent == reg.agent && l.reg.pid == reg.pid && !k.starts_with("proc:"))
+                .map(|(k, _)| k.clone())
+                .collect();
+            self.moved_on(g, before, now);
+        }
         if let Some(l) = g.live.get_mut(&key) {
             // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
             if conn.is_some() {
@@ -330,7 +342,8 @@ impl Daemon {
         self.inner.lock().unwrap().off.remove(&key);
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
-            if g.live.get(&key).is_some_and(|l| l.conn.is_none())
+            // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
+            if g.live.get(&key).is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent))
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
@@ -344,24 +357,6 @@ impl Daemon {
             self.recheck_terminal(&self.my_names_elsewhere(now));
         }
         if !known {
-            // Its MCP server, which the agent gives no session id (Gemini), registered it by its process before this
-            // hook came: it is this session, which takes over from it.
-            if let Some(pid) = pid {
-                let mut g = self.inner.lock().unwrap();
-                let by_process: Vec<String> = g
-                    .live
-                    .iter()
-                    .filter(|(k, l)| k.starts_with("proc:") && l.reg.agent == agent && l.reg.pid == Some(pid))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for k in by_process {
-                    if let Some(l) = g.live.remove(&k) {
-                        let _ = g.store.touch_session(&l.name, now);
-                        log(&format!("session {} is {key}, as its hooks say", self.addr(&l.name)));
-                        self.presence_changed();
-                    }
-                }
-            }
             let remembered_cwd = self.inner.lock().unwrap().store.session_by_key(&key)?.map(|r| r.cwd);
             let cwd = cwd.or(remembered_cwd).unwrap_or_else(|| "/".into());
             let git = self.git(&cwd).await;
@@ -467,15 +462,23 @@ impl Daemon {
         Ok(key)
     }
 
-    /// The session id `agent`'s process `pid` is in, as its hooks registered it (the latest, if several): for its MCP
-    /// server, which the agent gives no session id (Gemini).
+    /// The session id `agent`'s live process `pid` is in, as its hooks registered it: for its MCP server, which the
+    /// agent gives no session id (Gemini). None unless exactly one session is its process's.
     pub(super) fn linked(&self, agent: &str, pid: u32) -> Option<String> {
-        let g = self.inner.lock().unwrap();
-        g.live
+        if !agent::session_from_hooks(agent) || !util::pid_alive(pid) {
+            return None;
+        }
+        let mut g = self.inner.lock().unwrap();
+        self.prune(&mut g);
+        let mut ids = g
+            .live
             .values()
             .filter(|l| l.reg.agent == agent && l.reg.pid == Some(pid) && !l.reg.key.starts_with("proc:"))
-            .max_by_key(|l| l.since)
-            .and_then(|l| l.reg.agent_session_id.clone())
+            .map(|l| l.reg.agent_session_id.clone());
+        match (ids.next(), ids.next()) {
+            (Some(id), None) => id,
+            _ => None,
+        }
     }
 
     pub(super) fn drop_conn(&self, conn: u64) {
@@ -1128,47 +1131,101 @@ mod tests {
         }
     }
 
+    /// A Gemini hook from process `pid`, and its MCP server registering `key` over its connection `conn`.
+    fn gemini_hook(id: &str, event: &str, pid: u32) -> HookCall {
+        HookCall { pid: Some(pid), ..gemini(id, event) }
+    }
+
+    fn gemini_mcp(d: &Daemon, conn: u64, key: &str, pid: u32) {
+        let id = key.strip_prefix("gemini:").map(str::to_string);
+        let reg = SessionReg { agent_session_id: id, pid: Some(pid), ..named(key, "gemini", None) };
+        d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap();
+    }
+
+    fn live_sessions(d: &Daemon) -> Vec<(String, String, Tier)> {
+        let g = d.inner.lock().unwrap();
+        let mut v: Vec<_> = g.live.iter().map(|(k, l)| (k.clone(), l.name.clone(), l.reg.tier)).collect();
+        v.sort();
+        v
+    }
+
+    /// A process that has exited.
+    fn gone_pid() -> u32 {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
     #[tokio::test]
-    async fn geminis_mcp_server_and_hooks_are_one_session() {
-        // Gemini gives its MCP servers no session id, only its hooks: its MCP server goes by the session its hooks
-        // registered for the same Gemini process, whichever of the two comes first.
+    async fn geminis_mcp_server_goes_by_the_session_its_hooks_registered() {
+        // Gemini gives its MCP servers no session id, only its hooks: its MCP server asks for the session the hooks of
+        // its own process registered, and registers that, which keeps its hooks' tier.
         let d = Arc::new(super::super::test_daemon(Default::default()));
-        let hook = |id: &str, pid: u32| HookCall { pid: Some(pid), ..gemini(id, "start") };
-        let mcp = |key: &str, id: Option<&str>, pid: u32| SessionReg {
-            agent_session_id: id.map(str::to_string),
-            pid: Some(pid),
-            ..named(key, "gemini", None)
-        };
-        let live = |d: &Daemon| {
-            let g = d.inner.lock().unwrap();
-            let mut v: Vec<(String, String, Tier)> =
-                g.live.iter().map(|(k, l)| (k.clone(), l.name.clone(), l.reg.tier)).collect();
-            v.sort();
-            v
-        };
-        // Its hooks first, as Gemini goes: its MCP server registers that session, which stays at its hooks' tier.
-        d.hook(hook("g1", 100)).await.unwrap();
-        assert_eq!(d.linked("gemini", 100).as_deref(), Some("g1"));
-        assert_eq!((d.linked("gemini", 101), d.linked("codex", 100)), (None, None));
-        join(&d, mcp("gemini:g1", Some("g1"), 100));
-        assert_eq!(live(&d), [("gemini:g1".into(), "api-gemini".into(), Tier::Turn)]);
-        // Its MCP server first (its hooks are slow): the hook's session takes over from the one it registered by
-        // its process, name and all.
-        join(&d, mcp("proc:7", None, 200));
-        assert_eq!(d.linked("gemini", 200), None);
-        d.hook(hook("g2", 200)).await.unwrap();
-        assert_eq!(
-            live(&d),
-            [
-                ("gemini:g1".into(), "api-gemini".into(), Tier::Turn),
-                ("gemini:g2".into(), "api-gemini-2".into(), Tier::Turn)
-            ]
-        );
-        assert_eq!(d.linked("gemini", 200).as_deref(), Some("g2"));
-        // Another process's session is never taken.
-        join(&d, mcp("proc:8", None, 300));
-        d.hook(hook("g3", 301)).await.unwrap();
-        assert!(live(&d).iter().any(|(k, ..)| k == "proc:8"));
+        let (me, other) = (std::process::id(), util::parent_pid());
+        d.hook(gemini_hook("g1", "start", me)).await.unwrap();
+        assert_eq!(d.linked("gemini", me).as_deref(), Some("g1"));
+        assert_eq!(d.linked("gemini", other), None);
+        gemini_mcp(&d, 1, "gemini:g1", me);
+        assert_eq!(live_sessions(&d), [("gemini:g1".into(), "api-gemini".into(), Tier::Turn)]);
+        // Only Gemini's: agents whose MCP calls name the session, or that share one MCP server, never ask.
+        let mut cursor = gemini_hook("c1", "start", me);
+        cursor.agent = "cursor".into();
+        d.hook(cursor).await.unwrap();
+        assert_eq!((d.linked("cursor", me), d.linked("claude-code", me), d.linked("codex", me)), (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn an_older_gemini_mcp_server_keeps_the_session_it_registered_by_process() {
+        // An MCP server from before (or one whose hooks were late) registered by its process: its hooks coming never
+        // take that key away, so it keeps working across an upgrade.
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let me = std::process::id();
+        gemini_mcp(&d, 7, "proc:7", me);
+        d.hook(gemini_hook("g2", "start", me)).await.unwrap();
+        let keys: Vec<String> = live_sessions(&d).into_iter().map(|(k, ..)| k).collect();
+        assert_eq!(keys, ["gemini:g2", "proc:7"]);
+        // A current one goes by its hooks' session from then on: over the same connection, that ends its own.
+        gemini_mcp(&d, 7, "gemini:g2", me);
+        assert_eq!(live_sessions(&d), [("gemini:g2".into(), "api-gemini-2".into(), Tier::Turn)]);
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_in_a_gemini_window_ends_the_one_before() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let me = std::process::id();
+        d.hook(gemini_hook("g1", "start", me)).await.unwrap();
+        gemini_mcp(&d, 3, "gemini:g1", me);
+        // `/clear`: SessionEnd, then SessionStart with a new id, the same MCP server throughout.
+        d.hook(gemini_hook("g1", "end", me)).await.unwrap();
+        assert_eq!(live_sessions(&d), []);
+        d.hook(gemini_hook("g2", "start", me)).await.unwrap();
+        assert_eq!(d.linked("gemini", me).as_deref(), Some("g2"));
+        gemini_mcp(&d, 3, "gemini:g2", me);
+        assert_eq!(live_sessions(&d).len(), 1);
+        // A SessionEnd that never came: the next conversation's start ends this one all the same. An older MCP
+        // server's session, registered by process, stays.
+        gemini_mcp(&d, 9, "proc:9", me);
+        d.hook(gemini_hook("g3", "start", me)).await.unwrap();
+        let keys: Vec<String> = live_sessions(&d).into_iter().map(|(k, ..)| k).collect();
+        assert_eq!(keys, ["gemini:g3", "proc:9"]);
+    }
+
+    #[tokio::test]
+    async fn no_session_is_linked_when_it_is_unclear_or_its_process_is_gone() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let me = std::process::id();
+        // Two of its process's sessions: neither is taken for the other.
+        d.hook(gemini_hook("g1", "start", me)).await.unwrap();
+        gemini_mcp(&d, 5, "gemini:g9", me);
+        assert_eq!(d.linked("gemini", me), None);
+        // A process that has exited (its id may be some other process's soon).
+        let gone = gone_pid();
+        d.hook(gemini_hook("g4", "start", gone)).await.unwrap();
+        assert_eq!(d.linked("gemini", gone), None);
     }
 
     #[tokio::test]
