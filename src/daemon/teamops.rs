@@ -132,6 +132,8 @@ impl Daemon {
         if let Ok(s) = serde_json::to_string(rem) {
             let mut g = self.inner.lock().unwrap();
             let _ = g.store.set(&format!("presence:{id}"), &s);
+            // A look through unread mail, under the lock, on every presence: only while mail from before notices is
+            // unknown, which it stops being once read or dropped.
             if g.sourceless
                 && let Err(e) = self.find_sources(&mut g)
             {

@@ -169,7 +169,7 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
-    /// Mail kept from before notices waits for a presence to tell which machine it came from (see `find_sources`).
+    /// Some mail kept from before notices doesn't say which machine it came from yet (see `find_sources`).
     sourceless: bool,
 }
 

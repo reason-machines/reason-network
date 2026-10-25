@@ -645,8 +645,9 @@ impl Store {
 
     /// Unread and held mail kept from before notices, which doesn't say which machine it came from: ids and senders.
     pub fn sourceless(&self) -> Result<Vec<(String, String)>> {
-        let mut st =
-            self.db.prepare_cached("SELECT id, sender FROM messages WHERE source IS NULL AND read_at IS NULL")?;
+        let mut st = self.db.prepare_cached(
+            "SELECT id, sender FROM messages WHERE source IS NULL AND read_at IS NULL ORDER BY rowid",
+        )?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
