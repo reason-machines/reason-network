@@ -169,6 +169,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Mail kept from before notices waits for a presence to tell which machine it came from (see `find_sources`).
+    sourceless: bool,
 }
 
 /// A session running on this machine.
@@ -259,6 +261,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                sourceless: false,
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -271,7 +274,7 @@ impl Daemon {
             plain_until: Mutex::new(None),
             capped: Default::default(),
         };
-        if let Err(e) = daemon.find_sources(&daemon.inner.lock().unwrap()) {
+        if let Err(e) = daemon.find_sources(&mut daemon.inner.lock().unwrap()) {
             log(&format!("finding where mail from before notices came from: {e:#}"));
         }
         Ok(daemon)

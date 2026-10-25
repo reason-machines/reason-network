@@ -664,10 +664,12 @@ check("…dropped once the session is forgotten, each leaves a notice for the se
       (rows, outbox))
 cli("alice", "team")
 for _ in range(60):
-    if cli("alice", "held").count("Not delivered") == 2:
+    held = cli("alice", "held")
+    if held.count("Not delivered") == 2:
         break
     time.sleep(1)
-cli("alice", "approve", "--all")  # alice holds messages from alex (the hold policy above)
+check("…which come once it is back, and are held like any mail from alex (the hold policy above)", held.count("Not delivered") == 2, held)
+cli("alice", "approve", "--all")
 codex = Mcp("alice", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "work"))
 out = codex.tool("check_inbox", {}, meta)
 for body, row in zip(bodies, rows):

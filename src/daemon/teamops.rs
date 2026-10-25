@@ -130,7 +130,13 @@ impl Daemon {
 
     pub fn save_presence(&self, id: &EndpointId, rem: &Remote) {
         if let Ok(s) = serde_json::to_string(rem) {
-            let _ = self.inner.lock().unwrap().store.set(&format!("presence:{id}"), &s);
+            let mut g = self.inner.lock().unwrap();
+            let _ = g.store.set(&format!("presence:{id}"), &s);
+            if g.sourceless
+                && let Err(e) = self.find_sources(&mut g)
+            {
+                log(&format!("finding where mail from before notices came from: {e:#}"));
+            }
         }
     }
 
