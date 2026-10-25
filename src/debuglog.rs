@@ -69,9 +69,10 @@ const SECRET_FIELDS: &[&str] = &[
 ];
 
 /// What a hidden id or secret becomes, and how much of it is enough to recognize it: 6 hex characters (24 of the
-/// code's ~41 bits), 8 of anything else.
+/// code's ~41 bits), 5 of z-base-32 (25), 8 of anything else.
 const HIDDEN: &str = "[invite]";
 const HIDDEN_HEX: usize = 6;
+const HIDDEN_Z32: usize = 5;
 const HIDDEN_PREFIX: usize = 8;
 
 /// iroh's z-base-32 alphabet (for keys in DNS names), and that length for a key.
@@ -167,8 +168,8 @@ pub fn hide(id: &iroh::EndpointId) {
     if !collecting() {
         return;
     }
-    hide_text(&id.to_string());
-    hide_text(&id.to_z32());
+    hide_from(&id.to_string(), HIDDEN_HEX);
+    hide_from(&id.to_z32(), HIDDEN_Z32);
 }
 
 /// Keeps `text` (a code, or a secret that stands for one) and any prefix of it out of the log, while it is on.
@@ -176,8 +177,15 @@ pub fn hide_text(text: &str) {
     if !collecting() {
         return;
     }
+    hide_from(text, if text.bytes().all(|b| b.is_ascii_hexdigit()) { HIDDEN_HEX } else { HIDDEN_PREFIX });
+}
+
+/// Keeps `text`, from its first `from` characters on, out of the log.
+fn hide_from(text: &str, from: usize) {
+    if !collecting() {
+        return;
+    }
     let text = text.to_ascii_lowercase();
-    let from = if text.bytes().all(|b| b.is_ascii_hexdigit()) { HIDDEN_HEX } else { HIDDEN_PREFIX };
     let mut hide = HIDE.lock().unwrap_or_else(|e| e.into_inner());
     let had = hide.as_deref().map(Vec::as_slice).unwrap_or_default();
     if text.len() >= from && text.is_ascii() && !had.iter().any(|(t, _)| *t == text) {
@@ -435,10 +443,12 @@ struct Line {
 impl Visit for Line {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         let name = field.name();
+        // A byte list cut short here becomes its length here, before a later field's `[` could hide where it ends.
         if name == "message" {
-            self.message = unquote(cap(&format!("{value:?}"), MAX_LINE), '"', 64);
+            self.message = unquote(&byte_lists(cap(&format!("{value:?}"), MAX_LINE)), '"', 64);
         } else if !secret_field(name) {
-            self.fields += &format!(" {name}={}", unquote(cap(&format!("{value:?}"), MAX_VALUE), '"', 64));
+            let value = unquote(&byte_lists(cap(&format!("{value:?}"), MAX_VALUE)), '"', 64);
+            self.fields += &format!(" {name}={value}");
         }
     }
 
@@ -618,6 +628,10 @@ fn byte_lists(line: &str) -> String {
                 n.parse::<u8>().is_ok() || n.strip_prefix("0x").is_some_and(|h| u8::from_str_radix(h, 16).is_ok())
             };
             if open_end && items.len() > 1 && !items.last().is_some_and(|n| byte(n)) {
+                // Only a number cut short; words after it mean this isn't a list.
+                if !items.last().is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit())) {
+                    return None;
+                }
                 items.pop();
             }
             let hex = items.iter().all(|n| n.strip_prefix("0x").is_some_and(|h| u8::from_str_radix(h, 16).is_ok()));
@@ -676,7 +690,14 @@ fn token(run: &str, known: &[(String, String)]) -> String {
     if let Some(id) = id(run, known) {
         return id;
     }
-    // An id may sit between `-`, `_`, `/` or `+` (`relay-<id>`): each piece is checked on its own.
+    // A field name like `mapping_varies_by_dest_ipv4`: short lowercase words, joined by `_`.
+    let field_name = run.contains('_')
+        && run.split('_').all(|w| w.len() <= 12 && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    // An encoded key or token goes whole, whatever ids it seems to hold.
+    if long_opaque(run) && !field_name {
+        return "[redacted]".into();
+    }
+    // An id may sit between `-`, `_`, `/` or `+` (`relay-<id>`), or be glued to letters: each piece is checked.
     let mut pieces = Vec::new();
     let mut from = 0;
     for (i, c) in run.char_indices().filter(|&(_, c)| "-_/+".contains(c)) {
@@ -684,23 +705,14 @@ fn token(run: &str, known: &[(String, String)]) -> String {
         from = i + c.len_utf8();
     }
     pieces.push(&run[from..]);
-    let piece_id = |p: &str| id(p, known).or_else(|| glued(p, known));
+    let piece_id = |p: &str| id(p, known).or_else(|| (!long_opaque(p)).then(|| glued(p, known)).flatten());
     if pieces.iter().any(|p| piece_id(p).is_some()) {
-        if run.contains(['+', '/']) && long_opaque(run) {
-            return "[redacted]".into();
-        }
         return pieces
             .iter()
             .map(|p| piece_id(p).unwrap_or_else(|| if long_opaque(p) { "[redacted]".into() } else { p.to_string() }))
             .collect();
     }
-    // A field name like `mapping_varies_by_dest_ipv4`: short lowercase words, joined by `_`.
-    if run.contains('_')
-        && run.split('_').all(|w| w.len() <= 12 && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
-    {
-        return run.into();
-    }
-    if long_opaque(run) { "[redacted]".into() } else { run.into() }
+    run.into()
 }
 
 /// An id, whole or its first characters: 8 or more hex digits, or a z-base-32 key. Shown, cut to 10, only if it is
@@ -723,8 +735,8 @@ fn id(piece: &str, known: &[(String, String)]) -> Option<String> {
 }
 
 /// `piece` with each id glued to letters (`v` and 20 hex characters) checked as an id: a stretch of 8 or more hex
-/// characters with a digit among them, between letters that aren't hex. Words have no digits, so none is taken for
-/// one. None if there is no such stretch.
+/// characters with both a digit and a letter among them, between letters that aren't hex, and not a `0x` number. Words
+/// have no digits and numbers no letters, so neither is taken for one. None if there is no such stretch.
 fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
     let mut out = String::with_capacity(piece.len());
     let (mut found, mut from) = (false, 0);
@@ -740,7 +752,14 @@ fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
             i += 1;
         }
         let stretch = &piece[start..i];
-        if stretch.len() >= 8 && stretch.len() < piece.len() && stretch.bytes().any(|b| b.is_ascii_digit()) {
+        let number =
+            start >= 1 && bytes[start - 1].eq_ignore_ascii_case(&b'x') && start >= 2 && bytes[start - 2] == b'0';
+        if stretch.len() >= 8
+            && stretch.len() < piece.len()
+            && stretch.bytes().any(|b| b.is_ascii_digit())
+            && stretch.bytes().any(|b| b.is_ascii_alphabetic())
+            && !number
+        {
             out += &piece[from..start];
             out += &id(stretch, known)?;
             (found, from) = (true, i);
@@ -749,13 +768,12 @@ fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
     found.then(|| out + &piece[from..])
 }
 
-/// A long run of letters and digits mixed (an encoded key, a token).
+/// A long run of letters and digits (an encoded key, a token): 24 or more with letters and digits mixed, or any of
+/// 32 or more (no word is that long).
 fn long_opaque(run: &str) -> bool {
     let n = run.len();
     let has = |f: fn(&char) -> bool| run.chars().any(|c| f(&c));
-    let (digits, upper, lower) =
-        (has(char::is_ascii_digit), has(char::is_ascii_uppercase), has(char::is_ascii_lowercase));
-    n >= 24 && digits && (upper || lower) || n >= 32 && upper && lower
+    n >= 24 && has(char::is_ascii_digit) && has(char::is_ascii_alphabetic) || n >= 32
 }
 
 #[cfg(test)]
@@ -821,12 +839,14 @@ mod tests {
         let hex = other.to_string();
         for n in [8, 10, 12, 32, 64] {
             assert_eq!(scrub_with(&format!("x={}", &hex[..n]), &[], &known), "x=[id]", "{n}");
-            // Also between `-`, `_`, `/` or `+` (where base64 can be, a long run goes whole).
+            // Also between `-`, `_`, `/` or `+`; in a long run, the whole run goes.
             for sep in ["-", "_", "/", "+"] {
                 let out = scrub_with(&format!("x=relay{sep}{}{sep}b", &hex[..n]), &[], &known);
                 assert!(!out.contains(&hex[..8]), "{n} {sep}: {out}");
-                if "-_".contains(sep) {
+                if n <= 12 {
                     assert_eq!(out, format!("x=relay{sep}[id]{sep}b"), "{n} {sep}");
+                } else {
+                    assert_eq!(out, "x=[redacted]", "{n} {sep}");
                 }
             }
         }
@@ -891,9 +911,9 @@ mod tests {
             out.contains("bound id=[invite]") && out.contains("_iroh.[invite].dns"),
             "the invite id isn't replaced"
         );
-        // From 6 hex characters on.
-        let six = scrub_with(&format!("x={} y={}", &hex[..6], &secret[..6]), &hide, &[]);
-        assert_eq!(six, "x=[invite] y=[invite]", "a 6-character prefix isn't hidden");
+        // From 6 hex characters on, and 5 of z-base-32.
+        let six = scrub_with(&format!("x={} y={} z={}", &hex[..6], &secret[..6], &z32[..5]), &hide, &[]);
+        assert_eq!(six, "x=[invite] y=[invite] z=[invite]", "a short prefix isn't hidden");
     }
 
     #[test]
@@ -997,7 +1017,7 @@ mod tests {
     }
     static SITE: Site = Site;
     static FIELD: tracing_core::field::FieldSet =
-        tracing_core::field::FieldSet::new(&["data"], tracing_core::identify_callsite!(&SITE));
+        tracing_core::field::FieldSet::new(&["data", "frame", "peer"], tracing_core::identify_callsite!(&SITE));
 
     #[test]
     fn only_the_networking_librarys_events_are_kept() {
@@ -1175,5 +1195,60 @@ mod tests {
         // Words, and short numbers in them, stay.
         let words = "established connection via relay-sfo1 ipv4 Ipv6Addr v12 rtt=28.369875ms";
         assert_eq!(scrub_with(words, &[], &known), words);
+    }
+
+    /// A deterministic stream of pseudo-random numbers.
+    fn xorshift(mut seed: u64) -> impl FnMut() -> u64 {
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        }
+    }
+
+    #[test]
+    fn a_long_token_goes_whole_whatever_ids_it_seems_to_hold() {
+        let mut next = xorshift(0x9e3779b97f4a7c15);
+        let mut from = |alphabet: &str, n: usize| -> String {
+            let a: Vec<char> = alphabet.chars().collect();
+            (0..n).map(|_| a[(next() % a.len() as u64) as usize]).collect()
+        };
+        let base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let ticket = from(base32, 96);
+        for token in [
+            "v1234abcd9XyZsEcReTtOkEnQwErTy0987654321abcdefXYZ".to_string(),
+            ticket,
+            format!("Zm9v0123abcd4567efGh+/{}", from("abcdefghijklmnopqrstuvwxyz", 20)),
+        ] {
+            assert_eq!(none(&format!("token={token} next")), "token=[redacted] next", "{token}");
+        }
+        // Random keys and tokens never come out partly: only whole, as [redacted] (or as an id they are).
+        let me = iroh::SecretKey::generate().public();
+        let known = [(me.to_string(), me.to_z32())];
+        let alphabets = [
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+            base32,
+            "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
+        ];
+        for i in 0..6000 {
+            let n = 32 + (i * 7919) % 269;
+            let token = from(alphabets[i % 3], n);
+            let out = scrub_with(&format!("token={token} next"), &[], &known);
+            let whole = ["[redacted]", "[id]", "[invite]", "[ticket]"].map(|w| format!("token={w} next"));
+            assert!(whole.contains(&out), "{token} -> {out}");
+        }
+    }
+
+    #[test]
+    fn numbers_and_cut_lists_stay_readable() {
+        assert_eq!(none("elapsed=1.234567891s ptr=0x1234abcd"), "elapsed=1.234567891s ptr=0x1234abcd");
+        assert_eq!(none("x [5, 7, rest of the line"), "x [5, 7, rest of the line");
+        // A list cut at a field's limit becomes its length there, though a later field has a `[`.
+        let mut line = Line::default();
+        line.record_debug(&FIELD.field("frame").unwrap(), &vec![7u8; 3000]);
+        line.record_debug(&FIELD.field("peer").unwrap(), &format_args!("[::1]:4433"));
+        let out = none(&line.fields);
+        assert!(out.starts_with(" frame=[<") && out.ends_with(" peer=[::1]:4433") && !out.contains("7, 7"), "{out}");
     }
 }
