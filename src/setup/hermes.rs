@@ -43,9 +43,31 @@ fn source() -> Option<PathBuf> {
     if bundled.join("hermes_cli").is_dir() {
         return Some(bundled);
     }
-    let out =
-        Command::new(agent::find_bin("hermes")?).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
-    String::from_utf8_lossy(&out.stdout)
+    let mut version = Command::new(agent::find_bin("hermes")?);
+    version.arg("--version");
+    install_dir(version)
+}
+
+/// The `Install directory:` a Hermes command reports, waiting at most a few seconds for it.
+fn install_dir(mut command: Command) -> Option<PathBuf> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+        let _ = tx.send(out);
+    });
+    // A Hermes that hangs on `--version` (or leaves something holding its output) mustn't hang setup, init and join.
+    let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    String::from_utf8_lossy(&out.ok()?)
         .lines()
         .find_map(|l| l.trim().strip_prefix("Install directory:"))
         .map(|p| PathBuf::from(p.trim()))
@@ -176,6 +198,21 @@ mod tests {
     use super::*;
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!("reason-hermes-{}", ulid::Ulid::generate()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hermes_that_hangs_on_version_does_not_hang_setup() {
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        assert_eq!(install_dir(sh("echo 'Install directory: /opt/hermes'")), Some(PathBuf::from("/opt/hermes")));
+        let started = std::time::Instant::now();
+        // The shell's `sleep` keeps the output open after the shell itself is killed.
+        assert_eq!(install_dir(sh("echo 'Install directory: /opt/hermes'; sleep 30")), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
     }
 
     #[test]

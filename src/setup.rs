@@ -1207,14 +1207,6 @@ fn me(exe: &Path) -> String {
 
 const AGENTS: [Agent; 12] = [
     Agent {
-        id: "hermes",
-        name: "Hermes",
-        hint: "native plugin; enable it in each Hermes profile",
-        installed: hermes::installed,
-        wired: hermes::wired,
-        apply: hermes::apply,
-    },
-    Agent {
         id: "claude",
         name: "Claude Code",
         hint: "messages arrive instantly",
@@ -1316,6 +1308,14 @@ const AGENTS: [Agent; 12] = [
         installed: || agent::find_bin("reason").is_some(),
         wired: |_| Config::load().reason,
         apply: reason,
+    },
+    Agent {
+        id: "hermes",
+        name: "Hermes",
+        hint: "native plugin; enable it in each Hermes profile",
+        installed: hermes::installed,
+        wired: hermes::wired,
+        apply: hermes::apply,
     },
 ];
 

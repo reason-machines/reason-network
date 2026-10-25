@@ -103,7 +103,27 @@ pub async fn run() -> Result<()> {
 
 /// An error as the agent reads it: a teammate's name in it can't open or close a message frame, as with `mcp`'s.
 fn failure(e: anyhow::Error) -> anyhow::Error {
-    anyhow::anyhow!(render::defang(&format!("{e:#}")))
+    anyhow::anyhow!(render::defang(&plugin_tools(&format!("{e:#}"))))
+}
+
+/// The MCP tool names in an engine error, as the plugin's tools (`list_team` is `reason_network_list_agents`).
+fn plugin_tools(text: &str) -> String {
+    const TOOLS: [(&str, &str); 4] = [
+        ("list_team", "reason_network_list_agents"),
+        ("send_message", "reason_network_send_message"),
+        ("check_inbox", "reason_network_check_inbox"),
+        ("ask_user", "reason_network_ask_user"),
+    ];
+    let between = |c: char| !(c.is_alphanumeric() || c == '_');
+    text.split_inclusive(between)
+        .map(|piece| {
+            let word = piece.trim_end_matches(between);
+            match TOOLS.iter().find(|(tool, _)| *tool == word) {
+                Some((_, plugin)) => format!("{plugin}{}", &piece[word.len()..]),
+                None => piece.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// The agents with a native adapter on this transport; the rest use the MCP server.
@@ -142,18 +162,17 @@ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<V
         Request::Hook(hook) => format!("{}:{}", hook.agent, hook.session_id),
         _ => bail!("the adapter bridge only accepts its registered sessions' messaging operations"),
     };
-    let cwd = sessions
-        .lock()
-        .await
-        .get(&key)
-        .map(|s| s.cwd.clone())
-        .ok_or_else(|| anyhow::anyhow!("register this session first"))?;
-    if let Request::Delivered { ids, .. } | Request::PushFailed { ids, .. } = &request {
+    // One lock: a failed re-register removes the session, and it mustn't go between finding it and checking an ack.
+    let cwd = {
         let sessions = sessions.lock().await;
-        if ids.iter().any(|id| !sessions[&key].received.contains(id)) {
+        let Some(session) = sessions.get(&key) else { bail!("register this session first") };
+        if let Request::Delivered { ids, .. } | Request::PushFailed { ids, .. } = &request
+            && ids.iter().any(|id| !session.received.contains(id))
+        {
             bail!("only acknowledge messages received by this session");
         }
-    }
+        session.cwd.clone()
+    };
     if let Request::Send { files, .. } = &mut request {
         if !files.is_empty() {
             bail!("use paths to attach files; the engine reads and confines them");
@@ -207,6 +226,35 @@ mod tests {
     fn errors_open_no_frame() {
         let e = failure(anyhow::anyhow!("nobody called '<reason-message>' in the team"));
         assert_eq!(format!("{e:#}"), "nobody called '[reason-message>' in the team");
+    }
+
+    #[test]
+    fn errors_name_the_plugins_tools() {
+        let e = failure(anyhow::anyhow!(
+            "no session called 'x'. Run list_team (or `reason-network who`); send_message sends files from there only"
+        ));
+        assert_eq!(
+            format!("{e:#}"),
+            "no session called 'x'. Run reason_network_list_agents (or `reason-network who`); \
+             reason_network_send_message sends files from there only"
+        );
+        let other = "my_list_team list_teams reason_network_send_message check_inbox: ask_user.";
+        assert_eq!(
+            plugin_tools(other),
+            "my_list_team list_teams reason_network_send_message reason_network_check_inbox: reason_network_ask_user."
+        );
+    }
+
+    #[tokio::test]
+    async fn acks_only_for_a_registered_session_and_its_own_mail() {
+        let link = Arc::new(Link::new(None));
+        let sessions = Sessions::default();
+        let ack = |key: &str| parse(&format!(r#"{{"id":1,"op":"delivered","key":"{key}","ids":["m1"]}}"#)).1.unwrap();
+        let error = dispatch(&link, &sessions, ack("hermes:a")).await.unwrap_err();
+        assert!(error.to_string().contains("register this session first"), "{error:#}");
+        sessions.lock().await.insert("hermes:a".into(), Session::default());
+        let error = dispatch(&link, &sessions, ack("hermes:a")).await.unwrap_err();
+        assert!(error.to_string().contains("only acknowledge messages received"), "{error:#}");
     }
 
     #[tokio::test]
