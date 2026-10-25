@@ -445,7 +445,7 @@ mod tests {
         let text = super::instructions();
         assert!(text.contains("- Message only when") && text.contains("say briefly if you can't."), "{text}");
         assert!(text.contains("- One task per session:") && text.contains("`person/session@machine`"), "{text}");
-        assert!(text.contains("- If that session is on a different task (a `doing:` line under it"), "{text}");
+        assert!(text.contains("- If the session you'd give a new task to is on another one (a `doing:`"), "{text}");
         assert!(text.contains("Reply to a message's `from` as given."), "{text}");
     }
 }

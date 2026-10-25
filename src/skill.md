@@ -38,8 +38,8 @@ to join.
   machine: prefer your harness's own messaging.
 - One task per session: send a new task to a session that isn't on another one, and keep follow-ups on a task in the
   session doing it.
-- If that session is on a different task (a `doing:` line under it in list_team), even one that shows idle, don't
-  send into it: ask your user to get a new session started for yours.
+- If the session you'd give a new task to is on another one (a `doing:` line under it in list_team, `↳` in `who`),
+  even if it shows idle, don't send into it: ask your user to get a new session started for yours.
 - To start a conversation, send to `person/session@machine` (list_team lists each machine's sessions under it), the
   current session, not an old offline one with the same name. Reply to a message's `from` as given.
 - Point first, then the context they can't see (repo, branch, files). One message per need; don't ask for updates,
