@@ -256,6 +256,29 @@ mod tests {
         let _ = std::fs::remove_file(&pid);
     }
 
+    /// On Windows a pip or uv `hermes.exe` launcher runs Python as its child: ending the launcher alone would leave it.
+    #[cfg(windows)]
+    #[test]
+    fn giving_up_ends_what_the_command_started() {
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut Vec::new());
+            let _ = tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        kill_tree(&mut child);
+        let _ = child.wait();
+        // `ping` holds the output open until it's gone too.
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "ping outlived cmd");
+    }
+
     #[test]
     fn install_and_remove_are_idempotent_and_never_rewrite_config() {
         let root = temp();
