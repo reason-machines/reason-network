@@ -509,9 +509,8 @@ impl Daemon {
         let this = self.clone();
         tokio::spawn(async move {
             let run = async {
-                let (program, first) = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
-                let out = tokio::process::Command::new(program)
-                    .args(&first)
+                let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
+                let out = tokio::process::Command::from(program)
                     .args(&args)
                     .arg(&text)
                     .stdin(std::process::Stdio::null())

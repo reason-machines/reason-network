@@ -106,7 +106,8 @@ fn failure(e: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(render::defang(&plugin_tools(&format!("{e:#}"))))
 }
 
-/// The MCP tool names in an engine error, as the plugin's tools (`list_team` is `reason_network_list_agents`).
+/// The MCP tool names in an engine error, as the plugin's tools (`list_team` is `reason_network_list_agents`). Not
+/// where one is part of a name or path the error quotes (`'send_message-claude'`, `notes/check_inbox.md`).
 fn plugin_tools(text: &str) -> String {
     const TOOLS: [(&str, &str); 4] = [
         ("list_team", "reason_network_list_agents"),
@@ -114,16 +115,27 @@ fn plugin_tools(text: &str) -> String {
         ("check_inbox", "reason_network_check_inbox"),
         ("ask_user", "reason_network_ask_user"),
     ];
-    let between = |c: char| !(c.is_alphanumeric() || c == '_');
-    text.split_inclusive(between)
-        .map(|piece| {
-            let word = piece.trim_end_matches(between);
-            match TOOLS.iter().find(|(tool, _)| *tool == word) {
-                Some((_, plugin)) => format!("{plugin}{}", &piece[word.len()..]),
-                None => piece.to_string(),
-            }
-        })
-        .collect()
+    let part = |c: char| c.is_alphanumeric() || c == '_';
+    let joins = |c: Option<char>| c.is_some_and(|c| matches!(c, '/' | '\\' | '\'' | '"' | '-' | '.'));
+    let mut out = String::with_capacity(text.len());
+    let (mut done, mut at) = (0, 0);
+    while let Some(start) = text[at..].find(part).map(|n| at + n) {
+        let end = text[start..].find(|c| !part(c)).map_or(text.len(), |n| start + n);
+        let mut after = text[end..].chars();
+        let next = after.next();
+        // A full stop ends a sentence; one followed by more of a word starts an extension.
+        let joined = joins(text[..start].chars().next_back())
+            || (next != Some('.') && joins(next))
+            || (next == Some('.') && after.next().is_some_and(part));
+        if !joined && let Some((_, plugin)) = TOOLS.iter().find(|(tool, _)| *tool == &text[start..end]) {
+            out.push_str(&text[done..start]);
+            out.push_str(plugin);
+            done = end;
+        }
+        at = end;
+    }
+    out.push_str(&text[done..]);
+    out
 }
 
 /// The agents with a native adapter on this transport; the rest use the MCP server.
@@ -243,6 +255,10 @@ mod tests {
             plugin_tools(other),
             "my_list_team list_teams reason_network_send_message reason_network_check_inbox: reason_network_ask_user."
         );
+        // Names and paths the error quotes keep theirs.
+        let quoted =
+            "'send_message' \"ask_user\" notes/check_inbox.md send_message-claude list_team.txt x-ask_user é.list_team";
+        assert_eq!(plugin_tools(quoted), quoted);
     }
 
     #[tokio::test]

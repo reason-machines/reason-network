@@ -50,27 +50,47 @@ fn source() -> Option<PathBuf> {
 
 /// The `Install directory:` a Hermes command reports, waiting at most a few seconds for it.
 fn install_dir(mut command: Command) -> Option<PathBuf> {
-    let mut child = command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    // In its own process group, so giving up on it ends what it started too (a launcher's Python, a shell's `sleep`).
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
-        let _ = tx.send(out);
+        let found = std::io::BufRead::lines(std::io::BufReader::new(stdout))
+            .map_while(Result::ok)
+            .find_map(|l| l.trim().strip_prefix("Install directory:").map(|p| PathBuf::from(p.trim())));
+        let _ = tx.send(found);
     });
     // A Hermes that hangs on `--version` (or leaves something holding its output) mustn't hang setup, init and join.
-    let out = rx.recv_timeout(std::time::Duration::from_secs(5));
-    let _ = child.kill();
+    let found = rx.recv_timeout(std::time::Duration::from_secs(5)).ok().flatten();
+    kill_tree(&mut child);
     let _ = child.wait();
-    String::from_utf8_lossy(&out.ok()?)
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Install directory:"))
-        .map(|p| PathBuf::from(p.trim()))
+    found
+}
+
+/// Ends `child` and everything it started: its process group on Unix, its process tree on Windows.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: signals the process group `install_dir` created for this child, which isn't reaped yet.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let taskkill = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from("taskkill.exe"), |r| PathBuf::from(r).join(r"System32\taskkill.exe"));
+        let _ = Command::new(taskkill)
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    let _ = child.kill();
 }
 
 /// The plugin context methods the plugin needs (NousResearch/hermes-agent#143310), wherever in `hermes_cli` they are.
@@ -209,10 +229,31 @@ mod tests {
             c
         };
         assert_eq!(install_dir(sh("echo 'Install directory: /opt/hermes'")), Some(PathBuf::from("/opt/hermes")));
+        // The line is used as soon as it's there, and what's still running is ended, including its children.
+        let pid = temp();
         let started = std::time::Instant::now();
-        // The shell's `sleep` keeps the output open after the shell itself is killed.
-        assert_eq!(install_dir(sh("echo 'Install directory: /opt/hermes'; sleep 30")), None);
+        let script = format!("sleep 30 & echo $! > {}; echo 'Install directory: /opt/hermes'; wait", pid.display());
+        assert_eq!(install_dir(sh(&script)), Some(PathBuf::from("/opt/hermes")));
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+        let gone = |pid: &PathBuf| {
+            let sleep: libc::pid_t = std::fs::read_to_string(pid).unwrap().trim().parse().unwrap();
+            // SAFETY: signal 0 only checks that the process exists.
+            (0..50).any(|_| {
+                let alive = unsafe { libc::kill(sleep, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            })
+        };
+        assert!(gone(&pid), "the sleep outlived the probe");
+        // Nothing said: given up on after a few seconds, and ended the same way.
+        let started = std::time::Instant::now();
+        let script = format!("sleep 30 & echo $! > {}; wait", pid.display());
+        assert_eq!(install_dir(sh(&script)), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+        assert!(gone(&pid), "the sleep outlived the probe");
+        let _ = std::fs::remove_file(&pid);
     }
 
     #[test]

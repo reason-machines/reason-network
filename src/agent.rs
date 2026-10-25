@@ -144,28 +144,44 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
         .find(|p| executable(p))
 }
 
-/// How to run `name`: the program, and the arguments that go before the caller's. On Windows the `<name>.cmd` npm
-/// (or pnpm) installs runs through cmd.exe, which can't be handed an argument with a line break (Rust refuses one rather
-/// than let cmd.exe cut it short), and a message has them: its Node script is run with node instead, when the shim
-/// names one.
-pub fn command_for(name: &str) -> Option<(PathBuf, Vec<PathBuf>)> {
-    let bin = find_bin(name)?;
+/// How to run `name`, for the caller to add its arguments to. On Windows the `<name>.cmd` npm (or pnpm) installs runs
+/// through cmd.exe, which can't be handed an argument with a line break (Rust refuses one rather than let cmd.exe cut it
+/// short), and a message has them: its Node script is run with node instead, when the shim names one.
+pub fn command_for(name: &str) -> Option<std::process::Command> {
+    find_bin(name).map(|bin| command_at(&bin))
+}
+
+/// [`command_for`] for the program at `bin`.
+fn command_at(bin: &Path) -> std::process::Command {
     #[cfg(windows)]
     if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
         && let Some(dir) = bin.parent()
-        && let Some(run) = std::fs::read_to_string(&bin).ok().and_then(|shim| node_shim(&shim, dir))
+        && let Some((node, script)) = std::fs::read_to_string(bin).ok().and_then(|shim| node_shim(&shim, dir))
     {
-        return Some(run);
+        let mut command = std::process::Command::new(node);
+        command.args(script);
+        return command;
     }
-    Some((bin, vec![]))
+    std::process::Command::new(bin)
 }
 
 /// Node and the script an npm or pnpm `.cmd` shim in `dir` runs (`"%dp0%\\node_modules\\…\\codex.js" %*`): the node
 /// beside the shim if there is one, as the shim itself prefers, else the one on `PATH`. Only when the shim runs that
-/// script with node and nothing else in between (no flags, not bun): any other shim is left to run as it is.
+/// script with node and nothing else in between (no flags, not bun), and sets nothing in the environment but its own
+/// bookkeeping (`dp0`, `_prog`, `PATHEXT`, `NODE_PATH`): any other shim is left to run as it is.
 #[cfg(any(windows, test))]
 fn node_shim(shim: &str, dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     let lower = shim.to_ascii_lowercase();
+    // Running node directly would skip whatever else the shim sets for it.
+    let sets_more = lower.split(['\n', '&', '(']).any(|part| {
+        let part = part.trim().trim_start_matches('@');
+        let Some(set) = part.strip_prefix("set ").or_else(|| part.strip_prefix("set\t")) else { return false };
+        let name = set.trim_start().trim_start_matches('"').split('=').next().unwrap_or_default().trim();
+        !["dp0", "_prog", "pathext", "node_path"].contains(&name)
+    });
+    if sets_more {
+        return None;
+    }
     let script = shim.match_indices('"').find_map(|(at, _)| {
         let part = shim[at + 1..].split('"').next()?;
         let rest = part.strip_prefix("%dp0%\\").or_else(|| part.strip_prefix("%~dp0\\"))?;
@@ -576,15 +592,34 @@ mod tests {
         );
         let flags = npm.replace("\"%_prog%\"  \"%dp0%", "\"%_prog%\" --no-warnings \"%dp0%");
         assert_eq!(node_shim(&flags, d.as_path()), None);
+        // pnpm's NODE_PATH is fine to skip; a shim that sets anything else is left to set it.
+        let node_path =
+            format!("@SETLOCAL\r\n@IF NOT DEFINED NODE_PATH (\r\n  @SET \"NODE_PATH=C:\\x\"\r\n)\r\n{plain}");
+        assert!(node_shim(&node_path, &sub).is_some());
+        for set in ["@SET \"NODE_OPTIONS=--max-old-space-size=8192\"", "SET CODEX_HOME=C:\\c", "set /a n=1"] {
+            assert_eq!(node_shim(&format!("@SETLOCAL\r\n{set}\r\n{plain}"), &sub), None, "{set}");
+        }
+        assert_eq!(node_shim(&format!("@SETLOCAL\r\nIF 1==1 (SET X=1)\r\n{plain}"), &sub), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn a_program_that_is_not_a_cmd_shim_runs_as_it_is() {
+        let bin = std::env::temp_dir().join("codex");
+        let command = command_at(&bin);
+        assert_eq!(command.get_program(), bin.as_os_str());
+        assert_eq!(command.get_args().count(), 0);
+    }
+
     /// The point of it, on Windows itself: a message with line breaks and cmd.exe's special characters reaches the
-    /// script npm installed, as it was sent.
+    /// script npm installed, as it was sent, through the command delivery runs.
     #[cfg(windows)]
     #[test]
     fn a_message_with_line_breaks_reaches_an_npm_installed_script() {
-        let Some(node) = find_bin("node") else { return };
+        let Some(node) = find_bin("node") else {
+            assert!(std::env::var_os("CI").is_none(), "CI must run this with node installed");
+            return;
+        };
         let d = std::env::temp_dir().join(format!("reason-network-shim-run-{}", ulid::Ulid::generate()));
         let bin = d.join("node_modules").join("x").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -596,10 +631,11 @@ mod tests {
         .unwrap();
         let shim =
             "@ECHO off\r\nSETLOCAL\r\nSET \"_prog=node\"\r\n\"%_prog%\"  \"%dp0%\\node_modules\\x\\bin\\x.js\" %*\r\n";
-        let (prog, pre) = node_shim(shim, &d).unwrap();
-        assert_eq!(prog, node);
+        std::fs::write(d.join("x.cmd"), shim).unwrap();
+        let mut command = command_at(&d.join("x.cmd"));
+        assert_eq!(command.get_program(), node.as_os_str());
         let text = "<reason-message from=\"a\">\r\nline & two %PATH% ^ | < > \"quoted\"\n</reason-message>";
-        let status = std::process::Command::new(prog).args(&pre).args(["queue", "--message", text]).status().unwrap();
+        let status = command.args(["queue", "--message", text]).status().unwrap();
         assert!(status.success());
         let got: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(got, ["queue", "--message", text]);
