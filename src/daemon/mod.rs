@@ -52,6 +52,12 @@ pub async fn run(service: bool) -> Result<()> {
         log("another daemon is already running");
         return Ok(());
     };
+    if Config::load().debug_log {
+        match crate::debuglog::start() {
+            Ok(()) => log(&format!("debug log on: {}", crate::debuglog::path().display())),
+            Err(e) => log(&format!("debug log not started: {e}")),
+        }
+    }
     let mut listener = ipc::Listener::bind()?;
     let daemon = Arc::new(Daemon::open()?);
     log(&format!("listening on {} as {}@{}", paths::socket().display(), daemon.person, daemon.machine));

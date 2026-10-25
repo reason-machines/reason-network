@@ -24,6 +24,10 @@ pub struct Config {
     /// random one each start. Taken by something else, a random one is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Write the networking library's events to `debug.log`, on this machine only, to work out why connections drop
+    /// (read when the daemon starts). Off by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub debug_log: bool,
     pub inbound: Inbound,
     /// Folders whose sessions stay off the network, e.g. `"~/personal" = "off"` (`reason-network folder`). The deepest
     /// entry that holds a session's folder decides; `off` is the only value so far.
@@ -68,6 +72,7 @@ impl Default for Config {
             reason: false,
             auto_update: true,
             port: None,
+            debug_log: false,
             inbound: Inbound::default(),
             folders: BTreeMap::new(),
         }

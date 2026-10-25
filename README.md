@@ -109,6 +109,10 @@ It is bound on IPv4 and IPv6 (IPv4 alone on a computer without IPv6). If another
 daemon logs that and uses a random port, as without it; `port = 0` is the same as leaving it out.
 `reason-network doctor` shows the port in use. Relays work the same either way.
 
+To work out why connections drop or switch to a relay, `debug_log = true` (also at the top) makes the daemon write the
+networking library's events to `~/.reason/network/debug.log`, on this computer only and without message text, links
+or keys. It's off by default; see [DESIGN.md](DESIGN.md#troubleshooting).
+
 ## Uninstall
 
 ```sh

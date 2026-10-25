@@ -504,6 +504,7 @@ edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/c
 | `lan` | `true` | find teammates on the local network (mDNS) |
 | `auto_update` | `true` | install new releases when they come out (checked every few hours) |
 | `reason` | `false` | list your live Reason sessions (set by `reason-network setup`) |
+| `debug_log` | `false` | write the networking library's events to `debug.log`, on this computer only (read when the daemon starts) |
 | `inbound` | accept | see above |
 | `folders` | none | folders whose sessions are never shared, e.g. `"~/personal" = "off"` (`reason-network folder <path> off`, `on` undoes it) |
 
@@ -537,3 +538,9 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
 - **Codex sessions don't show up until they use a Reason Network tool:** Codex hasn't been told to trust the hooks yet;
   run `/hooks` in Codex.
 - Logs: `~/.reason/network/daemon.log`.
+- **Connections drop or keep switching to a relay:** set `debug_log = true` at the top of `config.toml` and run
+  `reason-network stop` (the service starts it again). The daemon then also writes iroh's own events (path changes,
+  time-outs, QUIC errors, at debug level) and its own network lines to `~/.reason/network/debug.log`. It stays on your
+  computer, readable only by you, and starts over past 4 MB, keeping the previous one as `debug.log.1`. It never holds
+  message text, files, team links or keys; it does hold computer ids and IP addresses, so look it over before you share
+  it. Remove the line and stop the daemon again to turn it off.

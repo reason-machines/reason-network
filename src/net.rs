@@ -550,6 +550,7 @@ impl AddressLookup for NoRelays {
 
 fn log(msg: &str) {
     eprintln!("[{}] net: {msg}", util::now_ms());
+    crate::debuglog::ours("net", msg);
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, v: &T) -> Result<()> {

@@ -151,6 +151,7 @@ pub async fn refresh() {
 
 fn log(msg: &str) {
     eprintln!("[{}] relays: {msg}", crate::util::now_ms());
+    crate::debuglog::ours("relays", msg);
 }
 
 async fn refresh_in(home: &Path, url: &str) -> Result<()> {

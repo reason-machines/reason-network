@@ -5,6 +5,7 @@ mod client;
 mod codex;
 mod config;
 mod daemon;
+mod debuglog;
 mod doing;
 mod files;
 mod git;

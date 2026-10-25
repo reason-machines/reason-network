@@ -2783,6 +2783,7 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "tracing-core",
  "tray-icon",
  "ulid",
  "windows-sys 0.61.2",

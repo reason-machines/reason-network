@@ -138,6 +138,11 @@ def link_secret(link):
 
 os.makedirs(os.path.join(D, "work"), exist_ok=True)
 
+# alice's machine keeps the debug log; alex's doesn't, as by default.
+os.makedirs(H["alice"], exist_ok=True)
+with open(os.path.join(H["alice"], "config.toml"), "w") as f:
+    f.write("debug_log = true\n")
+
 # --- team formation, signed in with Reason ---
 ep = {who: cli(who, "endpoint") for who in H}
 check("endpoint prints this machine's id, before any team", all(re.fullmatch(r"[0-9a-f]{64}", e) for e in ep.values()), ep)
@@ -654,6 +659,23 @@ check("folder <path> on puts it back", "Reason Network is on in" in out and "pri
 claude.close()
 cli("alex", "stop")
 cli("alice", "stop")
+
+# --- the debug log: the networking library's events, on alice's machine only, with nothing anyone wrote ---
+dbg = os.path.join(H["alice"], "debug.log")
+text = open(dbg, errors="replace").read() if os.path.exists(dbg) else ""
+check("debug_log = true writes the networking library's events to debug.log",
+      re.search(r"^\[\d+\] (DEBUG|INFO|WARN|ERROR) (iroh|noq)", text, re.M) is not None, text[:500])
+check("…and the daemon's own network lines", "net: connected to" in text, text[:500])
+check("…readable by its owner only", os.name == "nt" or os.stat(dbg).st_mode & 0o777 == 0o600, dbg)
+check("without debug_log, no debug log", not os.path.exists(os.path.join(H["alex"], "debug.log")))
+key = open(os.path.join(H["alice"], "machine.key"), "rb").read()
+said = ["hello from alex's terminal", "dinner at 8?", "can you approve the deploy?", "codex here", "yes, ship it",
+        "first words from a new session", "answered at once", "broadcast", "sent while you were offline",
+        "from an agent's shell there", "cross-machine push", "line two", '"port": 8080', "q" * 64]
+held = [link.group(1), link.group(1).split("#", 1)[1], link_secret(link.group(1)), "rn1-", "tincan1", "/join/#",
+        key.hex(), base64.b64encode(key).decode().rstrip("="), base64.urlsafe_b64encode(key).decode().rstrip("="), "eyJ"]
+found = [s for s in said + held if s in text]
+check("…with no message text, file, link, ticket, key or sign-in proof in it", not found, found)
 log = open(UNEXPECTED).read() if os.path.exists(UNEXPECTED) else ""
 check("nothing opened a browser or reached the real notifications", log == "", log)
 print(f"\n{sum(results)}/{len(results)} checks passed  (state in {D})")
