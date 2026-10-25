@@ -1441,11 +1441,12 @@ mod tests {
             ("01SENT", |s, id| s.drop_outbox(id, None).map(|_| ()), "messages"),
         ];
         for (id, drop, noticed_in) in cases {
-            // The notice can't be written: only the drop writes to that table, and only its notice.
+            // The notice is written, then fails: only the drop writes to that table, and only its notice. Only the
+            // drop's transaction can take that row back (FAIL keeps what the statement did).
             store
                 .db
                 .execute_batch(&format!(
-                    "CREATE TEMP TRIGGER fail BEFORE INSERT ON {noticed_in} BEGIN SELECT RAISE(ABORT, 'injected'); END"
+                    "CREATE TEMP TRIGGER fail AFTER INSERT ON {noticed_in} BEGIN SELECT RAISE(FAIL, 'injected'); END"
                 ))
                 .unwrap();
             let before = (rows("messages"), rows("outbox"));
