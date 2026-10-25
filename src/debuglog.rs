@@ -514,16 +514,23 @@ fn scrub_with(line: &str, hide: &[(String, usize)], known: &[(String, String)]) 
     tokens(&byte_lists(&credentials(&urls(&hidden(line, hide)))), known)
 }
 
+/// Each hidden text, from its first `from` characters on, where a run of letters and digits starts: every form iroh
+/// prints an id in (`id=…`, `PublicKey(…`, `_iroh.….`), never a chance match inside a word (`conne[invite]` would tell
+/// a reader the start of the key).
 fn hidden(line: &str, hide: &[(String, usize)]) -> String {
     let mut line = line.to_string();
     for (text, from) in hide {
         let lower = line.to_ascii_lowercase();
-        let (mut out, mut done) = (String::with_capacity(line.len()), 0);
-        while let Some(at) = lower[done..].find(&text[..*from]).map(|i| i + done) {
+        let (mut out, mut done, mut seek) = (String::with_capacity(line.len()), 0, 0);
+        while let Some(at) = lower[seek..].find(&text[..*from]).map(|i| i + seek) {
+            if at > 0 && lower.as_bytes()[at - 1].is_ascii_alphanumeric() {
+                seek = at + 1;
+                continue;
+            }
             let end = at + lower[at..].bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
             out += &line[done..at];
             out += HIDDEN;
-            done = end;
+            (done, seek) = (end, end);
         }
         out += &line[done..];
         line = out;
@@ -735,8 +742,9 @@ fn id(piece: &str, known: &[(String, String)]) -> Option<String> {
 }
 
 /// `piece` with each id glued to letters (`v` and 20 hex characters) checked as an id: a stretch of 8 or more hex
-/// characters with both a digit and a letter among them, between letters that aren't hex, and not a `0x` number. Words
-/// have no digits and numbers no letters, so neither is taken for one. None if there is no such stretch.
+/// characters with both a digit and a letter among them, between letters that aren't hex, and not a `0x` number or a
+/// number with a unit. Words have no digits and numbers no letters, so neither is taken for one. None if there is no
+/// such stretch.
 fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
     let mut out = String::with_capacity(piece.len());
     let (mut found, mut from) = (false, 0);
@@ -754,11 +762,14 @@ fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
         let stretch = &piece[start..i];
         let number =
             start >= 1 && bytes[start - 1].eq_ignore_ascii_case(&b'x') && start >= 2 && bytes[start - 2] == b'0';
+        // Glued to letters before it, or with a hex letter before its end: not a number with a unit (`16777216Bps`).
+        let id_like = start > 0 || stretch[..stretch.len() - 1].bytes().any(|b| b.is_ascii_alphabetic());
         if stretch.len() >= 8
             && stretch.len() < piece.len()
             && stretch.bytes().any(|b| b.is_ascii_digit())
             && stretch.bytes().any(|b| b.is_ascii_alphabetic())
             && !number
+            && id_like
         {
             out += &piece[from..start];
             out += &id(stretch, known)?;
@@ -1134,19 +1145,33 @@ mod tests {
 
     #[test]
     fn a_huge_line_is_scrubbed_in_linear_time() {
-        let mb = 1 << 20;
-        let bound = Duration::from_millis(if cfg!(debug_assertions) { 3000 } else { 250 });
+        // A megabyte in a release build (where a slow machine still has a ceiling), a quarter of one in a debug build.
+        let (mb, ceiling) =
+            if cfg!(debug_assertions) { (1 << 18, Duration::MAX) } else { (1 << 20, Duration::from_millis(250)) };
         let hide = vec![("0123456789abcdef".to_string(), HIDDEN_HEX)];
         let known = vec![("fedcba9876543210".to_string(), "ybndrfg8ejkm".to_string())];
+        // The fastest of three runs, so a busy machine doesn't make one look slow.
+        let time = |unit: &str| {
+            let line = unit.repeat(mb / unit.len());
+            (0..3)
+                .map(|_| {
+                    let begun = Instant::now();
+                    let _ = scrub_with(&line, &hide, &known);
+                    let _ = unquote(&line, '"', 64);
+                    let _ = unquote(&line, '\'', 0);
+                    begun.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        // Ordinary text, as a baseline. Every input below takes at most about 3 times as long, so 8 times catches a
+        // 5-fold slowdown in any of them, and anything quadratic by far, while a busy machine slows both alike.
+        let base = time("established a connection to the relay ");
         let units =
             ["[", "user=a ", "\"", "://", "@", "0x", "basic ", "[1,", "0123456", "a\"b ", "'", "0123456789abcdef "];
         for unit in units {
-            let line = unit.repeat(mb / unit.len());
-            let begun = Instant::now();
-            let _ = scrub_with(&line, &hide, &known);
-            let _ = unquote(&line, '"', 64);
-            let _ = unquote(&line, '\'', 0);
-            assert!(begun.elapsed() < bound, "{unit:?}: {:?}", begun.elapsed());
+            let took = time(unit);
+            assert!(took < ceiling && took < base * 8, "{unit:?}: {took:?} (ordinary text: {base:?})");
         }
     }
 
@@ -1250,5 +1275,27 @@ mod tests {
         line.record_debug(&FIELD.field("peer").unwrap(), &format_args!("[::1]:4433"));
         let out = none(&line.fields);
         assert!(out.starts_with(" frame=[<") && out.ends_with(" peer=[::1]:4433") && !out.contains("7, 7"), "{out}");
+    }
+
+    #[test]
+    fn only_a_run_that_starts_with_a_hidden_text_hides_it() {
+        let hide = vec![("ctionybndrfg8ejkm".to_string(), HIDDEN_Z32), ("fedcba0123456789".to_string(), HIDDEN_HEX)];
+        let line = "established connection; id=ctionybnd remote=fedcba0123 _iroh.ctionybndr.dns PublicKey(fedcba01…) \
+                    at 0xfedcba01 in afedcba0123";
+        assert_eq!(
+            scrub_with(line, &hide, &[]),
+            "established connection; id=[invite] remote=[invite] _iroh.[invite].dns PublicKey([invite]…) \
+             at 0xfedcba01 in [id]"
+        );
+    }
+
+    #[test]
+    fn a_number_with_a_unit_stays() {
+        assert_eq!(none("rate=16777216Bps sent=12345678kB"), "rate=16777216Bps sent=12345678kB");
+        let other = iroh::SecretKey::generate().public().to_string();
+        let h = &other[..20];
+        if h.bytes().any(|b| b.is_ascii_digit()) && h.bytes().any(|b| b.is_ascii_alphabetic()) {
+            assert_eq!(none(&format!("x=v{h}")), "x=v[id]");
+        }
     }
 }
