@@ -475,9 +475,16 @@ mod tests {
         );
         let out = scrub(&line);
         for gone in [&hex[..HIDDEN_PREFIX], &z32[..HIDDEN_PREFIX], &secret[..HIDDEN_PREFIX], &hex[..8].to_uppercase()] {
-            assert!(!out.to_ascii_lowercase().contains(&gone.to_ascii_lowercase()), "{gone} in {out}");
+            // No secret-derived text in the failure message either.
+            assert!(
+                !out.to_ascii_lowercase().contains(&gone.to_ascii_lowercase()),
+                "a form of the invite id or secret is left"
+            );
         }
-        assert!(out.contains("bound id=[invite]") && out.contains("_iroh.[invite].dns"), "{out}");
+        assert!(
+            out.contains("bound id=[invite]") && out.contains("_iroh.[invite].dns"),
+            "the invite id isn't replaced"
+        );
         // Another endpoint's id stays (cut short, as iroh shows it).
         let other = iroh::SecretKey::generate().public();
         assert!(scrub(&format!("remote_id={}", other.fmt_short())).contains(&other.fmt_short().to_string()));
