@@ -607,7 +607,7 @@ fn remembered(l: &Live, now: i64) -> Remembered {
 }
 
 /// The key of a machine's own terminal mailbox (`<you>/terminal`).
-const TERMINAL: &str = "cli:terminal";
+pub(super) const TERMINAL: &str = "cli:terminal";
 
 /// What a machine's presence says when its engine shows a message from another machine's terminal as from
 /// `<person>/terminal@<machine>`, so its agents' replies reach the one it came from.

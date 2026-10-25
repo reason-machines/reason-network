@@ -19,6 +19,7 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -372,13 +373,13 @@ impl Daemon {
                         ("refused".into(), LOOP_NOTE.into())
                     }
                     Target::Session { key: Some(key), .. } => {
-                        g.store.insert(&mut msg, false)?;
+                        g.store.insert_sent(&mut msg, &exclude)?;
                         self.deliver(&mut g, &key, vec![msg.clone()], wake)
                     }
                     Target::Session { key: None, address } => {
                         let name = address.split_once('/').map_or("", |(_, n)| n);
                         let note = offline_note(g.store.session_by_name(name)?.as_ref(), now);
-                        g.store.insert(&mut msg, false)?;
+                        g.store.insert_sent(&mut msg, &exclude)?;
                         ("queued".into(), note)
                     }
                     Target::Remote { machine, .. } => {
@@ -386,7 +387,8 @@ impl Daemon {
                         match for_machine(msg.clone(), takes_files) {
                             Ok(m) => {
                                 msg = m;
-                                self.queue_remote(&mut g, t, &msg, &mut remote_jobs, res.recipients.len())?
+                                let at = res.recipients.len();
+                                self.queue_remote(&mut g, t, &msg, &exclude, &mut remote_jobs, at)?
                             }
                             Err(note) => ("refused".into(), note),
                         }
@@ -449,17 +451,19 @@ impl Daemon {
         Ok(res)
     }
 
-    /// Puts a message for a teammate's machine in the outbox, and on the list to send now if it is connected.
+    /// Puts a message for a teammate's machine, sent by the session `key`, in the outbox, and on the list to send now if
+    /// it is connected.
     fn queue_remote(
         &self,
         g: &mut Inner,
         t: Target,
         msg: &Message,
+        key: &str,
         jobs: &mut Vec<RemoteJob>,
         at: usize,
     ) -> Result<(String, String)> {
         let Target::Remote { machine, machine_name, online, .. } = t else { unreachable!("only remote targets") };
-        g.store.outbox_add(&machine.to_string(), msg)?;
+        g.store.outbox_add(&machine.to_string(), msg, Some(key))?;
         let note = format!("queued: not connected to {machine_name} right now; it goes out as soon as it is");
         jobs.push((at, machine, machine_name, online, msg.clone()));
         Ok(("queued".into(), note))
@@ -922,47 +926,53 @@ impl Daemon {
 
     /// Names the machine each message kept from before notices came from (see [`crate::store::Store::sourceless`]), so
     /// its notice can go back there if it is dropped. Only on evidence: a session of this person's remembered here
-    /// under that name sent it from here; else it came from the sender's machine its address names (a terminal's), the
-    /// sender's only machine (unless it is this person's, whose session here may be forgotten), or the only one of
-    /// theirs whose last presence names the session. Otherwise it stays unknown, and goes without a notice if dropped:
-    /// an engine from before notices kept nothing more to tell by, and a guess could hand its first line to another
-    /// conversation under the name. While some is unknown, each presence looks again (`sourceless`): the team may have
-    /// changed since, or that presence may be the evidence.
+    /// under that name sent it from here, if each other machine of theirs has said which sessions it has and none named
+    /// it (agent sessions there have addresses without a machine too); else it came from the sender's machine its
+    /// address names (a terminal's), the sender's only machine (unless it is this person's, whose session here may be
+    /// forgotten), or the only one of theirs whose last presence names the session (unless a session here has the name
+    /// too). Otherwise it stays unknown, and goes without a notice if dropped: an engine from before notices kept nothing
+    /// more to tell by, and a guess could hand its first line to another conversation under the name. While some is
+    /// unknown, each presence looks again (`sourceless`): the team may have changed since, or that presence may be the
+    /// evidence.
     pub(super) fn find_sources(&self, g: &mut Inner) -> Result<()> {
+        let rows = g.store.sourceless()?;
         let me = self.key.public();
-        let presence = |g: &Inner, m: &Member| {
-            let saved = g.store.get(&format!("presence:{}", m.endpoint)).ok().flatten();
-            saved.and_then(|s| serde_json::from_str::<Remote>(&s).ok())
+        let members: Vec<&Member> = g.team.iter().flat_map(|t| t.active()).filter(|m| m.endpoint != me).collect();
+        // Each machine's last presence, read once: whether it names a session, if it has said.
+        let presences: HashMap<EndpointId, Remote> = members
+            .iter()
+            .filter_map(|m| {
+                let saved = g.store.get(&format!("presence:{}", m.endpoint)).ok().flatten()?;
+                Some((m.endpoint, serde_json::from_str(&saved).ok()?))
+            })
+            .collect();
+        let names = |m: &Member, name: &str| {
+            let p = &presences.get(&m.endpoint)?.presence;
+            Some(p.sessions.iter().any(|s| s.name == name) || p.kept.iter().chain(&p.known).any(|k| k == name))
         };
-        let mut unknown = false;
-        for (id, from) in g.store.sourceless()? {
+        let (mut found, mut unknown) = (Vec::new(), false);
+        for (id, from) in rows {
             let (address, machine) = from.split_once('@').map_or((from.as_str(), None), |(a, m)| (a, Some(m)));
             let Some((person, name)) = address.split_once('/') else { continue };
-            if person == self.person && machine.is_none() && g.store.session_by_name(name)?.is_some() {
-                g.store.set_source(&id, "")?;
-                continue;
-            }
-            let Some(team) = &g.team else {
-                unknown = true;
-                continue;
-            };
-            let theirs: Vec<&Member> = team
-                .active()
-                .filter(|m| m.endpoint != me && m.person == person && machine.is_none_or(|n| m.machine == n))
+            let theirs: Vec<&Member> = members
+                .iter()
+                .copied()
+                .filter(|m| m.person == person && machine.is_none_or(|n| m.machine == n))
                 .collect();
-            let names = |r: &Remote| {
-                let p = &r.presence;
-                p.sessions.iter().any(|s| s.name == name) || p.kept.iter().chain(&p.known).any(|k| k == name)
-            };
-            let named: Vec<&Member> =
-                theirs.iter().copied().filter(|m| presence(g, m).is_some_and(|r| names(&r))).collect();
-            let maybe_here = person == self.person && machine.is_none();
-            match (&theirs[..], &named[..]) {
-                (_, [only]) => g.store.set_source(&id, &only.endpoint.to_string())?,
-                ([only], _) if !maybe_here => g.store.set_source(&id, &only.endpoint.to_string())?,
+            let named: Vec<&Member> = theirs.iter().copied().filter(|m| names(m, name) == Some(true)).collect();
+            let mine = person == self.person && machine.is_none();
+            let here = if mine { g.store.session_by_name(name)? } else { None };
+            match (&theirs[..], &named[..], here) {
+                (_, _, Some(s)) if theirs.iter().all(|m| names(m, name) == Some(false)) => {
+                    found.push((id, String::new(), Some(s.key)))
+                }
+                (_, _, Some(_)) => unknown = true,
+                (_, [only], None) => found.push((id, only.endpoint.to_string(), None)),
+                ([only], _, None) if !mine => found.push((id, only.endpoint.to_string(), None)),
                 _ => unknown = true,
             }
         }
+        g.store.set_sources(&found)?;
         g.sourceless = unknown;
         Ok(())
     }
@@ -976,7 +986,8 @@ impl Daemon {
     }
 
     /// Hands notices for senders here to those that are live; the others' wait in their inbox like any mail. A
-    /// teammate's goes out with the rest of the outbox.
+    /// teammate's goes out with the rest of the outbox. Only those still waiting: in the seconds since it was stored, a
+    /// hook or the inbox may have shown one already (see [`Inner::pending`]).
     fn deliver_notices(self: &Arc<Self>) {
         let mut g = self.inner.lock().unwrap();
         let notices = g.store.take_notices();
@@ -985,7 +996,8 @@ impl Daemon {
         }
         for m in notices {
             let name = m.to.split_once('/').map_or("", |(_, n)| n);
-            if let Some(key) = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone()) {
+            let Some(key) = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone()) else { continue };
+            if g.pending(&m.to).is_ok_and(|p| p.iter().any(|w| w.id == m.id)) {
                 self.deliver(&mut g, &key, vec![m.clone()], m.wake);
             }
         }
@@ -1401,6 +1413,83 @@ mod tests {
         assert!(text.contains(&format!("From Reason Network on {}'s machine.", d.person)), "{text}");
     }
 
+    #[tokio::test]
+    async fn a_new_session_taking_a_lapsed_name_gets_neither_the_old_ones_mail_nor_its_notices() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let at = |key: &str, cwd: &str| SessionReg { cwd: cwd.into(), ..codex(key) };
+        let old = d.register(Some(1), at("codex:old", "/work/api"), Default::default()).unwrap().address;
+        let to = d.register(Some(2), at("codex:receiver", "/work/web"), Default::default()).unwrap().address;
+        d.register(Some(3), at("codex:other", "/work/docs"), Default::default()).unwrap();
+        gone(&d, "codex:receiver", 3 * HOUR);
+        let send = |from: &'static str, to: String, body: &'static str| {
+            let d = d.clone();
+            async move { d.send(from.into(), &to, body, None, true, false, None, Vec::new()).await }
+        };
+        send("codex:old", to.clone(), "the old plan").await.unwrap();
+        // The old conversation is gone two days, with mail it never read; its name lapses and a new one takes it.
+        let name = gone(&d, "codex:old", 48 * HOUR);
+        let theirs = send("codex:other", old.clone(), "for the old one").await.unwrap().ids.remove(0);
+        {
+            let g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(&name).unwrap().unwrap();
+            g.store.forget_session(&r, &d.person).unwrap();
+        }
+        let new = d.register(Some(4), at("codex:new", "/work/api"), Default::default()).unwrap().address;
+        assert_eq!(new, old);
+        // The mail the old one sent is dropped too: its notice isn't for the new one.
+        {
+            let g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(to.split_once('/').unwrap().1).unwrap().unwrap();
+            g.store.forget_session(&r, &d.person).unwrap();
+        }
+        d.deliver_notices();
+        assert!(d.inbox("codex:new".into(), 0, false).await.unwrap().messages.is_empty());
+        let told = d.inbox("codex:other".into(), 0, false).await.unwrap().messages;
+        assert_eq!(told.iter().map(|m| m.reply_to.as_deref()).collect::<Vec<_>>(), [Some(theirs.as_str())]);
+    }
+
+    #[tokio::test]
+    async fn a_notice_already_shown_or_on_its_way_is_not_pushed_again() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.register(Some(1), codex("codex:receiver"), Default::default()).unwrap();
+        let receiver = gone(&d, "codex:receiver", 3 * HOUR);
+        // A Claude Code session whose MCP server takes pushes, sending mail the receiver never reads.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let claude = SessionReg {
+            key: "claude-code:a".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/web".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Push,
+            name: None,
+        };
+        let from = d.register(Some(7), claude, Default::default()).unwrap().address;
+        for body in ["one", "two", "three"] {
+            let to = d.addr(&receiver);
+            d.send("claude-code:a".into(), &to, body, None, true, false, None, Vec::new()).await.unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+        let notices = {
+            let mut g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(&receiver).unwrap().unwrap();
+            g.store.forget_session(&r, &d.person).unwrap();
+            let notices = g.store.unread(&from).unwrap();
+            // Before the notices are handed over, a hook showed the first, and the second is on its way.
+            g.store.mark_read(std::slice::from_ref(&notices[0].id), util::now_ms()).unwrap();
+            g.in_flight.insert(notices[1].id.clone(), Instant::now());
+            notices
+        };
+        d.deliver_notices();
+        let mut pushed = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            let Event::Deliver { ids, .. } = serde_json::from_str(&line).unwrap();
+            pushed.extend(ids);
+        }
+        assert_eq!(pushed, [notices[2].id.clone()]);
+    }
+
     fn remembered(name: &str) -> Remembered {
         Remembered {
             name: name.into(),
@@ -1455,7 +1544,13 @@ mod tests {
                 store.insert(&mut m, false).unwrap();
             }
         }
-        rusqlite::Connection::open(&db).unwrap().execute("ALTER TABLE messages DROP COLUMN source", []).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX messages_sourceless; ALTER TABLE messages DROP COLUMN source;
+                 ALTER TABLE messages DROP COLUMN sender_key; ALTER TABLE outbox DROP COLUMN sender_key;",
+            )
+            .unwrap();
         let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
         let store = crate::store::Store::open(&db, inbox).unwrap();
         (Arc::new(super::super::Daemon::with(cfg, store, key.clone()).unwrap()), dir)
@@ -1482,13 +1577,19 @@ mod tests {
         // A session here that is forgotten since may have sent `alex/forgotten`'s, as much as alex's mini.
         let more = [("01DAVE", "dave/web"), ("01FORGOT", "alex/forgotten")];
         let (d, dir) = backlog(&key, Some(team), &[&senders[..], &more[..]].concat());
-        // Either of carol's or dave's machines could have sent theirs: unknown until a presence says which.
+        // Either of carol's or dave's machines could have sent theirs, and alex/api's an `api` session on alex's mini as
+        // much as the one here: unknown until a presence says which.
         let unknown = |d: &Daemon| -> Vec<String> {
             d.inner.lock().unwrap().store.sourceless().unwrap().into_iter().map(|(id, _)| id).collect()
         };
+        assert_eq!(unknown(&d), ["01HERE", "01CAROL", "01DAVE", "01FORGOT"]);
+        let named = |names: &[&str]| crate::net::Presence {
+            known: names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        };
+        d.save_presence(&mini.public(), &Remote { presence: named(&[]), last_seen: 0, online: true });
         assert_eq!(unknown(&d), ["01CAROL", "01DAVE", "01FORGOT"]);
-        let presence = crate::net::Presence { known: vec!["web".into()], ..Default::default() };
-        d.save_presence(&carol2.public(), &Remote { presence, last_seen: 0, online: true });
+        d.save_presence(&carol2.public(), &Remote { presence: named(&["web"]), last_seen: 0, online: true });
         assert_eq!(unknown(&d), ["01DAVE", "01FORGOT"]);
         let g = d.inner.lock().unwrap();
         g.store.forget_session(&remembered("gone"), "alex").unwrap();
@@ -1508,6 +1609,31 @@ mod tests {
             g.store.take_notices().into_iter().map(|m| (m.to, m.reply_to)).collect();
         assert_eq!(here, one("alex/api", "01HERE"));
         assert!(g.store.unread("alex/terminal").unwrap().is_empty());
+        drop(g);
+        drop(d);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mail_from_before_notices_is_not_put_down_as_sent_here_while_another_machine_of_the_persons_may_have_sent_it() {
+        let key = SecretKey::generate();
+        let mini = SecretKey::generate();
+        let mut team = TeamState::found("acme", "alex", "laptop", &key);
+        team.put_member(&key, mini.public(), "alex", "mini", true);
+        // An `api` session is remembered here, but agent sessions on alex's mini have addresses without a machine too.
+        let (d, dir) = backlog(&key, Some(team), &[("01API", "alex/api")]);
+        let unknown = |d: &Daemon| -> Vec<String> {
+            d.inner.lock().unwrap().store.sourceless().unwrap().into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(unknown(&d), ["01API"]);
+        // The mini has one too: still either.
+        let presence = crate::net::Presence { known: vec!["api".into()], ..Default::default() };
+        d.save_presence(&mini.public(), &Remote { presence, last_seen: 0, online: true });
+        assert_eq!(unknown(&d), ["01API"]);
+        let g = d.inner.lock().unwrap();
+        g.store.forget_session(&remembered("gone"), "alex").unwrap();
+        assert!(g.store.take_notices().is_empty() && g.store.unread("alex/api").unwrap().is_empty());
+        assert!(g.store.outbox_for(&mini.public().to_string(), 0).unwrap().0.is_empty());
         drop(g);
         drop(d);
         std::fs::remove_dir_all(&dir).unwrap();

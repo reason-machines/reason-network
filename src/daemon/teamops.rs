@@ -132,8 +132,9 @@ impl Daemon {
         if let Ok(s) = serde_json::to_string(rem) {
             let mut g = self.inner.lock().unwrap();
             let _ = g.store.set(&format!("presence:{id}"), &s);
-            // A look through unread mail, under the lock, on every presence: only while mail from before notices is
-            // unknown, which it stops being once read or dropped.
+            // A look, under the lock, on every presence through the unread mail from before notices (by its own index,
+            // not all mail), and the team's presences once: only while some of it is unknown, which it stops being once
+            // read or dropped.
             if g.sourceless
                 && let Err(e) = self.find_sources(&mut g)
             {

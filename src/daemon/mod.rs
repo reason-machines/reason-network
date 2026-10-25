@@ -499,10 +499,18 @@ impl Daemon {
 
 /// A daemon on an in-memory store, outside any team, with `cfg`.
 #[cfg(test)]
-fn test_daemon(cfg: Config) -> Daemon {
+pub(crate) fn test_daemon(cfg: Config) -> Daemon {
     let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
     let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
     Daemon::with(cfg, store, SecretKey::generate()).unwrap()
+}
+
+#[cfg(test)]
+impl Daemon {
+    /// Its store and its person, for tests outside the daemon.
+    pub(crate) fn with_store<R>(&self, f: impl FnOnce(&Store, &str) -> R) -> R {
+        f(&self.inner.lock().unwrap().store, &self.person)
+    }
 }
 
 #[cfg(test)]

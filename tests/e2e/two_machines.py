@@ -36,12 +36,11 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}: {name}" + ("" if ok else f"\n      {detail}"))
 
 
-def env(who, strip_claude=True):
+def env(who, strip_claude=True, extra=None):
     e = dict(os.environ, REASON_NETWORK_HOME=H[who], REASON_NETWORK_MACHINE=MACHINE[who], REASON_NETWORK_NO_MDNS="1", REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_CODEX_BIN=FAKE_CODEX)
     e.update({"HOME": os.path.join(D, "home"), "PATH": FAKE_BIN + os.pathsep + os.environ["PATH"], "REASON_NETWORK_NO_UPDATE": "1",
-              "REASON_NETWORK_NO_TRAY": "1", "REASON_NETWORK_TRUST_KEYS": TRUST, "REASON_NETWORK_RELAYS_URL": RELAYS_URL,
-              # Sessions gone a day are forgotten from the start, not six hours after it (debug builds only).
-              "REASON_NETWORK_FORGET_GRACE_MS": "0"})
+              "REASON_NETWORK_NO_TRAY": "1", "REASON_NETWORK_TRUST_KEYS": TRUST, "REASON_NETWORK_RELAYS_URL": RELAYS_URL})
+    e.update(extra or {})
     e.update({"REASON_NETWORK_OSASCRIPT_BIN": FAKE_NOTIFY, "REASON_NETWORK_NOTIFY-SEND_BIN": FAKE_NOTIFY, "DBUS_SESSION_BUS_ADDRESS": "test",
               "NOTIFY_LOG": os.path.join(D, f"notify-{who}.log")})
     if strip_claude:
@@ -53,8 +52,8 @@ def env(who, strip_claude=True):
     return e
 
 
-def cli(who, *args):
-    r = subprocess.run([BIN, *args], env=env(who), capture_output=True, text=True, timeout=90)
+def cli(who, *args, extra=None):
+    r = subprocess.run([BIN, *args], env=env(who, extra=extra), capture_output=True, text=True, timeout=90)
     return (r.stdout + r.stderr).strip()
 
 
@@ -654,7 +653,9 @@ rows = [db.execute("SELECT id, sent_at FROM messages WHERE body = ?", (body,)).f
 db.execute("UPDATE messages SET source = NULL WHERE body = ?", (bodies[1],))
 db.execute("UPDATE sessions SET last_seen = ? WHERE name = 'drop-codex'", (int(time.time() * 1000) - 2 * 86_400_000,))
 db.commit()
-cli("alex", "who")  # alex's machine back, the session a day gone: forgotten, with its mail
+# alex's machine back, the session a day gone: forgotten, with its mail. Its daemon forgets from the start, not six hours
+# after it (debug builds only), until it is started again below.
+cli("alex", "who", extra={"REASON_NETWORK_FORGET_GRACE_MS": "0"})
 time.sleep(1)
 outbox = [json.loads(m) for (m,) in db.execute("SELECT msg FROM outbox WHERE target = ?", (ep["alice"],))]
 left = db.execute("SELECT COUNT(*) FROM messages WHERE body IN (?, ?)", bodies).fetchone()[0]
@@ -680,6 +681,7 @@ for body, row in zip(bodies, rows):
 check("…only the first line, from Reason Network", "second line" not in out and "From Reason Network on alex's machine." in out, out)
 out = codex.tool("check_inbox", {}, meta)
 check("…once", "Not delivered" not in out, out)
+cli("alex", "stop")  # the next command starts it again as usual
 
 # --- offline machine: outbox ---
 codex.close()
