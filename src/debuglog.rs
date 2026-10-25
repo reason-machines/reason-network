@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     time::{Duration, Instant},
@@ -31,9 +31,17 @@ use tracing_core::{
 const MAX_BYTES: u64 = 4 << 20;
 
 /// Lines in a burst, then this many a second: a flood (of packets from a peer, say) can't fill the file and push out
-/// what came before it. Starting up and connecting is a few hundred.
-const BURST: f64 = 2000.0;
-const PER_SECOND: f64 = 50.0;
+/// what came before it, nor cost a scrub per packet. Starting up and connecting is a few hundred.
+const BURST: u64 = 2000;
+const PER_SECOND: u64 = 50;
+
+/// How often the writer writes out what it has, and how many lines were left out.
+const FLUSH_EVERY: Duration = Duration::from_secs(2);
+
+/// A line is cut to this many characters before it is scrubbed (a relay can send a problem report of a megabyte), and
+/// each field's value to this many before that.
+const MAX_LINE: usize = 4000;
+const MAX_VALUE: usize = 2000;
 
 /// Lines waiting for the writer; past this they are left out (and counted), never waited for.
 const QUEUE: usize = 4096;
@@ -75,8 +83,16 @@ enum Msg {
 
 static LOG: OnceLock<SyncSender<Msg>> = OnceLock::new();
 
-/// Lines left out because the writer was behind.
+/// Lines left out because the writer was behind, or over the rate limit.
 static BEHIND: AtomicU64 = AtomicU64::new(0);
+static OVER: AtomicU64 = AtomicU64::new(0);
+
+/// The rate limit, kept without a lock: when the next line is due, in microseconds since `START` (a GCRA bucket).
+static DUE: AtomicU64 = AtomicU64::new(0);
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// Whether the writer thread is still there to wait for.
+static WRITER: AtomicBool = AtomicBool::new(false);
 
 /// Ids and secrets that stand for something guessable (an invite code, its key and secret), in every form a line may
 /// show them in: even a short prefix of one would let someone holding the log test codes offline.
@@ -98,7 +114,9 @@ pub fn path() -> PathBuf {
 pub fn start() -> Result<(), String> {
     let writer = Writer::open(path()).map_err(|e| format!("can't write {}: {e}", path().display()))?;
     let (tx, rx) = sync_channel(QUEUE);
-    std::thread::Builder::new().name("debug-log".into()).spawn(move || writer.run(rx)).map_err(|e| e.to_string())?;
+    START.get_or_init(Instant::now);
+    WRITER.store(true, Ordering::Relaxed);
+    std::thread::Builder::new().name(WRITER_NAME.into()).spawn(move || writer.run(rx)).map_err(|e| e.to_string())?;
     dispatcher::set_global_default(Dispatch::new(Networking)).map_err(|e| e.to_string())?;
     LOG.set(tx).map_err(|_| "already on".to_string())?;
     let shown = std::panic::take_hook();
@@ -112,8 +130,14 @@ pub fn start() -> Result<(), String> {
     Ok(())
 }
 
-/// Writes out what is waiting (before the process exits, say), waiting at most a second.
+const WRITER_NAME: &str = "debug-log";
+
+/// Writes out what is waiting (before the process exits, say), waiting at most a second; not at all if the writer is
+/// gone, or this is the writer (panicking).
 pub fn flush() {
+    if !WRITER.load(Ordering::Relaxed) || std::thread::current().name() == Some(WRITER_NAME) {
+        return;
+    }
     if let Some(tx) = LOG.get() {
         let (ack, done) = sync_channel(1);
         if tx.try_send(Msg::Flush(ack)).is_ok() {
@@ -128,14 +152,21 @@ pub fn know(ids: &[iroh::EndpointId]) {
     *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = ids;
 }
 
-/// Keeps `id` (an invite code's key) out of the log: its hex and z-base-32 forms, and any prefix of them.
+/// Keeps `id` (an invite code's key) out of the log: its hex and z-base-32 forms, and any prefix of them. Only while
+/// the log is on (the daemon turns it on before it binds or dials anything); a process without it keeps nothing.
 pub fn hide(id: &iroh::EndpointId) {
+    if !collecting() {
+        return;
+    }
     hide_text(&id.to_string());
     hide_text(&id.to_z32());
 }
 
-/// Keeps `text` (a code, or a secret that stands for one) and any prefix of it out of the log.
+/// Keeps `text` (a code, or a secret that stands for one) and any prefix of it out of the log, while it is on.
 pub fn hide_text(text: &str) {
+    if !collecting() {
+        return;
+    }
     let text = text.to_ascii_lowercase();
     let mut hide = HIDE.lock().unwrap_or_else(|e| e.into_inner());
     if text.len() >= HIDDEN_PREFIX && text.is_ascii() && !hide.contains(&text) {
@@ -143,12 +174,56 @@ pub fn hide_text(text: &str) {
     }
 }
 
+/// Whether invite codes are collected to hide: while the log is on (and in tests).
+fn collecting() -> bool {
+    LOG.get().is_some() || cfg!(test)
+}
+
 /// One of the daemon's own network lines (`what` names the part), when the log is on. Quoted text in it is dropped
 /// too: here that can only be an error's echo of what a peer sent.
 pub fn ours(what: &str, msg: &str) {
-    if LOG.get().is_some() {
+    if LOG.get().is_some() && admit() {
+        let msg = cap(msg, MAX_LINE);
         let msg = unquote(&unquote(&unquote(msg, '"', 0), '`', 0), '\'', 0);
         write(&format!("{what}: {msg}"), false);
+    }
+}
+
+/// Whether the rate limit lets one more line through now; counted if not.
+fn admit() -> bool {
+    let now = START.get_or_init(Instant::now).elapsed().as_micros() as u64;
+    if admit_at(&DUE, now) {
+        return true;
+    }
+    OVER.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// A GCRA bucket: `BURST` lines at once, then one every `1/PER_SECOND` seconds.
+fn admit_at(due: &AtomicU64, now: u64) -> bool {
+    let (every, slack) = (1_000_000 / PER_SECOND, (BURST - 1) * (1_000_000 / PER_SECOND));
+    let mut was = due.load(Ordering::Relaxed);
+    loop {
+        let next = was.max(now) + every;
+        if next > now + slack + every {
+            return false;
+        }
+        match due.compare_exchange_weak(was, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(v) => was = v,
+        }
+    }
+}
+
+/// `s` cut to `n` characters, then back to the last character that ends a run of letters and digits: no id or key is
+/// left cut short below the length it would be recognized at.
+fn cap(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        None => s,
+        Some((at, _)) => {
+            let head = &s[..at];
+            head.char_indices().rev().find(|&(_, c)| !opaque(c)).map_or("", |(i, c)| &head[..i + c.len_utf8()])
+        }
     }
 }
 
@@ -156,11 +231,12 @@ pub fn ours(what: &str, msg: &str) {
 /// writer is behind.
 fn write(line: &str, urgent: bool) {
     let Some(tx) = LOG.get() else { return };
+    let line = cap(line, MAX_LINE);
     SCRUBBING.with(|s| s.set(true));
     let scrubbed = std::panic::catch_unwind(|| scrub(line));
     SCRUBBING.with(|s| s.set(false));
     let Ok(scrubbed) = scrubbed else { return };
-    let line = format!("[{}] {}\n", util::now_ms(), util::one_line(&scrubbed, 4000));
+    let line = format!("[{}] {}\n", util::now_ms(), util::one_line(&scrubbed, MAX_LINE));
     if let Err(TrySendError::Full(_)) = tx.try_send(Msg::Line(line, urgent)) {
         BEHIND.fetch_add(1, Ordering::Relaxed);
     }
@@ -171,64 +247,60 @@ struct Writer {
     /// None between closing the full file and opening the next, and for good once that fails.
     file: Option<BufWriter<File>>,
     len: u64,
-    tokens: f64,
-    filled: Instant,
-    dropped: u64,
+}
+
+/// Marks the writer gone when its thread ends, however it ends.
+struct Alive;
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        WRITER.store(false, Ordering::Relaxed);
+    }
 }
 
 impl Writer {
     fn open(path: PathBuf) -> std::io::Result<Writer> {
         let file = open_private(&path, false)?;
         let len = file.metadata()?.len();
-        let file = Some(BufWriter::with_capacity(64 << 10, file));
-        Ok(Writer { path, file, len, tokens: BURST, filled: Instant::now(), dropped: 0 })
+        Ok(Writer { path, file: Some(BufWriter::with_capacity(64 << 10, file)), len })
     }
 
-    /// The writer thread: lines as they come, written out every 2 seconds (at once for urgent ones), with a count of
-    /// any left out.
+    /// The writer thread: lines as they come; every `FLUSH_EVERY` (and at once for urgent ones) written out, with a
+    /// count of any left out.
     fn run(mut self, rx: Receiver<Msg>) {
+        let _alive = Alive;
+        let mut flushed = Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_secs(2)) {
+            match rx.recv_timeout(FLUSH_EVERY.saturating_sub(flushed.elapsed())) {
                 Ok(Msg::Line(line, urgent)) => {
-                    self.line(line.as_bytes());
+                    self.write(line.as_bytes());
                     if urgent {
                         self.flush();
                     }
                 }
                 Ok(Msg::Flush(ack)) => {
-                    self.note_dropped();
+                    self.note_left_out();
                     self.flush();
                     let _ = ack.send(());
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    self.note_dropped();
-                    self.flush();
-                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
+                    self.note_left_out();
                     self.flush();
                     return;
                 }
             }
+            if flushed.elapsed() >= FLUSH_EVERY {
+                self.note_left_out();
+                self.flush();
+                flushed = Instant::now();
+            }
         }
-    }
-
-    /// Writes `line` unless the rate limit is spent (then it is counted).
-    fn line(&mut self, line: &[u8]) {
-        let now = Instant::now();
-        self.tokens = (self.tokens + now.duration_since(self.filled).as_secs_f64() * PER_SECOND).min(BURST);
-        self.filled = now;
-        if self.tokens < 1.0 {
-            self.dropped += 1;
-            return;
-        }
-        self.tokens -= 1.0;
-        self.write(line);
     }
 
     /// Says how many lines were left out since it last said, if any.
-    fn note_dropped(&mut self) {
-        let n = self.dropped + BEHIND.swap(0, Ordering::Relaxed);
-        self.dropped = 0;
+    fn note_left_out(&mut self) {
+        let n = BEHIND.swap(0, Ordering::Relaxed) + OVER.swap(0, Ordering::Relaxed);
         if n > 0 {
             self.write(format!("[{}] ({n} lines left out: too many at once)\n", util::now_ms()).as_bytes());
         }
@@ -324,6 +396,9 @@ impl Subscriber for Networking {
     fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
 
     fn event(&self, event: &Event) {
+        if !admit() {
+            return;
+        }
         let meta = event.metadata();
         let mut line = Line::default();
         event.record(&mut line);
@@ -346,9 +421,9 @@ impl Visit for Line {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         let name = field.name();
         if name == "message" {
-            self.message = unquote(&format!("{value:?}"), '"', 64);
+            self.message = unquote(cap(&format!("{value:?}"), MAX_LINE), '"', 64);
         } else if !secret_field(name) {
-            self.fields += &format!(" {name}={}", unquote(&format!("{value:?}"), '"', 64));
+            self.fields += &format!(" {name}={}", unquote(cap(&format!("{value:?}"), MAX_VALUE), '"', 64));
         }
     }
 
@@ -417,12 +492,16 @@ fn scrub_with(line: &str, hide: &[String], known: &[(String, String)]) -> String
 fn hidden(line: &str, hide: &[String]) -> String {
     let mut line = line.to_string();
     for text in hide {
-        loop {
-            let lower = line.to_ascii_lowercase();
-            let Some(at) = lower.find(&text[..HIDDEN_PREFIX]) else { break };
+        let lower = line.to_ascii_lowercase();
+        let (mut out, mut done) = (String::with_capacity(line.len()), 0);
+        while let Some(at) = lower[done..].find(&text[..HIDDEN_PREFIX]).map(|i| i + done) {
             let end = at + lower[at..].bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
-            line.replace_range(at..end, HIDDEN);
+            out += &line[done..at];
+            out += HIDDEN;
+            done = end;
         }
+        out += &line[done..];
+        line = out;
     }
     line
 }
@@ -467,39 +546,31 @@ fn credentials(line: &str) -> String {
         ("query: ", false, true),
         ("fragment: ", false, true),
     ];
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let found = MARKERS
+    let lower = line.to_ascii_lowercase();
+    let (mut out, mut done, mut i) = (String::with_capacity(line.len()), 0, 0);
+    while i < line.len() {
+        let at = &lower.as_bytes()[i..];
+        let marker = MARKERS
             .iter()
-            .filter_map(|&(m, ws, keep_none)| {
-                let mut from = 0;
-                while let Some(at) = lower[from..].find(m).map(|i| i + from) {
-                    let next = lower[at + m.len()..].chars().next();
-                    if !ws || next.is_some_and(char::is_whitespace) {
-                        return Some((at, m.len(), keep_none));
-                    }
-                    from = at + m.len();
-                }
-                None
+            .filter(|&&(m, ws, _)| {
+                at.starts_with(m.as_bytes()) && (!ws || at.get(m.len()).is_some_and(|b| b.is_ascii_whitespace()))
             })
-            .min_by_key(|&(at, len, _)| (at, usize::MAX - len));
-        let Some((at, len, keep_none)) = found else { break };
-        let after = &rest[at + len..];
+            .max_by_key(|(m, ..)| m.len());
+        let Some(&(m, _, keep_none)) = marker else {
+            i += 1;
+            continue;
+        };
+        let after = &line[i + m.len()..];
         let gap = after.len() - after.trim_start().len();
         let value = &after[gap..];
         let end = value.find(char::is_whitespace).unwrap_or(value.len());
-        out += &rest[..at + len + gap];
+        out += &line[done..i + m.len() + gap];
         let none = keep_none && (value.starts_with("None") || value.starts_with("\"\""));
-        if end > 0 && !none {
-            out += "[redacted]";
-        } else {
-            out += &value[..end];
-        }
-        rest = &value[end..];
+        out += if end > 0 && !none { "[redacted]" } else { &value[..end] };
+        i += m.len() + gap + end;
+        done = i;
     }
-    out + rest
+    out + &line[done..]
 }
 
 /// A list of bytes (`[112, 145, …]`, a nonce or raw data) becomes its length: 8 or more numbers up to 255, or 2 or more
@@ -509,10 +580,13 @@ fn byte_lists(line: &str) -> String {
     let mut rest = line;
     while let Some(open) = rest.find('[') {
         out += &rest[..open];
-        let before = out.to_ascii_lowercase();
-        let named = ["data=", "data: ", "bytes=", "bytes: ", "nonce=", "nonce: "].iter().any(|m| before.ends_with(m));
+        let named = ["data=", "data: ", "bytes=", "bytes: ", "nonce=", "nonce: "]
+            .iter()
+            .any(|m| out.len() >= m.len() && out.as_bytes()[out.len() - m.len()..].eq_ignore_ascii_case(m.as_bytes()));
         let after = &rest[open + 1..];
-        let bytes = after.find(']').and_then(|close| {
+        // Only up to the next bracket of either kind: a `[` first means this one isn't a list (and keeps this linear).
+        let close = after.find(['[', ']']).filter(|&i| after.as_bytes()[i] == b']');
+        let bytes = close.and_then(|close| {
             let mut items: Vec<&str> = after[..close].split(',').map(str::trim).collect();
             if items.len() > 1 && items.last() == Some(&"") {
                 items.pop();
@@ -536,9 +610,13 @@ fn byte_lists(line: &str) -> String {
     out + rest
 }
 
+/// What a run of letters and digits is made of: `=` splits, so `name=value` is judged by its value; `/` and `+`
+/// don't, so base64 can't hide in short pieces.
+fn opaque(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-_+/".contains(c)
+}
+
 fn tokens(line: &str, known: &[(String, String)]) -> String {
-    // `=` splits, so `name=value` is judged by its value; `/` and `+` don't, so base64 can't hide in short pieces.
-    let opaque = |c: char| c.is_ascii_alphanumeric() || "-_+/".contains(c);
     let mut out = String::with_capacity(line.len());
     let mut run = String::new();
     for c in line.chars() {
@@ -554,27 +632,28 @@ fn tokens(line: &str, known: &[(String, String)]) -> String {
 }
 
 fn token(run: &str, known: &[(String, String)]) -> String {
-    let n = run.len();
     if crate::team::Ticket::is_ticket(run) {
         return "[ticket]".into();
     }
-    // An id (a key in hex, whole or its first characters): shown, cut to 10, only if it is this machine's or a
-    // teammate's. Digits alone are an id only at the lengths iroh shows ids in.
-    let hex = run.chars().all(|c| c.is_ascii_hexdigit());
-    if hex && n >= 8 && (run.chars().any(|c| c.is_ascii_alphabetic()) || n == 10 || n >= 32) {
-        let lower = run.to_ascii_lowercase();
-        let ours = known.iter().any(|(k, _)| if n <= k.len() { k.starts_with(&lower) } else { lower.starts_with(k) });
-        return match (ours, n > 10) {
-            (true, true) => format!("{}…", &run[..10]),
-            (true, false) => run.into(),
-            (false, _) => "[id]".into(),
-        };
+    if let Some(id) = id(run, known) {
+        return id;
     }
-    if n == Z32_KEY && run.chars().all(|c| Z32.contains(c)) {
-        return match known.iter().any(|(_, z)| z == run) {
-            true => format!("{}…", &run[..10]),
-            false => "[id]".into(),
-        };
+    // An id may sit between `-`, `_`, `/` or `+` (`relay-<id>`): each piece is checked on its own.
+    let mut pieces = Vec::new();
+    let mut from = 0;
+    for (i, c) in run.char_indices().filter(|&(_, c)| "-_/+".contains(c)) {
+        pieces.extend([&run[from..i], &run[i..i + c.len_utf8()]]);
+        from = i + c.len_utf8();
+    }
+    pieces.push(&run[from..]);
+    if pieces.iter().any(|p| id(p, known).is_some()) {
+        if run.contains(['+', '/']) && long_opaque(run) {
+            return "[redacted]".into();
+        }
+        return pieces
+            .iter()
+            .map(|p| id(p, known).unwrap_or_else(|| if long_opaque(p) { "[redacted]".into() } else { p.to_string() }))
+            .collect();
     }
     // A field name like `mapping_varies_by_dest_ipv4`: short lowercase words, joined by `_`.
     if run.contains('_')
@@ -582,10 +661,35 @@ fn token(run: &str, known: &[(String, String)]) -> String {
     {
         return run.into();
     }
+    if long_opaque(run) { "[redacted]".into() } else { run.into() }
+}
+
+/// An id, whole or its first characters: 8 or more hex digits, or a z-base-32 key. Shown, cut to 10, only if it is
+/// this machine's or a teammate's; `[id]` otherwise. None if `piece` isn't one.
+fn id(piece: &str, known: &[(String, String)]) -> Option<String> {
+    let n = piece.len();
+    let ours = if n >= 8 && piece.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let lower = piece.to_ascii_lowercase();
+        known.iter().any(|(k, _)| if n <= k.len() { k.starts_with(&lower) } else { lower.starts_with(k) })
+    } else if n == Z32_KEY && piece.chars().all(|c| Z32.contains(c)) {
+        known.iter().any(|(_, z)| z == piece)
+    } else {
+        return None;
+    };
+    Some(match (ours, n > 10) {
+        (true, true) => format!("{}…", &piece[..10]),
+        (true, false) => piece.into(),
+        (false, _) => "[id]".into(),
+    })
+}
+
+/// A long run of letters and digits mixed (an encoded key, a token).
+fn long_opaque(run: &str) -> bool {
+    let n = run.len();
     let has = |f: fn(&char) -> bool| run.chars().any(|c| f(&c));
     let (digits, upper, lower) =
         (has(char::is_ascii_digit), has(char::is_ascii_uppercase), has(char::is_ascii_lowercase));
-    if n >= 24 && digits && (upper || lower) || n >= 32 && upper && lower { "[redacted]".into() } else { run.into() }
+    n >= 24 && digits && (upper || lower) || n >= 32 && upper && lower
 }
 
 #[cfg(test)]
@@ -617,11 +721,11 @@ mod tests {
 
     #[test]
     fn only_this_teams_ids_show() {
-        let (me, mate) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
-        // One whose first 8 hex characters aren't all digits (those count as an id only at 10 or 32+).
-        let other = std::iter::repeat_with(|| iroh::SecretKey::generate().public())
-            .find(|id| id.to_string()[..8].chars().any(|c| c.is_ascii_alphabetic()))
-            .unwrap();
+        let (me, mate, other) = (
+            iroh::SecretKey::generate().public(),
+            iroh::SecretKey::generate().public(),
+            iroh::SecretKey::generate().public(),
+        );
         let known = [(me.to_string(), me.to_z32()), (mate.to_string(), mate.to_z32())];
         let line = |id: &iroh::EndpointId| {
             format!(
@@ -651,7 +755,19 @@ mod tests {
         let hex = other.to_string();
         for n in [8, 10, 12, 32, 64] {
             assert_eq!(scrub_with(&format!("x={}", &hex[..n]), &[], &known), "x=[id]", "{n}");
+            // Also between `-`, `_`, `/` or `+` (where base64 can be, a long run goes whole).
+            for sep in ["-", "_", "/", "+"] {
+                let out = scrub_with(&format!("x=relay{sep}{}{sep}b", &hex[..n]), &[], &known);
+                assert!(!out.contains(&hex[..8]), "{n} {sep}: {out}");
+                if "-_".contains(sep) {
+                    assert_eq!(out, format!("x=relay{sep}[id]{sep}b"), "{n} {sep}");
+                }
+            }
         }
+        // Digits alone count too.
+        assert_eq!(scrub_with("x=12345678 y=1234567", &[], &known), "x=[id] y=1234567");
+        let short = me.fmt_short().to_string();
+        assert_eq!(scrub_with(&format!("relay-{short}"), &[], &known), format!("relay-{short}"));
     }
 
     #[test]
@@ -718,7 +834,7 @@ mod tests {
         let line = format!(
             "path direct -> relay (rtt 41 ms) relay=https://relay-sfo1.compute.reasonmachines.com/ remote={} \
              addr=192.168.1.20:41641 [2001:db8::1]:41641 err=\"timed out\" mapping_varies_by_dest_ipv4: None \
-             conn_id=524305809616 [1, 2, 3] path_id=7 ports [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]",
+             [1, 2, 3] path_id=7 ports [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000] rtt=28.369875ms",
             me.fmt_short()
         );
         assert_eq!(scrub_with(&line, &[], &known), line);
@@ -896,28 +1012,56 @@ mod tests {
     }
 
     #[test]
-    fn a_flood_is_cut_off_and_counted() {
-        let dir = temp("flood");
+    fn a_flood_is_cut_off() {
+        let due = AtomicU64::new(0);
+        let at = |t: u64| (0..BURST + 500).filter(|_| admit_at(&due, t)).count() as u64;
+        assert_eq!(at(1_000_000), BURST);
+        // A second later, a second's worth more.
+        assert_eq!(at(2_000_000), PER_SECOND);
+        assert_eq!(at(2_000_000), 0);
+    }
+
+    #[test]
+    fn what_was_left_out_is_said_every_tick_even_while_lines_keep_coming() {
+        let dir = temp("tick");
         let path = dir.join("debug.log");
         let w = Writer::open(path.clone()).unwrap();
         let (tx, rx) = sync_channel(QUEUE);
         let writer = std::thread::spawn(move || w.run(rx));
-        let n = BURST as usize + 500;
-        for i in 0..n {
-            tx.send(Msg::Line(format!("line {i}\n"), false)).unwrap();
+        OVER.fetch_add(7, Ordering::Relaxed);
+        let begun = Instant::now();
+        while begun.elapsed() < FLUSH_EVERY + Duration::from_millis(800) {
+            tx.send(Msg::Line("line\n".into(), false)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
         }
-        // Counted on the next tick even with nothing more to write.
-        std::thread::sleep(Duration::from_millis(3500));
         let text = std::fs::read_to_string(&path).unwrap();
-        let kept = text.lines().filter(|l| l.starts_with("line ")).count();
-        assert!((BURST as usize..BURST as usize + 150).contains(&kept), "{kept}");
-        assert!(
-            text.contains(&format!("({} lines left out: too many at once)", n - kept)),
-            "{}",
-            &text[text.len() - 200..]
-        );
+        assert!(text.contains("(7 lines left out: too many at once)"), "{}", text.len());
+        assert!(text.lines().filter(|l| *l == "line").count() > 50);
         drop(tx);
         writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_huge_line_is_scrubbed_in_linear_time() {
+        let mb = 1 << 20;
+        let bound = Duration::from_millis(if cfg!(debug_assertions) { 3000 } else { 50 });
+        let hide = vec!["0123456789abcdef".to_string()];
+        for unit in ["[", "user=a ", "\"", "://", "@", "0x", "basic ", "[1,", "0123456", "a\"b ", "'"] {
+            let line = unit.repeat(mb / unit.len());
+            let begun = Instant::now();
+            let _ = scrub_with(&line, &hide, &[]);
+            let _ = unquote(&line, '"', 64);
+            let _ = unquote(&line, '\'', 0);
+            assert!(begun.elapsed() < bound, "{unit:?}: {:?}", begun.elapsed());
+        }
+        // And what is written is cut first, on a character boundary, back to where a run ends.
+        assert_eq!(cap(&"a ".repeat(3000), 4000).len(), 4000);
+        assert_eq!(
+            cap(&format!("{} {}", "x".repeat(3990), "0123456789abcdef"), 4000),
+            format!("{} ", "x".repeat(3990))
+        );
+        assert_eq!(cap(&"a".repeat(5000), 4000), "");
+        assert_eq!(cap(&"é".repeat(5000), 4000).chars().count(), 4000);
     }
 }
