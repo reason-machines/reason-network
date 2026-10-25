@@ -1396,6 +1396,88 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_whose_notice_cant_be_kept_keeps_its_message_and_changes_nothing() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = Remembered {
+            name: "api".into(),
+            key: "codex:api".into(),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&session, "lars").unwrap();
+        let rows = |table: &str| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut st = store.db.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+            let n = st.column_count();
+            let rows = st.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let noticed = |id: &str| -> (bool, bool) {
+            let here = store.db.prepare("SELECT 1 FROM messages WHERE reply_to = ?1").unwrap().exists([id]).unwrap();
+            let mut st = store.db.prepare("SELECT msg FROM outbox").unwrap();
+            let msgs = st.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            let queued = msgs
+                .map(|m| serde_json::from_str::<Message>(&m.unwrap()).unwrap())
+                .any(|m| m.reply_to.as_deref() == Some(id));
+            (here, queued)
+        };
+        // Mail from a teammate's machine (its notice goes to the outbox), mail from a session here (to its inbox), and
+        // mail sent from here (from the outbox, its notice to the sender's inbox); with others left alone beside them.
+        store.insert_from(&mut message("01REMOTE", "lars/gone"), false, Some("peer")).unwrap();
+        store.insert(&mut Message { from: "lars/api".into(), ..message("01LOCAL", "lars/gone") }, false).unwrap();
+        store.outbox_add("sven-box", &Message { from: "lars/api".into(), ..message("01SENT", "sven/web") }).unwrap();
+        store.insert_from(&mut message("01OTHER", "lars/gone"), false, Some("peer")).unwrap();
+        store.outbox_add("sven-box", &Message { from: "lars/api".into(), ..message("01QUEUED", "sven/web") }).unwrap();
+        type Drop = fn(&Store, &str) -> Result<()>;
+        let cases: [(&str, Drop, &str); 3] = [
+            ("01REMOTE", |s, id| s.drop_unread(id, "expired"), "outbox"),
+            ("01LOCAL", |s, id| s.drop_unread(id, "expired"), "messages"),
+            ("01SENT", |s, id| s.drop_outbox(id, None).map(|_| ()), "messages"),
+        ];
+        for (id, drop, noticed_in) in cases {
+            // The notice can't be written: only the drop writes to that table, and only its notice.
+            store
+                .db
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER fail BEFORE INSERT ON {noticed_in} BEGIN SELECT RAISE(ABORT, 'injected'); END"
+                ))
+                .unwrap();
+            let before = (rows("messages"), rows("outbox"));
+            let err = drop(&store, id).unwrap_err();
+            assert!(err.to_string().contains("injected"), "{id}: {err}");
+            assert_eq!((rows("messages"), rows("outbox")), before, "{id}");
+            let (unread, queued) = (
+                store.db.prepare("SELECT 1 FROM messages WHERE id = ?1 AND read_at IS NULL").unwrap().exists([id]),
+                store.db.prepare("SELECT 1 FROM outbox WHERE id = ?1").unwrap().exists([id]),
+            );
+            assert!(if id == "01SENT" { queued.unwrap() } else { unread.unwrap() }, "{id} is gone");
+            assert_eq!(noticed(id), (false, false), "{id}");
+            assert!(store.take_notices().is_empty(), "{id}");
+            // Without the failure, the same drop goes through: the message goes, and its notice is kept.
+            store.db.execute_batch("DROP TRIGGER fail").unwrap();
+            drop(&store, id).unwrap();
+            assert!(
+                !store.has(id).unwrap()
+                    && !store.db.prepare("SELECT 1 FROM outbox WHERE id = ?1").unwrap().exists([id]).unwrap()
+            );
+            assert_eq!(noticed(id), (noticed_in == "messages", noticed_in == "outbox"), "{id}");
+            let told: Vec<Option<String>> = store.take_notices().into_iter().map(|m| m.reply_to).collect();
+            assert_eq!(told, if noticed_in == "messages" { vec![Some(id.to_string())] } else { vec![] }, "{id}");
+        }
+        assert!(store.has("01OTHER").unwrap());
+        assert_eq!(
+            store.outbox_for("sven-box", 0).unwrap().0.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["01QUEUED"]
+        );
+    }
+
+    #[test]
     fn a_store_from_before_keeps_the_persons_mailboxes_but_not_the_clis_ask_sessions() {
         let dir = std::env::temp_dir().join(format!("reason-network-mailbox-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
