@@ -73,7 +73,7 @@ impl Daemon {
         // An agent with an MCP server per session is in one conversation at a time: the one its server registers now
         // ends any other it served (Claude Code's `/clear`, which runs no new server). Also when the new one is known
         // already, from its hooks or Claude Code's registry.
-        if conn.is_some() && !agent::multiplexed(&reg.agent) {
+        if conn.is_some() && !agent::shares_connection(&reg.agent) {
             let before: Vec<String> = g
                 .live
                 .iter()
@@ -503,6 +503,19 @@ impl Daemon {
         }
     }
 
+    /// One conversation on a shared connection ended. Only the connection it registered through can end it.
+    pub(super) fn end_session(&self, conn: u64, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if g.live.get(key).is_none_or(|l| l.conn != Some(conn)) {
+            return;
+        }
+        if let Some(l) = g.live.remove(key) {
+            let _ = g.store.touch_session(&l.name, util::now_ms());
+            log(&format!("session {} left", self.addr(&l.name)));
+            self.presence_changed();
+        }
+    }
+
     /// Forgets hook-only sessions whose agent is gone or has been silent too long.
     pub(super) fn prune(&self, g: &mut Inner) {
         let now = util::now_ms();
@@ -851,6 +864,24 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    #[test]
+    fn a_gateways_chats_share_its_bridge_and_each_ends_on_its_own() {
+        let d = super::super::test_daemon(Default::default());
+        let (bridge, other) = (conn_of("hermes-bridge"), conn_of("someone-else"));
+        for key in ["hermes:p:1", "hermes:p:2", "hermes:p:3"] {
+            d.register_quiet(Some(bridge), named(key, "hermes", None), GitInfo::default()).unwrap();
+        }
+        let live = |key: &str| d.inner.lock().unwrap().live.contains_key(key);
+        assert!(["hermes:p:1", "hermes:p:2", "hermes:p:3"].iter().all(|k| live(k)));
+        // Only the connection a chat registered through can end it.
+        d.end_session(other, "hermes:p:2");
+        assert!(live("hermes:p:2"));
+        d.end_session(bridge, "hermes:p:2");
+        assert!(!live("hermes:p:2") && live("hermes:p:1") && live("hermes:p:3"));
+        d.drop_conn(bridge);
+        assert!(!live("hermes:p:1") && !live("hermes:p:3"));
     }
 
     #[tokio::test]

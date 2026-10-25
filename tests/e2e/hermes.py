@@ -63,9 +63,9 @@ class Context:
 
 
 STAND_IN_ENGINE = '''
-import json, sys, time
-for line in sys.stdin:
-    call = json.loads(line)
+import json, sys, threading, time
+out = threading.Lock()
+def answer(call):
     result = {}
     if call.get("op") == "register":
         key = call["session"]["key"]
@@ -75,7 +75,11 @@ for line in sys.stdin:
         result = {"address": key}
     elif call.get("op") == "unread":
         result = {"count": 0}
-    print(json.dumps({"id": call["id"], "ok": True, "result": result}), flush=True)
+    with out:
+        print(json.dumps({"id": call["id"], "ok": True, "result": result}), flush=True)
+# Calls finish out of order, as the real bridge's do.
+for line in sys.stdin:
+    threading.Thread(target=answer, args=(json.loads(line),)).start()
 '''
 
 
@@ -164,7 +168,10 @@ class NativeHermes(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Host accepted delivery but the adapter did not acknowledge it")
 
-    def test_two_conversations_use_captured_routes_and_teardown_independently(self):
+    def listed(self, session, viewer):
+        return session["registration"]["name"] + " " in viewer["bridge"].request("who", me=viewer["key"])
+
+    def test_two_conversations_use_captured_routes_and_end_independently(self):
         first = self.start()
         self.context.route = "route-second"
         second = self.start("second")
@@ -175,11 +182,68 @@ class NativeHermes(unittest.TestCase):
         self.assertIn("<reason-message", self.context.received[0][1])
         self.assert_acknowledged(second)
         self.network.finalize(session_id="first")
-        self.assertFalse(first["bridge"].alive)
         self.assertTrue(second["bridge"].alive)
-        listing = second["bridge"].request("who", me=second["key"])
-        self.assertIn(second["registration"]["name"], listing)
-        self.assertNotIn(first["registration"]["name"] + " ", listing)
+        self.assertTrue(self.listed(second, second))
+        self.assertFalse(self.listed(first, second))
+
+    def test_a_gateways_conversations_share_one_adapter(self):
+        sessions = [self.start(f"chat-{n}") for n in range(4)]
+        self.assertEqual(len({id(s["bridge"]) for s in sessions}), 1)
+        for session in sessions:
+            self.assertTrue(self.listed(session, sessions[0]))
+        # Every conversation registered on it stays: none ends another.
+        self.send(sessions[3], sessions[0], "to the first chat")
+        self.assertTrue(self.context.delivered.wait(5))
+        self.assertEqual(self.context.received[0][0], "route-chat-0")
+        self.assert_acknowledged(sessions[0])
+
+    def test_mail_held_for_a_conversation_reaches_it_when_it_comes_back(self):
+        sender, target = self.start("sender"), self.start("returning")
+        address = target["registration"]["address"]
+        self.network.finalize(session_id="returning")
+        self.send(sender, target, "held while away")
+        self.assertEqual(self.context.received, [])
+        # The daemon pushes held mail as the conversation registers, before the plugin has it stored.
+        back = self.start("returning")
+        self.assertEqual(back["registration"]["address"], address)
+        # At once: a dropped push only comes back with the daemon's retry, seconds later.
+        self.assertTrue(self.context.delivered.wait(2), "mail pushed at registration was dropped")
+        self.assertIn("held while away", self.context.received[0][1])
+        self.assert_acknowledged(back)
+
+    def test_an_ended_conversation_stays_gone_after_the_daemon_restarts(self):
+        ended, kept = self.start("ended"), self.start("kept")
+        self.network.finalize(session_id="ended")
+        self.cli("stop")
+        # The adapter reconnects and registers again only the conversations still open.
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                if self.listed(kept, kept):
+                    break
+            except RuntimeError:
+                pass
+            self.assertLess(time.monotonic(), deadline, "the open conversation never came back")
+            time.sleep(0.1)
+        self.assertFalse(self.listed(ended, kept))
+
+    def test_a_restarted_adapter_registers_each_conversation_again(self):
+        self.context.wake = False
+        first, second = self.start(), self.start("second")
+        old = first["bridge"]
+        old.process.kill()
+        old.process.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while old.alive:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        # One conversation's turn starts the new adapter; the other's next tool call joins it.
+        self.network.before_turn(session_id="first", platform="desktop")
+        self.assertIsNot(first["bridge"], old)
+        self.assertIn("No messages", self.network.tool("check_inbox", {}, "second"))
+        self.assertIs(second["bridge"], first["bridge"])
+        self.send(first, second, "after the restart")
+        self.assertIn("after the restart", self.network.inbox(second))
 
     def test_failed_push_stays_unread(self):
         sender = self.start()
@@ -329,7 +393,12 @@ class NativeHermes(unittest.TestCase):
                 worker.join(timeout=5)
 
     def test_bridge_refuses_admin_commands_other_identities_and_raw_files(self):
-        first, other = self.start(), self.start("other")
+        first = self.start()
+        # Another Hermes process, with its own adapter: its conversations aren't this adapter's to speak for.
+        elsewhere = plugin.Network(self.context)
+        self.addCleanup(elsewhere.close)
+        self.context.route = "route-elsewhere"
+        other = elsewhere.session("other", platform="desktop")
         bridge = first["bridge"]
         for op, arguments in (
             ("who", {"me": other["key"]}), ("leave", {}),
@@ -367,8 +436,9 @@ class NativeHermes(unittest.TestCase):
         self.assertIs(continuation, original)
         self.assertEqual(continuation["route"], "new-routing-key")
         self.assertNotIn("before-compression", self.network._sessions)
+        witness = self.start("witness")
         self.network.finalize(session_id="after-compression")
-        self.assertFalse(original["bridge"].alive)
+        self.assertFalse(self.listed(original, witness))
 
     def assert_late_delivery_is_ignored(self, close):
         sender, target = self.start("sender"), self.start("closing")
@@ -388,7 +458,7 @@ class NativeHermes(unittest.TestCase):
             self.assertTrue(entered.wait(5))
             close()
             self.assertNotIn("closing", self.network._sessions)
-            self.assertFalse(target["bridge"].alive)
+            self.assertNotIn(target["key"], self.network._keys)
             release.set()
             self.assertTrue(finished.wait(5))
             self.assertEqual(self.context.received, [], "an old callback injected into a closed conversation")
@@ -471,16 +541,21 @@ class NativeHermes(unittest.TestCase):
         self.assertFalse(slow_done.is_set())
         self.assertTrue(slow_done.wait(15))
 
-    def test_an_oversized_frame_ends_only_that_adapter(self):
+    def test_an_oversized_frame_fails_only_that_call(self):
         first, other = self.start(), self.start("other")
-        # One line over the 1 MiB cap: the adapter stops rather than buffering it.
-        first["bridge"].process.stdin.write('{"id":1,"op":"unread","key":"' + "x" * (1024 * 1024) + '"}\n')
-        first["bridge"].process.stdin.flush()
-        self.assertIsNotNone(first["bridge"].process.wait(timeout=10))
-        with self.assertRaises(RuntimeError):
-            first["bridge"].request("unread", key=first["key"], timeout=5)
-        # The daemon and the other conversation's adapter are unaffected.
+        bridge = first["bridge"]
+        # One line over the 1 MiB cap: the adapter drops it unbuffered and keeps serving every conversation.
+        with bridge._lock:
+            bridge.process.stdin.write('{"id":1,"op":"unread","key":"' + "x" * (2 * 1024 * 1024) + '"}\n')
+            bridge.process.stdin.flush()
+        self.assertEqual(bridge.request("unread", key=first["key"])["count"], 0)
         self.assertEqual(other["bridge"].request("unread", key=other["key"])["count"], 0)
+        self.assertTrue(bridge.alive)
+        # The plugin never sends one: such a call fails at once.
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            self.send(first, other, "x" * (1024 * 1024))
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_an_older_hermes_without_the_plugin_apis_loads_nothing(self):
         registered = []

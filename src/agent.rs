@@ -81,6 +81,12 @@ pub fn multiplexed(agent: &str) -> bool {
     matches!(agent, "codex" | "opencode" | "cursor")
 }
 
+/// Agents whose one connection to the daemon carries many conversations: a multiplexed MCP server's, or the bridge a
+/// Hermes gateway shares across its chats. Registering one never ends the others.
+pub fn shares_connection(agent: &str) -> bool {
+    multiplexed(agent) || agent == "hermes"
+}
+
 /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
 /// Claude Code's is read from its session registry first: `/clear` starts a new conversation in the same process, and
 /// the variable it gave us at start still names the old one.

@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 
 class Bridge:
-    """One conversation, one local connection; no shared process-wide identity."""
+    """One local connection for every conversation in this Hermes process; each keeps its own identity."""
 
     def __init__(self, executable, receive):
         options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
@@ -48,10 +48,14 @@ class Bridge:
                 raise RuntimeError("Reason adapter stopped; retry after the next Hermes turn")
             self._next += 1
             ident = self._next
+            frame = json.dumps({"id": ident, "op": op, **arguments}) + "\n"
+            # The engine refuses a larger frame; refused here, the call fails at once instead of timing out.
+            if len(frame.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("Reason request exceeds 1 MiB")
             future = Future()
             self._pending[ident] = future
             try:
-                self.process.stdin.write(json.dumps({"id": ident, "op": op, **arguments}) + "\n")
+                self.process.stdin.write(frame)
                 self.process.stdin.flush()
             except (OSError, ValueError):
                 self._pending.pop(ident, None)
@@ -138,7 +142,22 @@ class Network:
         # One lock per conversation: its turn refresh, deliveries and replacement
         # run one at a time, so an old refusal cannot undo a newer registration.
         self._turns = {}
+        # Registration keys, for routing the shared adapter's deliveries.
+        self._keys = {}
+        # One adapter for every conversation here, a gateway's many chats included.
+        self._bridge = None
+        self._spawn = threading.Lock()
         self.profile_id = None
+
+    def bridge(self):
+        stale = None
+        with self._spawn:
+            if self._bridge is None or not self._bridge.alive:
+                stale, self._bridge = self._bridge, Bridge(self.executable(), self.deliver)
+            bridge = self._bridge
+        if stale:
+            stale.close()
+        return bridge
 
     def turn_lock(self, session_id):
         with self._lock:
@@ -170,20 +189,23 @@ class Network:
         lock = self.turn_lock(session_id)
         with lock:
             previous = self.current(session_id)
-            if previous and previous["bridge"].alive:
+            bridge = self.bridge()
+            if previous:
+                # The adapter restarted: the conversation registers again on the new one, as itself.
+                restarted = previous.get("registered_on") is not bridge
+                previous["bridge"] = bridge
                 if platform is not None:
                     route, interactive, wake = self.delivery_mode(platform)
                     if interactive and route:
                         previous["route"] = route
-                    if previous["wake"] and not wake:
-                        previous["bridge"].request("push_failed", key=previous["key"], ids=[])
+                    if previous["wake"] and not wake and not restarted:
+                        bridge.request("push_failed", key=previous["key"], ids=[])
                     previous["wake"] = wake
-                    # Retry registration every bound turn, including after a transient
-                    # failure or a daemon-side fallback to pull.
+                # Retry registration every bound turn, including after a transient
+                # failure or a daemon-side fallback to pull.
+                if platform is not None or restarted:
                     self.register_session(previous)
                 return previous
-            if previous:
-                previous["bridge"].close()
             cwd = self.ctx.session_cwd()
             if not cwd:
                 raise ValueError("Reason needs the conversation's working directory")
@@ -191,12 +213,17 @@ class Network:
             if self.profile_id is None:
                 self.profile_id = hashlib.sha256(str(self.ctx.state.data_dir).encode("utf-8")).hexdigest()[:32]
             ident = f"{self.ctx.profile_name}:{self.profile_id}:{route if interactive and route else session_id}"
-            session = {"key": f"hermes:{ident}", "id": ident, "route": route, "cwd": cwd, "wake": wake, "lock": lock}
-            session["bridge"] = Bridge(self.executable(), lambda event: self.receive(session, event))
+            session = {"key": f"hermes:{ident}", "id": ident, "route": route, "cwd": cwd, "wake": wake, "lock": lock,
+                       "bridge": bridge}
+            # Known by key before it registers: mail the daemon delivers on registration waits on its lock.
+            with self._lock:
+                self._keys[session["key"]] = session
             try:
                 self.register_session(session)
             except Exception:
-                session["bridge"].close()
+                with self._lock:
+                    if self._keys.get(session["key"]) is session:
+                        del self._keys[session["key"]]
                 raise
             with self._lock:
                 self._sessions[session_id] = session
@@ -212,13 +239,20 @@ class Network:
         return route, interactive, wake
 
     def register_session(self, session):
-        session["registration"] = session["bridge"].request("register", session={
+        bridge = session["bridge"]
+        session["registration"] = bridge.request("register", session={
             "key": session["key"], "agent": "hermes", "agent_session_id": session["id"],
-            # The adapter's lifetime is the conversation's lifetime, including in a
-            # gateway process that hosts other conversations after this one closes.
-            "cwd": session["cwd"], "pid": session["bridge"].process.pid,
+            # The shared adapter's process; a conversation that closes first ends itself with end_session.
+            "cwd": session["cwd"], "pid": bridge.process.pid,
             "tier": "push" if session["wake"] else "pull",
         })
+        session["registered_on"] = bridge
+
+    def deliver(self, event):
+        with self._lock:
+            session = self._keys.get(event.get("key"))
+        if session is not None:
+            self.receive(session, event)
 
     def receive(self, session, event):
         # Serialize refusal and mode changes with this conversation's next bound turn,
@@ -289,13 +323,18 @@ class Network:
     def finalize(self, session_id="", old_session_id="", **_):
         key = old_session_id or session_id
         # Wait out a registration or delivery in progress for this conversation only;
-        # close outside its lock so a waiting delivery callback can finish and see it gone.
+        # end it outside its lock so a waiting delivery callback can finish and see it gone.
         with self.turn_lock(key):
             with self._lock:
                 session = self._sessions.pop(key, None)
                 self._turns.pop(key, None)
-        if session:
-            session["bridge"].close()
+                if session and self._keys.get(session["key"]) is session:
+                    del self._keys[session["key"]]
+        if session and session["bridge"].alive:
+            try:
+                session["bridge"].request("end_session", key=session["key"], timeout=10)
+            except Exception as exc:
+                log.debug("Reason session end failed: %s", exc)
 
     def compacted(self, session_id="", old_session_id="", **_):
         if not session_id or not old_session_id or session_id == old_session_id:
@@ -309,11 +348,13 @@ class Network:
 
     def close(self):
         with self._lock:
-            sessions = list(self._sessions.values())
             self._sessions.clear()
             self._turns.clear()
-        for session in sessions:
-            session["bridge"].close()
+            self._keys.clear()
+        with self._spawn:
+            bridge, self._bridge = self._bridge, None
+        if bridge:
+            bridge.close()
 
     def inbox(self, session, wait_secs=0):
         result = session["bridge"].request("inbox", key=session["key"],

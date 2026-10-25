@@ -110,11 +110,16 @@ second Hermes, or approve tool actions.
 
 ## Processes and data
 
-Each active conversation starts one local `reason-network bridge` subprocess,
-with two small reader/delivery threads in Hermes. The engine connects to the
-shared local daemon through its existing socket or Windows named pipe; it
-handles peer connections, relay discovery and reconnection. Closing the plugin
-stops its adapters and leaves that shared daemon running.
+Each Hermes process starts one local `reason-network bridge` subprocess, with
+two small reader/delivery threads, and shares it across its conversations: a
+gateway serving many chats runs one bridge, not one per chat. Every conversation
+still registers its own identity; one that closes sends `end_session` and the
+others stay registered. The engine connects to the shared local daemon through
+its existing socket or Windows named pipe; it handles peer connections, relay
+discovery and reconnection, registering again every open conversation after a
+daemon restart. If the bridge itself stops, the next turn or tool call starts a
+new one and each conversation registers again as itself. Closing the plugin
+stops its bridge and leaves that shared daemon running.
 
 The plugin hashes the path returned by Hermes's profile-scoped state API to keep
 custom profile homes distinct, without storing additional state. It never reads a browser profile,
@@ -158,8 +163,10 @@ pull. A later permitted registration can restore push.
 The bridge accepts only registered-session messaging operations, not network
 administration. `send` accepts confined file `paths`, not raw `files` content;
 agent send targets must identify one conversation. `stop_waiting` releases an
-`inbox` or human-answer wait. Input frames are capped at 1 MiB. Closing stdin
-ends the adapter and its local connection, leaving the shared daemon running.
+`inbox` or human-answer wait. `end_session` ends one registered conversation on
+an adapter that carries several. Input frames are capped at 1 MiB: a larger one
+fails with id 0 and the adapter keeps serving the rest. Closing stdin ends the
+adapter and its local connection, leaving the shared daemon running.
 The exact operation fields are the existing `Request` types in `src/proto.rs`;
 `src/bridge.rs` defines the restricted adapter surface.
 
