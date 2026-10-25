@@ -42,14 +42,20 @@ pub fn normalize(input: &str) -> Option<String> {
     (parts.len() == LEN && parts.iter().all(|p| words.contains(&p.as_str()))).then(|| parts.join("-"))
 }
 
-/// The key the inviting machine listens on while the code is valid.
+/// The key the inviting machine listens on while the code is valid. Kept out of the debug log, even in part: the code
+/// is short enough to find from it offline.
 pub fn key(code: &str) -> SecretKey {
-    SecretKey::from_bytes(&blake3::derive_key("tincan 2026 invite endpoint", code.as_bytes()))
+    let key = SecretKey::from_bytes(&blake3::derive_key("tincan 2026 invite endpoint", code.as_bytes()));
+    crate::debuglog::hide(&key.public());
+    key
 }
 
-/// The invite secret the joiner proves (its hash is in the team state, like any invite's).
+/// The invite secret the joiner proves (its hash is in the team state, like any invite's). Kept out of the debug log
+/// too.
 pub fn secret(code: &str) -> String {
-    HEXLOWER.encode(&blake3::derive_key("tincan 2026 invite secret", code.as_bytes())[..16])
+    let secret = HEXLOWER.encode(&blake3::derive_key("tincan 2026 invite secret", code.as_bytes())[..16]);
+    crate::debuglog::hide_text(&secret);
+    secret
 }
 
 #[cfg(test)]

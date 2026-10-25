@@ -542,5 +542,5 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
   `reason-network stop` (the service starts it again). The daemon then also writes iroh's own events (path changes,
   time-outs, QUIC errors, at debug level) and its own network lines to `~/.reason/network/debug.log`. It stays on your
   computer, readable only by you, and starts over past 4 MB, keeping the previous one as `debug.log.1`. It never holds
-  message text, files, team links or keys; it does hold computer ids and IP addresses, so look it over before you share
-  it. Remove the line and stop the daemon again to turn it off.
+  message text, files, team links, invite codes or keys; it does hold computer ids and IP addresses, so look it over
+  before you share it. Remove the line and stop the daemon again to turn it off.

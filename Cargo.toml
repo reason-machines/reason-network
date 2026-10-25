@@ -31,7 +31,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 toml_edit = "0.25"
-tracing-core = "0.1"
+tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 ulid = "3"
 
 [target.'cfg(unix)'.dependencies]

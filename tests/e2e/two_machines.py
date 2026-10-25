@@ -25,6 +25,7 @@ UNEXPECTED = os.path.join(D, "unexpected.log")
 # Reason's relay list, served here: never the real one.
 RELAYS_URL = serve_relay_lists({"all": ["sfo1", "iad1", "fra1", "sin1"]}) + "/all.json"
 results = []
+out_codes = ""
 
 
 def check(name, ok, detail=""):
@@ -138,10 +139,12 @@ def link_secret(link):
 
 os.makedirs(os.path.join(D, "work"), exist_ok=True)
 
-# alice's machine keeps the debug log; alex's doesn't, as by default.
-os.makedirs(H["alice"], exist_ok=True)
-with open(os.path.join(H["alice"], "config.toml"), "w") as f:
-    f.write("debug_log = true\n")
+# alice's and alex's machines keep the debug log (and bob's, below, which joins with a code); the others don't, as by
+# default.
+for home in (H["alice"], H["alex"], os.path.join(D, "bob")):
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, "config.toml"), "w") as f:
+        f.write("debug_log = true\n")
 
 # --- team formation, signed in with Reason ---
 ep = {who: cli(who, "endpoint") for who in H}
@@ -253,9 +256,9 @@ _, out = run(sam, "join", solo_link, "--as", "sam", "--no-setup")
 check("a link that names only this machine, which left, says to ask for a fresh one",
       "names only this computer" in out and "fresh link" in out and "ourself" not in out, out)
 subprocess.run([BIN, "stop"], env=sam, capture_output=True)
-os.makedirs(os.path.join(D, "bob"), exist_ok=True)
 bob = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "bob"), REASON_NETWORK_MACHINE="nuc")
 out = cli("alex", "invite", "--code")
+out_codes += out
 code = re.search(r"One-time code for a teammate: ([a-z]+(?:-[a-z]+){3})", out)
 check("invite --code prints a four-word code", bool(code), out)
 r = subprocess.run([BIN, "join", code.group(1).replace("-", " ").upper(), "--as", "bob", "--no-setup"], env=bob,
@@ -660,22 +663,34 @@ claude.close()
 cli("alex", "stop")
 cli("alice", "stop")
 
-# --- the debug log: the networking library's events, on alice's machine only, with nothing anyone wrote ---
-dbg = os.path.join(H["alice"], "debug.log")
-text = open(dbg, errors="replace").read() if os.path.exists(dbg) else ""
+# --- the debug log: the networking library's events, on the machines that turned it on, with nothing anyone wrote ---
+logs = {who: os.path.join(home, "debug.log") for who, home in (("alice", H["alice"]), ("alex", H["alex"]), ("bob", os.path.join(D, "bob")))}
+text = {who: open(p, errors="replace").read() if os.path.exists(p) else "" for who, p in logs.items()}
+alltext = "\n".join(text.values())
 check("debug_log = true writes the networking library's events to debug.log",
-      re.search(r"^\[\d+\] (DEBUG|INFO|WARN|ERROR) (iroh|noq)", text, re.M) is not None, text[:500])
-check("…and the daemon's own network lines", "net: connected to" in text, text[:500])
-check("…readable by its owner only", os.name == "nt" or os.stat(dbg).st_mode & 0o777 == 0o600, dbg)
-check("without debug_log, no debug log", not os.path.exists(os.path.join(H["alex"], "debug.log")))
+      all(re.search(r"^\[\d+\] (DEBUG|INFO|WARN|ERROR) (iroh|noq)", t, re.M) for t in text.values()), {w: t[:300] for w, t in text.items()})
+check("…and the daemon's own network lines", "net: connected to" in text["alice"], text["alice"][:500])
+check("…readable by its owner only", os.name == "nt" or all(os.stat(p).st_mode & 0o777 == 0o600 for p in logs.values()), logs)
+check("without debug_log, no debug log", not any(os.path.exists(os.path.join(D, h, "debug.log")) for h in ("bob2", "mallory", "sam")))
 key = open(os.path.join(H["alice"], "machine.key"), "rb").read()
 said = ["hello from alex's terminal", "dinner at 8?", "can you approve the deploy?", "codex here", "yes, ship it",
         "first words from a new session", "answered at once", "broadcast", "sent while you were offline",
         "from an agent's shell there", "cross-machine push", "line two", '"port": 8080', "q" * 64]
 held = [link.group(1), link.group(1).split("#", 1)[1], link_secret(link.group(1)), "rn1-", "tincan1", "/join/#",
         key.hex(), base64.b64encode(key).decode().rstrip("="), base64.urlsafe_b64encode(key).decode().rstrip("="), "eyJ"]
-found = [s for s in said + held if s in text]
+found = [s for s in said + held if s in alltext]
 check("…with no message text, file, link, ticket, key or sign-in proof in it", not found, found)
+# The four-word code's own key (the inviting machine listens on it, the joiner dials it) is short enough to find from
+# offline: neither log shows it, not even the 10 characters iroh shows of an id. Every id left is a machine's.
+check("the invite code's key is hidden on both sides", "[invite]" in text["alex"] and "[invite]" in text["bob"],
+      [l for l in alltext.splitlines() if "bound" in l][:5])
+machines = [run(dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, h)), "endpoint")[0] for h in os.listdir(D)
+            if os.path.exists(os.path.join(D, h, "machine.key"))]
+ids = set(re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{10})(?:…)?(?![0-9A-Za-z])", alltext))
+unknown = sorted(i for i in ids if re.search(r"[a-f]", i) and not any(m.startswith(i) for m in machines))
+check("…and every id in the logs is one of the machines'", not unknown, unknown)
+for code_ in re.findall(r"One-time code for a teammate: ([a-z]+(?:-[a-z]+){3})", out_codes):
+    check(f"…nor the code itself", code_ not in alltext and code_.replace("-", " ") not in alltext.lower())
 log = open(UNEXPECTED).read() if os.path.exists(UNEXPECTED) else ""
 check("nothing opened a browser or reached the real notifications", log == "", log)
 print(f"\n{sum(results)}/{len(results)} checks passed  (state in {D})")
