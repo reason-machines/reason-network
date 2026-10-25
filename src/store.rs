@@ -301,7 +301,8 @@ impl Store {
             // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
             db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
-        // Added with notices: the teammate's machine a message came from, which its notice goes back to.
+        // Added with notices: the teammate's machine a message came from, which its notice goes back to, or empty for
+        // one sent here. Mail kept from before has none (see `sourceless`).
         if !db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'source'")?.exists([])? {
             db.execute("ALTER TABLE messages ADD COLUMN source TEXT", [])?;
         }
@@ -328,7 +329,7 @@ impl Store {
         self.insert_from(m, held, None)
     }
 
-    /// The same, for a message from a teammate's machine (`source`, its endpoint id).
+    /// The same, for a message from a teammate's machine (`source`, its endpoint id; `None`: sent here).
     pub fn insert_from(&self, m: &mut Message, held: bool, source: Option<&str>) -> Result<bool> {
         if self.has(&m.id)? {
             return Ok(false);
@@ -362,7 +363,7 @@ impl Store {
                 m.approval.as_ref().map(|a| serde_json::to_string(a).expect("approvals serialize")),
                 kept.as_ref().map(|k| serde_json::to_string(k).expect("files serialize")),
                 held,
-                source
+                source.unwrap_or_default()
             ],
         );
         if n.as_ref().is_ok_and(|n| *n == 1) && !held {
@@ -590,10 +591,11 @@ impl Store {
         let source: Option<Option<String>> =
             self.db.query_row("SELECT source FROM messages WHERE id = ?1", [id], |r| r.get(0)).optional()?;
         let mut told = None;
-        if let (Some(source), Some(m)) = (source, self.message(id)?) {
+        // (Mail from before notices whose machine wasn't found, see `sourceless`, goes without one.)
+        if let (Some(Some(source)), Some(m)) = (source, self.message(id)?) {
             // Mail here is for this machine's person.
             let person = m.to.split_once('/').map_or(m.to.as_str(), |(p, _)| p);
-            told = self.tell(&m, source.as_deref(), person)?;
+            told = self.tell(&m, Some(source.as_str()).filter(|s| !s.is_empty()), person)?;
         }
         self.discard_receipt(id, stage, util::now_ms())?;
         self.db.execute("DELETE FROM messages WHERE id = ?1", [id])?;
@@ -620,16 +622,18 @@ impl Store {
         Ok(removed)
     }
 
-    /// Keeps the notice that `m` was dropped on `person`'s machine: in the outbox for the teammate's machine it came from
-    /// (`source`), or, sent here, in its sender's inbox, if that is a session remembered here. Returns that one.
+    /// Keeps the notice that `m` was dropped on `person`'s machine: in the outbox for the teammate's machine it came
+    /// from (`source`), or, sent here, in its sender's inbox, if that is a session remembered here. Returns that one.
     fn tell(&self, m: &Message, source: Option<&str>, person: &str) -> Result<Option<Message>> {
         let Some(mut n) = notice(m, &format!("{person}/terminal"), util::now_ms()) else { return Ok(None) };
         if let Some(machine) = source {
+            // That machine knows its terminal without its own name on it.
+            n.to = render::without_machine(&n.to).to_string();
             self.outbox_add(machine, &n)?;
             return Ok(None);
         }
-        // (Mail kept from before notices doesn't say where it came from: a teammate's goes without one.)
-        let here = n.to.split_once('/').filter(|(p, _)| *p == person).map(|(_, name)| name);
+        // A sender here has an address without a machine on it.
+        let here = n.to.split_once('/').filter(|(p, name)| *p == person && !name.contains('@')).map(|(_, name)| name);
         if let Some(name) = here
             && self.session_by_name(name)?.is_some()
             && self.insert(&mut n, false)?
@@ -637,6 +641,20 @@ impl Store {
             return Ok(Some(n));
         }
         Ok(None)
+    }
+
+    /// Unread and held mail kept from before notices, which doesn't say which machine it came from: ids and senders.
+    pub fn sourceless(&self) -> Result<Vec<(String, String)>> {
+        let mut st =
+            self.db.prepare_cached("SELECT id, sender FROM messages WHERE source IS NULL AND read_at IS NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Where a message came from, found later (see `insert_from`).
+    pub fn set_source(&self, id: &str, source: &str) -> Result<()> {
+        self.db.execute("UPDATE messages SET source = ?2 WHERE id = ?1", params![id, source])?;
+        Ok(())
     }
 
     /// The notices stored for senders here since the last call.
@@ -875,6 +893,8 @@ impl Store {
 /// line, to tell which it was. An ordinary message, which an engine from before notices shows like any other. None for
 /// a notice: a dropped one never makes another.
 pub fn notice(m: &Message, from: &str, now: i64) -> Option<Message> {
+    // Only to stop a loop of notices. Anyone can put this in a message (a teammate's machine passes its agent on as
+    // it says), so nothing may be granted or trusted on it.
     if m.from_agent.as_deref() == Some(NOTICE_AGENT) {
         return None;
     }
@@ -884,8 +904,8 @@ pub fn notice(m: &Message, from: &str, now: i64) -> Option<Message> {
         from: from.to_string(),
         from_agent: Some(NOTICE_AGENT.into()),
         from_repo: None,
-        // Its machine knows a terminal without its own name on it.
-        to: render::without_machine(&m.from).to_string(),
+        // As it shows here, a teammate's terminal with its machine, until it is known where the notice goes.
+        to: m.from.clone(),
         via: None,
         reply_to: Some(m.id.clone()),
         body: format!(
@@ -1295,8 +1315,8 @@ mod tests {
             n.body,
             "Not delivered: your message to lars/api (sent 2026-10-29 03:04 UTC) was dropped unread: \"please rebase\""
         );
-        // To the sender as its own machine knows it, from Reason Network, as an answer to the message it names.
-        assert_eq!((n.from.as_str(), n.to.as_str()), ("lars/terminal", "sven/terminal"));
+        // To the sender as it shows here, from Reason Network, as an answer to the message it names.
+        assert_eq!((n.from.as_str(), n.to.as_str()), ("lars/terminal", "sven/terminal@desktop"));
         assert_eq!((n.from_agent.as_deref(), n.reply_to.as_deref()), (Some(NOTICE_AGENT), Some("01DROPPED")));
         assert!(n.wake && !n.notify && n.files.is_empty() && n.approval.is_none() && n.sent_at == 5);
         assert!(ulid::Ulid::from_string(&n.id).is_ok());
@@ -1331,10 +1351,22 @@ mod tests {
         store.insert_from(&mut message("01REMOTE", "lars/gone"), false, Some("peer")).unwrap();
         // From a session here: it goes to that session's inbox, for the daemon to deliver.
         store.insert(&mut Message { from: "lars/api".into(), ..message("01LOCAL", "lars/gone") }, false).unwrap();
-        // From before notices, with no machine named: no session here sent it, so nothing.
-        store.insert(&mut message("01OLD", "lars/gone"), false).unwrap();
+        // From before notices, its machine named later (see `sourceless`): back to it, as that machine knows its
+        // terminal. One whose machine wasn't found goes without a notice.
+        for id in ["01OLD", "01LOST"] {
+            let m = Message { from: "sven/terminal@desktop".into(), ..message(id, "lars/gone") };
+            store.insert(&mut m.clone(), false).unwrap();
+            store.db.execute("UPDATE messages SET source = NULL WHERE id = ?1", [id]).unwrap();
+        }
+        let old: Vec<String> =
+            store.sourceless().unwrap().into_iter().map(|(id, from)| format!("{id} {from}")).collect();
+        assert_eq!(old, ["01OLD sven/terminal@desktop", "01LOST sven/terminal@desktop"]);
+        store.set_source("01OLD", "peer").unwrap();
         store.forget_session(&session("gone"), "lars").unwrap();
-        assert_eq!(notices(&store, "peer"), ["01REMOTE"]);
+        assert_eq!(notices(&store, "peer"), ["01REMOTE", "01OLD"]);
+        assert!(
+            store.outbox_for("peer", 0).unwrap().0.iter().all(|n| n.to == "sven/claude" || n.to == "sven/terminal")
+        );
         let here: Vec<Message> = store.take_notices();
         assert_eq!(here.iter().map(|m| m.reply_to.as_deref()).collect::<Vec<_>>(), [Some("01LOCAL")]);
         assert_eq!(store.unread("lars/api").unwrap()[0].id, here[0].id);
@@ -1342,7 +1374,7 @@ mod tests {
         // Held and turned down: the same.
         store.insert_from(&mut message("01HELD", "lars/api"), true, Some("peer")).unwrap();
         store.settle_held(&["01HELD".into()], false).unwrap();
-        assert_eq!(notices(&store, "peer"), ["01REMOTE", "01HELD"]);
+        assert_eq!(notices(&store, "peer"), ["01REMOTE", "01OLD", "01HELD"]);
         // Sent from here: refused once it was queued, or expired, the sender gets a notice; refused in the reply to
         // sending it, it already knows.
         for id in ["01REFUSED", "01SEEN", "01EXPIRED"] {

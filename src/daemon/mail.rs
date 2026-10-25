@@ -9,10 +9,11 @@ use crate::{
     agent, claude, codex,
     config::Policy,
     files,
+    net::Remote,
     proto::*,
     render,
     store::{Counted, Remembered},
-    team::Signed,
+    team::{Member, Signed},
     util,
 };
 use anyhow::{Result, anyhow, bail};
@@ -919,6 +920,42 @@ impl Daemon {
         self.usage.count("received", dims, 1);
     }
 
+    /// Names the machine each message kept from before notices came from (see [`crate::store::Store::sourceless`]), so
+    /// its notice can go back there if it is dropped. A session of this person's with its name remembered here sent it
+    /// from here; else it is one of the sender's machines: the one its address names (a terminal's), the only one, one
+    /// whose last presence names the session, or the one heard from last. With none in the team, it stays unknown.
+    pub(super) fn find_sources(&self, g: &Inner) -> Result<()> {
+        let Some(team) = &g.team else { return Ok(()) };
+        let me = self.key.public();
+        let presence = |m: &Member| {
+            let saved = g.store.get(&format!("presence:{}", m.endpoint)).ok().flatten();
+            saved.and_then(|s| serde_json::from_str::<Remote>(&s).ok())
+        };
+        for (id, from) in g.store.sourceless()? {
+            let (address, machine) = from.split_once('@').map_or((from.as_str(), None), |(a, m)| (a, Some(m)));
+            let Some((person, name)) = address.split_once('/') else { continue };
+            if person == self.person && machine.is_none() && g.store.session_by_name(name)?.is_some() {
+                g.store.set_source(&id, "")?;
+                continue;
+            }
+            let theirs: Vec<&Member> = team
+                .active()
+                .filter(|m| m.endpoint != me && m.person == person && machine.is_none_or(|n| m.machine == n))
+                .collect();
+            let names = |r: &Remote| {
+                let p = &r.presence;
+                p.sessions.iter().any(|s| s.name == name) || p.kept.iter().chain(&p.known).any(|k| k == name)
+            };
+            let named = theirs.iter().copied().find(|m| presence(m).is_some_and(|r| names(&r)));
+            let latest = || theirs.iter().copied().max_by_key(|m| presence(m).map_or(i64::MIN, |r| r.last_seen));
+            let from = if let [only] = theirs[..] { Some(only) } else { named.or_else(latest) };
+            if let Some(m) = from {
+                g.store.set_source(&id, &m.endpoint.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Checks for notices of mail dropped here (see [`crate::store::notice`]) every few seconds.
     pub(super) async fn notices_loop(self: Arc<Self>) {
         loop {
@@ -1351,6 +1388,75 @@ mod tests {
         assert!(text.contains(&format!("Not delivered: your message to {to}")), "{text}");
         assert!(text.contains("dropped unread: \"the plan\"") && !text.contains("details"), "{text}");
         assert!(text.contains(&format!("From Reason Network on {}'s machine.", d.person)), "{text}");
+    }
+
+    #[test]
+    fn mail_queued_before_notices_tells_its_sender_on_the_machine_it_came_from() {
+        let dir = std::env::temp_dir().join(format!("reason-network-backlog-{}", Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, inbox) = (dir.join("network.db"), dir.join("inbox"));
+        let (key, bob, mini) = (SecretKey::generate(), SecretKey::generate(), SecretKey::generate());
+        let session = |name: &str| Remembered {
+            name: name.into(),
+            key: format!("codex:{name}"),
+            agent: "codex".into(),
+            cwd: "/work".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        let mail = |id: &str, from: &str| Message {
+            id: id.into(),
+            from: from.into(),
+            from_agent: None,
+            from_repo: None,
+            to: "alex/gone".into(),
+            via: None,
+            reply_to: None,
+            body: "before the upgrade".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        {
+            // alex on laptop, in a team with bob on xps and alex's own mini; mail waits for an offline session.
+            let store = crate::store::Store::open(&db, inbox.clone()).unwrap();
+            let mut team = TeamState::found("acme", "alex", "laptop", &key);
+            team.put_member(&key, bob.public(), "bob", "xps", true);
+            team.put_member(&key, mini.public(), "alex", "mini", true);
+            store.set("team", &serde_json::to_string(&team).unwrap()).unwrap();
+            for name in ["gone", "api"] {
+                store.upsert_session(&session(name), "alex").unwrap();
+            }
+            for (id, from) in [("01BOB", "bob/web"), ("01MINI", "alex/terminal@mini"), ("01HERE", "alex/api")] {
+                store.insert(&mut mail(id, from), false).unwrap();
+            }
+        }
+        // As an engine from before notices kept it: nothing says where the mail came from.
+        rusqlite::Connection::open(&db).unwrap().execute("ALTER TABLE messages DROP COLUMN source", []).unwrap();
+        let store = crate::store::Store::open(&db, inbox).unwrap();
+        let d = Arc::new(super::super::Daemon::with(Default::default(), store, key).unwrap());
+        let g = d.inner.lock().unwrap();
+        g.store.forget_session(&session("gone"), "alex").unwrap();
+        let outbox = |machine: &SecretKey| -> Vec<(String, Option<String>)> {
+            let msgs = g.store.outbox_for(&machine.public().to_string(), 0).unwrap().0;
+            msgs.into_iter().map(|m| (m.to, m.reply_to)).collect()
+        };
+        assert_eq!(outbox(&bob), [("bob/web".to_string(), Some("01BOB".to_string()))]);
+        // A terminal's goes back to its own machine, never to the terminal here.
+        assert_eq!(outbox(&mini), [("alex/terminal".to_string(), Some("01MINI".to_string()))]);
+        let here: Vec<(String, Option<String>)> =
+            g.store.take_notices().into_iter().map(|m| (m.to, m.reply_to)).collect();
+        assert_eq!(here, [("alex/api".to_string(), Some("01HERE".to_string()))]);
+        assert!(g.store.unread("alex/terminal").unwrap().is_empty());
+        drop(g);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -641,32 +641,41 @@ dropper = Mcp("alex", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D,
 dropper.tool("list_team", {}, {"sessionId": "44444444-dddd", "threadId": "44444444-dddd"})
 dropper.close()
 time.sleep(4)
-body = "dropped unread (e2e test)\nthis second line isn't quoted"
-out = codex.tool("send_message", {"to": "alex/drop-codex", "message": body}, meta)
-check("mail for a session that is offline is queued on its machine", "queued: last seen" in out, out)
+bodies = ["dropped unread (e2e test)\nthis second line isn't quoted", "queued before the upgrade (e2e test)"]
+for body in bodies:
+    out = codex.tool("send_message", {"to": "alex/drop-codex", "message": body}, meta)
+    check(f"mail for a session that is offline is queued on its machine: {body.splitlines()[0]}", "queued: last seen" in out, out)
+codex.close()  # (its MCP server would start alice's machine again)
 cli("alice", "stop")
+cli("alex", "stop")
 db = sqlite3.connect(os.path.join(H["alex"], "network.db"), timeout=30)
-row = db.execute("SELECT id, sent_at FROM messages WHERE body = ?", (body,)).fetchone()
+rows = [db.execute("SELECT id, sent_at FROM messages WHERE body = ?", (body,)).fetchone() for body in bodies]
+# The second as an engine from before notices kept it: without the machine it came from.
+db.execute("UPDATE messages SET source = NULL WHERE body = ?", (bodies[1],))
 db.execute("UPDATE sessions SET last_seen = ? WHERE name = 'drop-codex'", (int(time.time() * 1000) - 2 * 86_400_000,))
 db.commit()
-cli("alex", "who")  # a day gone: forgotten, with its mail
+cli("alex", "who")  # alex's machine back, the session a day gone: forgotten, with its mail
 time.sleep(1)
 outbox = [json.loads(m) for (m,) in db.execute("SELECT msg FROM outbox WHERE target = ?", (ep["alice"],))]
-dropped = db.execute("SELECT 1 FROM messages WHERE body = ?", (body,)).fetchone()
+left = db.execute("SELECT COUNT(*) FROM messages WHERE body IN (?, ?)", bodies).fetchone()[0]
 db.close()
-check("…dropped once the session is forgotten, it leaves a notice for the sender's machine, which is off",
-      row is not None and dropped is None and [m.get("reply_to") for m in outbox if m.get("from_agent") == "reason-network"] == [row[0]], (row, outbox))
+check("…dropped once the session is forgotten, each leaves a notice for the sender's machine, which is off (one from before notices too)",
+      None not in rows and left == 0 and sorted(m.get("reply_to") for m in outbox if m.get("from_agent") == "reason-network") == sorted(r[0] for r in rows),
+      (rows, outbox))
 cli("alice", "team")
-for _ in range(30):
-    if "Not delivered" in cli("alice", "held"):
+for _ in range(60):
+    if cli("alice", "held").count("Not delivered") == 2:
         break
     time.sleep(1)
 cli("alice", "approve", "--all")  # alice holds messages from alex (the hold policy above)
+codex = Mcp("alice", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "work"))
 out = codex.tool("check_inbox", {}, meta)
-when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(row[1] / 1000)) if row else "?"
-check("the sender gets it once back: who the mail was for, when it was sent, its first line",
-      f'Not delivered: your message to alex/drop-codex (sent {when}) was dropped unread: "dropped unread (e2e test)"' in message_with(out, "Not delivered")
-      and "second line" not in out and "From Reason Network on alex's machine." in out, out)
+for body, row in zip(bodies, rows):
+    first = body.splitlines()[0]
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(row[1] / 1000)) if row else "?"
+    check(f"the sender gets it once back: who the mail was for, when it was sent, its first line ({first})",
+          f'Not delivered: your message to alex/drop-codex (sent {when}) was dropped unread: "{first}"' in message_with(out, f'"{first}"'), out)
+check("…only the first line, from Reason Network", "second line" not in out and "From Reason Network on alex's machine." in out, out)
 out = codex.tool("check_inbox", {}, meta)
 check("…once", "Not delivered" not in out, out)
 

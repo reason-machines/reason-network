@@ -239,7 +239,7 @@ impl Daemon {
             store.get("team")?.and_then(|s| serde_json::from_str(&s).ok()).map(TeamState::without_odd_names);
         // In a team, who we are is what the signed roster says, whatever the config file says.
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
-        Ok(Daemon {
+        let daemon = Daemon {
             usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
             machine: member.map_or_else(util::hostname, |m| m.machine),
@@ -270,7 +270,11 @@ impl Daemon {
             started: util::now_ms(),
             plain_until: Mutex::new(None),
             capped: Default::default(),
-        })
+        };
+        if let Err(e) = daemon.find_sources(&daemon.inner.lock().unwrap()) {
+            log(&format!("finding where mail from before notices came from: {e:#}"));
+        }
+        Ok(daemon)
     }
 
     fn addr(&self, name: &str) -> String {
