@@ -160,17 +160,25 @@ pub fn command_for(name: &str) -> Option<(PathBuf, Vec<PathBuf>)> {
     Some((bin, vec![]))
 }
 
-/// Node and the script an npm or pnpm `.cmd` shim in `dir` runs (`"%dp0%\node_modules\…\codex.js" %*`): the node
-/// beside the shim if there is one, as the shim itself prefers, else the one on `PATH`.
+/// Node and the script an npm or pnpm `.cmd` shim in `dir` runs (`"%dp0%\\node_modules\\…\\codex.js" %*`): the node
+/// beside the shim if there is one, as the shim itself prefers, else the one on `PATH`. Only when the shim runs that
+/// script with node and nothing else in between (no flags, not bun): any other shim is left to run as it is.
 #[cfg(any(windows, test))]
 fn node_shim(shim: &str, dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    let script = shim.split('"').find_map(|part| {
+    let lower = shim.to_ascii_lowercase();
+    let script = shim.match_indices('"').find_map(|(at, _)| {
+        let part = shim[at + 1..].split('"').next()?;
         let rest = part.strip_prefix("%dp0%\\").or_else(|| part.strip_prefix("%~dp0\\"))?;
-        let lower = rest.to_ascii_lowercase();
-        [".js", ".cjs", ".mjs"]
-            .iter()
-            .any(|ext| lower.ends_with(ext))
-            .then(|| rest.split(['\\', '/']).fold(dir.to_path_buf(), |p, c| p.join(c)))
+        let ext = rest.to_ascii_lowercase();
+        if ![".js", ".cjs", ".mjs"].iter().any(|e| ext.ends_with(e)) {
+            return None;
+        }
+        // What runs it: npm's `"%_prog%"` (node beside the shim, else `node`), node.exe, or plain `node`.
+        let before = lower[..at].rsplit(['\n', '&', '(']).next()?.trim();
+        let by_node = (before.ends_with("\"%_prog%\"") && lower.contains("_prog=node\""))
+            || before.ends_with("\\node.exe\"")
+            || before.trim_start_matches('@') == "node";
+        by_node.then(|| rest.split(['\\', '/']).fold(dir.to_path_buf(), |p, c| p.join(c)))
     })?;
     if !script.is_file() {
         return None;
@@ -539,6 +547,42 @@ mod tests {
         // A shim that runs no Node script, or one that isn't there, is left to run as it is.
         assert_eq!(node_shim("@echo off\r\n\"%dp0%\\codex.exe\" %*\r\n", d.as_path()), None);
         assert_eq!(node_shim(&npm.replace("codex.js", "gone.js"), d.as_path()), None);
+        // Plain `node` (pnpm's ELSE branch), and only node: not bun, and not node with flags we'd drop.
+        let plain = "@SETLOCAL\r\nnode  \"%~dp0\\..\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n";
+        assert!(node_shim(plain, &sub).is_some());
+        assert_eq!(
+            node_shim(&npm.replace("_prog=node\"", "_prog=bun\"").replace("node.exe", "bun.exe"), d.as_path()),
+            None
+        );
+        let flags = npm.replace("\"%_prog%\"  \"%dp0%", "\"%_prog%\" --no-warnings \"%dp0%");
+        assert_eq!(node_shim(&flags, d.as_path()), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The point of it, on Windows itself: a message with line breaks and cmd.exe's special characters reaches the
+    /// script npm installed, as it was sent.
+    #[cfg(windows)]
+    #[test]
+    fn a_message_with_line_breaks_reaches_an_npm_installed_script() {
+        let Some(node) = find_bin("node") else { return };
+        let d = std::env::temp_dir().join(format!("reason-network-shim-run-{}", ulid::Ulid::generate()));
+        let bin = d.join("node_modules").join("x").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let out = d.join("args.json");
+        std::fs::write(
+            bin.join("x.js"),
+            format!("require('fs').writeFileSync({:?}, JSON.stringify(process.argv.slice(2)))", out.to_str().unwrap()),
+        )
+        .unwrap();
+        let shim =
+            "@ECHO off\r\nSETLOCAL\r\nSET \"_prog=node\"\r\n\"%_prog%\"  \"%dp0%\\node_modules\\x\\bin\\x.js\" %*\r\n";
+        let (prog, pre) = node_shim(shim, &d).unwrap();
+        assert_eq!(prog, node);
+        let text = "<reason-message from=\"a\">\r\nline & two %PATH% ^ | < > \"quoted\"\n</reason-message>";
+        let status = std::process::Command::new(prog).args(&pre).args(["queue", "--message", text]).status().unwrap();
+        assert!(status.success());
+        let got: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(got, ["queue", "--message", text]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
