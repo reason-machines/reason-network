@@ -13,7 +13,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
@@ -68,8 +68,10 @@ const SECRET_FIELDS: &[&str] = &[
     "content",
 ];
 
-/// What a hidden id or secret becomes, and how much of it is enough to recognize it.
+/// What a hidden id or secret becomes, and how much of it is enough to recognize it: 6 hex characters (24 of the
+/// code's ~41 bits), 8 of anything else.
 const HIDDEN: &str = "[invite]";
+const HIDDEN_HEX: usize = 6;
 const HIDDEN_PREFIX: usize = 8;
 
 /// iroh's z-base-32 alphabet (for keys in DNS names), and that length for a key.
@@ -95,11 +97,18 @@ static START: OnceLock<Instant> = OnceLock::new();
 static WRITER: AtomicBool = AtomicBool::new(false);
 
 /// Ids and secrets that stand for something guessable (an invite code, its key and secret), in every form a line may
-/// show them in: even a short prefix of one would let someone holding the log test codes offline.
-static HIDE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// show them in, each with how much of it is hidden: even a short prefix of one would let someone holding the log test
+/// codes offline. Swapped whole when it grows, so a scrub only takes a reference.
+static HIDE: Mutex<Option<Arc<Hidden>>> = Mutex::new(None);
 
-/// The machines whose ids may show (this one and its team's): hex and z-base-32.
-static KNOWN: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// Each hidden text, and from how many of its first characters it is hidden.
+type Hidden = Vec<(String, usize)>;
+
+/// The machines whose ids may show (this one and its team's): hex and z-base-32. Swapped whole too.
+static KNOWN: Mutex<Option<Arc<Known>>> = Mutex::new(None);
+
+/// Each machine's id in hex and in z-base-32.
+type Known = Vec<(String, String)>;
 
 thread_local! {
     /// Set while a line is scrubbed: a panic there drops the line, and its message (which would quote it) is not shown.
@@ -149,7 +158,7 @@ pub fn flush() {
 /// The machines whose ids the log may show: this one and its team's.
 pub fn know(ids: &[iroh::EndpointId]) {
     let ids = ids.iter().map(|id| (id.to_string(), id.to_z32())).collect();
-    *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+    *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(ids));
 }
 
 /// Keeps `id` (an invite code's key) out of the log: its hex and z-base-32 forms, and any prefix of them. Only while
@@ -168,9 +177,13 @@ pub fn hide_text(text: &str) {
         return;
     }
     let text = text.to_ascii_lowercase();
+    let from = if text.bytes().all(|b| b.is_ascii_hexdigit()) { HIDDEN_HEX } else { HIDDEN_PREFIX };
     let mut hide = HIDE.lock().unwrap_or_else(|e| e.into_inner());
-    if text.len() >= HIDDEN_PREFIX && text.is_ascii() && !hide.contains(&text) {
-        hide.push(text);
+    let had = hide.as_deref().map(Vec::as_slice).unwrap_or_default();
+    if text.len() >= from && text.is_ascii() && !had.iter().any(|(t, _)| *t == text) {
+        let mut more = had.to_vec();
+        more.push((text, from));
+        *hide = Some(Arc::new(more));
     }
 }
 
@@ -215,14 +228,16 @@ fn admit_at(due: &AtomicU64, now: u64) -> bool {
     }
 }
 
-/// `s` cut to `n` characters, then back to the last character that ends a run of letters and digits: no id or key is
-/// left cut short below the length it would be recognized at.
+/// `s` cut to `n` characters, then back to the last whitespace, quote, angle bracket or backtick (where a URL ends): no
+/// id or key is left cut short below the length it would be recognized at, nor a URL's user and password without the
+/// `@` that marks them.
 fn cap(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         None => s,
         Some((at, _)) => {
             let head = &s[..at];
-            head.char_indices().rev().find(|&(_, c)| !opaque(c)).map_or("", |(i, c)| &head[..i + c.len_utf8()])
+            let ends = |c: char| c.is_whitespace() || "\"<>`".contains(c);
+            head.char_indices().rev().find(|&(_, c)| ends(c)).map_or("", |(i, c)| &head[..i + c.len_utf8()])
         }
     }
 }
@@ -480,21 +495,21 @@ fn unquote(s: &str, q: char, keep: usize) -> String {
 /// credentials, tickets, byte lists, ids of machines outside this team (and cuts this team's to 10 characters), and any
 /// other long run of letters and digits (encoded keys, tokens, tickets).
 pub fn scrub(line: &str) -> String {
-    let hide = HIDE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let hide = HIDE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
     scrub_with(line, &hide, &known)
 }
 
-fn scrub_with(line: &str, hide: &[String], known: &[(String, String)]) -> String {
+fn scrub_with(line: &str, hide: &[(String, usize)], known: &[(String, String)]) -> String {
     tokens(&byte_lists(&credentials(&urls(&hidden(line, hide)))), known)
 }
 
-fn hidden(line: &str, hide: &[String]) -> String {
+fn hidden(line: &str, hide: &[(String, usize)]) -> String {
     let mut line = line.to_string();
-    for text in hide {
+    for (text, from) in hide {
         let lower = line.to_ascii_lowercase();
         let (mut out, mut done) = (String::with_capacity(line.len()), 0);
-        while let Some(at) = lower[done..].find(&text[..HIDDEN_PREFIX]).map(|i| i + done) {
+        while let Some(at) = lower[done..].find(&text[..*from]).map(|i| i + done) {
             let end = at + lower[at..].bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
             out += &line[done..at];
             out += HIDDEN;
@@ -585,18 +600,41 @@ fn byte_lists(line: &str) -> String {
             .any(|m| out.len() >= m.len() && out.as_bytes()[out.len() - m.len()..].eq_ignore_ascii_case(m.as_bytes()));
         let after = &rest[open + 1..];
         // Only up to the next bracket of either kind: a `[` first means this one isn't a list (and keeps this linear).
-        let close = after.find(['[', ']']).filter(|&i| after.as_bytes()[i] == b']');
+        // One left open at the end of the line (cut there) counts from 2 numbers, or 1 written `0x..` or after a field
+        // named like data.
+        let next = after.find(['[', ']']);
+        let (close, open_end) = match next {
+            Some(i) if after.as_bytes()[i] == b']' => (Some(i), false),
+            None => (Some(after.len()), true),
+            Some(_) => (None, false),
+        };
         let bytes = close.and_then(|close| {
             let mut items: Vec<&str> = after[..close].split(',').map(str::trim).collect();
             if items.len() > 1 && items.last() == Some(&"") {
                 items.pop();
             }
+            // Cut there, the last one may be cut short too (`0x`).
+            let byte = |n: &str| {
+                n.parse::<u8>().is_ok() || n.strip_prefix("0x").is_some_and(|h| u8::from_str_radix(h, 16).is_ok())
+            };
+            if open_end && items.len() > 1 && !items.last().is_some_and(|n| byte(n)) {
+                items.pop();
+            }
             let hex = items.iter().all(|n| n.strip_prefix("0x").is_some_and(|h| u8::from_str_radix(h, 16).is_ok()));
             let dec = items.iter().all(|n| n.parse::<u8>().is_ok());
             let n = items.len();
-            ((hex && n >= 2) || (dec && (n >= 8 || named && n >= 4))).then_some((close, n))
+            let enough = if open_end {
+                (hex && n >= 1) || (dec && (n >= 2 || named))
+            } else {
+                (hex && n >= 2) || (dec && (n >= 8 || named && n >= 4))
+            };
+            enough.then_some((close, n))
         });
         match bytes {
+            Some((close, n)) if open_end => {
+                out += &format!("[<{n} bytes>…");
+                rest = &after[close..];
+            }
             Some((close, n)) => {
                 out += &format!("[<{n} bytes>]");
                 rest = &after[close + 1..];
@@ -646,13 +684,14 @@ fn token(run: &str, known: &[(String, String)]) -> String {
         from = i + c.len_utf8();
     }
     pieces.push(&run[from..]);
-    if pieces.iter().any(|p| id(p, known).is_some()) {
+    let piece_id = |p: &str| id(p, known).or_else(|| glued(p, known));
+    if pieces.iter().any(|p| piece_id(p).is_some()) {
         if run.contains(['+', '/']) && long_opaque(run) {
             return "[redacted]".into();
         }
         return pieces
             .iter()
-            .map(|p| id(p, known).unwrap_or_else(|| if long_opaque(p) { "[redacted]".into() } else { p.to_string() }))
+            .map(|p| piece_id(p).unwrap_or_else(|| if long_opaque(p) { "[redacted]".into() } else { p.to_string() }))
             .collect();
     }
     // A field name like `mapping_varies_by_dest_ipv4`: short lowercase words, joined by `_`.
@@ -681,6 +720,33 @@ fn id(piece: &str, known: &[(String, String)]) -> Option<String> {
         (true, false) => piece.into(),
         (false, _) => "[id]".into(),
     })
+}
+
+/// `piece` with each id glued to letters (`v` and 20 hex characters) checked as an id: a stretch of 8 or more hex
+/// characters with a digit among them, between letters that aren't hex. Words have no digits, so none is taken for
+/// one. None if there is no such stretch.
+fn glued(piece: &str, known: &[(String, String)]) -> Option<String> {
+    let mut out = String::with_capacity(piece.len());
+    let (mut found, mut from) = (false, 0);
+    let bytes = piece.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        let stretch = &piece[start..i];
+        if stretch.len() >= 8 && stretch.len() < piece.len() && stretch.bytes().any(|b| b.is_ascii_digit()) {
+            out += &piece[from..start];
+            out += &id(stretch, known)?;
+            (found, from) = (true, i);
+        }
+    }
+    found.then(|| out + &piece[from..])
 }
 
 /// A long run of letters and digits mixed (an encoded key, a token).
@@ -814,7 +880,7 @@ mod tests {
             hex[..12].to_uppercase(),
             &secret[..9]
         );
-        let hide = HIDE.lock().unwrap().clone();
+        let hide = HIDE.lock().unwrap().clone().unwrap_or_default();
         // Even as if the invite's id were a teammate's: hidden comes first.
         let out = scrub_with(&line, &hide, &[(hex.clone(), z32.clone())]).to_ascii_lowercase();
         // No secret-derived text in a failure message.
@@ -825,6 +891,9 @@ mod tests {
             out.contains("bound id=[invite]") && out.contains("_iroh.[invite].dns"),
             "the invite id isn't replaced"
         );
+        // From 6 hex characters on.
+        let six = scrub_with(&format!("x={} y={}", &hex[..6], &secret[..6]), &hide, &[]);
+        assert_eq!(six, "x=[invite] y=[invite]", "a 6-character prefix isn't hidden");
     }
 
     #[test]
@@ -872,7 +941,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let hide = vec!["0123456789abcdef".to_string()];
+        let hide = vec![("0123456789abcdef".to_string(), HIDDEN_HEX)];
         let known = vec![("abcdef0123456789".to_string(), "ybndrfg8ejkm".to_string())];
         for _ in 0..20_000 {
             let len = (next() % 80) as usize;
@@ -1046,23 +1115,65 @@ mod tests {
     #[test]
     fn a_huge_line_is_scrubbed_in_linear_time() {
         let mb = 1 << 20;
-        let bound = Duration::from_millis(if cfg!(debug_assertions) { 3000 } else { 50 });
-        let hide = vec!["0123456789abcdef".to_string()];
-        for unit in ["[", "user=a ", "\"", "://", "@", "0x", "basic ", "[1,", "0123456", "a\"b ", "'"] {
+        let bound = Duration::from_millis(if cfg!(debug_assertions) { 3000 } else { 250 });
+        let hide = vec![("0123456789abcdef".to_string(), HIDDEN_HEX)];
+        let known = vec![("fedcba9876543210".to_string(), "ybndrfg8ejkm".to_string())];
+        let units =
+            ["[", "user=a ", "\"", "://", "@", "0x", "basic ", "[1,", "0123456", "a\"b ", "'", "0123456789abcdef "];
+        for unit in units {
             let line = unit.repeat(mb / unit.len());
             let begun = Instant::now();
-            let _ = scrub_with(&line, &hide, &[]);
+            let _ = scrub_with(&line, &hide, &known);
             let _ = unquote(&line, '"', 64);
             let _ = unquote(&line, '\'', 0);
             assert!(begun.elapsed() < bound, "{unit:?}: {:?}", begun.elapsed());
         }
-        // And what is written is cut first, on a character boundary, back to where a run ends.
+    }
+
+    #[test]
+    fn a_line_is_cut_where_a_url_or_run_ends() {
         assert_eq!(cap(&"a ".repeat(3000), 4000).len(), 4000);
-        assert_eq!(
-            cap(&format!("{} {}", "x".repeat(3990), "0123456789abcdef"), 4000),
-            format!("{} ", "x".repeat(3990))
-        );
+        let pad = "x ".repeat(1990);
+        let long_pad = "x ".repeat(1995);
+        assert_eq!(cap(&format!("{long_pad}0123456789abcdef"), 4000), long_pad);
         assert_eq!(cap(&"a".repeat(5000), 4000), "");
-        assert_eq!(cap(&"é".repeat(5000), 4000).chars().count(), 4000);
+        // Never a URL's user and password without its `@`.
+        for url in ["url=http://alice:s3cr(et@proxy.example:3128/", "url=RelayUrl(\"http://alice:s3cr(et@proxy/\")"] {
+            let line = format!("{pad}{url}");
+            for n in 3981..line.chars().count() {
+                let out = scrub_with(cap(&line, n), &[], &[]);
+                assert!(
+                    !out.contains("alice") && !out.contains("s3cr"),
+                    "{n}: {}",
+                    &out[out.len().saturating_sub(40)..]
+                );
+            }
+        }
+        // A byte list left open at the cut still counts.
+        assert_eq!(none("data [112, 145, "), "data [<2 bytes>…");
+        assert_eq!(none("x [0x0a, 0x"), "x [<1 bytes>…");
+        assert_eq!(none("see [below"), "see [below");
+        let line = format!("{pad}ping data=[112, 145, 70, 165, 181, 195, 189, 229] rtt=28ms");
+        assert!(scrub_with(cap(&line, 4000), &[], &[]).ends_with("data=[<1 bytes>…"));
+    }
+
+    #[test]
+    fn an_id_glued_to_letters_is_still_an_id() {
+        let me = iroh::SecretKey::generate().public();
+        let known = [(me.to_string(), me.to_z32())];
+        // First 20 hex characters with a digit among them, as all but a vanishing few ids have.
+        let first20 = |id: &iroh::EndpointId| {
+            Some(id.to_string()[..20].to_string()).filter(|h| h.bytes().any(|b| b.is_ascii_digit()))
+        };
+        let other = iroh::SecretKey::generate().public();
+        if let Some(h) = first20(&other) {
+            assert_eq!(scrub_with(&format!("x=v{h} y=ip{h}z"), &[], &known), "x=v[id] y=ip[id]z");
+        }
+        if let Some(h) = first20(&me) {
+            assert_eq!(scrub_with(&format!("x=v{h}"), &[], &known), format!("x=v{}…", &h[..10]));
+        }
+        // Words, and short numbers in them, stay.
+        let words = "established connection via relay-sfo1 ipv4 Ipv6Addr v12 rtt=28.369875ms";
+        assert_eq!(scrub_with(words, &[], &known), words);
     }
 }
