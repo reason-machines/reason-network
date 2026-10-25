@@ -1134,11 +1134,12 @@ impl Net {
                 let _ = tx.send(Wire::Ack { id, state, note });
             }
             Wire::Ack { id, state, note } => {
+                let waiter = self.acks.lock().unwrap().remove(&id);
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
                 if state != "retry" {
-                    daemon.outbox_done(&id, state != "refused");
+                    daemon.outbox_done(&id, state != "refused", waiter.is_some());
                 }
-                if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
+                if let Some(waiter) = waiter {
                     let _ = waiter.send((state, note));
                 }
             }

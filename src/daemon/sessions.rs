@@ -207,6 +207,11 @@ impl Daemon {
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
     /// registered again (each gets the time a hook-only session has to show it is there).
     fn forgetting(&self, now: i64) -> bool {
+        // Debug builds take `REASON_NETWORK_FORGET_GRACE_MS` instead, for tests.
+        #[cfg(debug_assertions)]
+        if let Some(grace) = crate::paths::env_var("FORGET_GRACE_MS").ok().and_then(|v| v.parse::<i64>().ok()) {
+            return now - self.started > grace;
+        }
         now - self.started > HOOK_TTL_MS
     }
 

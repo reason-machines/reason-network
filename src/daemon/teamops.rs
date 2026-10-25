@@ -143,8 +143,8 @@ impl Daemon {
         messages
     }
 
-    pub fn outbox_done(&self, id: &str, taken: bool) {
-        if self.inner.lock().unwrap().store.outbox_done(id, taken).unwrap_or(false) {
+    pub fn outbox_done(&self, id: &str, taken: bool, seen: bool) {
+        if self.inner.lock().unwrap().store.outbox_done(id, taken, seen).unwrap_or(false) {
             self.usage.stage(id, if taken { "accepted" } else { "rejected" });
         }
     }

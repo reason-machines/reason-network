@@ -828,7 +828,7 @@ impl Daemon {
             // Held for a session whose name is kept, it is that session's: it goes when the session does.
             let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
-            if g.store.insert(&mut msg, held)? && !held {
+            if g.store.insert_from(&mut msg, held, Some(&peer.to_string()))? && !held {
                 self.record_remote_received(&msg);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
@@ -917,6 +917,32 @@ impl Daemon {
         };
         self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref(), true);
         self.usage.count("received", dims, 1);
+    }
+
+    /// Checks for notices of mail dropped here (see [`crate::store::notice`]) every few seconds.
+    pub(super) async fn notices_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self.deliver_notices();
+        }
+    }
+
+    /// Hands notices for senders here to those that are live; the others' wait in their inbox like any mail. A
+    /// teammate's goes out with the rest of the outbox.
+    fn deliver_notices(self: &Arc<Self>) {
+        let mut g = self.inner.lock().unwrap();
+        let notices = g.store.take_notices();
+        if notices.is_empty() {
+            return;
+        }
+        for m in notices {
+            let name = m.to.split_once('/').map_or("", |(_, n)| n);
+            if let Some(key) = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone()) {
+                self.deliver(&mut g, &key, vec![m.clone()], m.wake);
+            }
+        }
+        drop(g);
+        self.arrived.notify_waiters();
     }
 
     /// Approves or drops held messages. Approved ones go to their session now.
@@ -1301,6 +1327,30 @@ mod tests {
             format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {name}")
         );
         assert_eq!(offline_note(None, 0), format!("queued: the session is offline; {name}"));
+    }
+
+    #[tokio::test]
+    async fn a_session_here_hears_when_its_mail_to_a_forgotten_session_is_dropped() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.register(Some(1), codex("codex:sender"), Default::default()).unwrap();
+        d.register(Some(2), codex("codex:receiver"), Default::default()).unwrap();
+        let receiver = gone(&d, "codex:receiver", 3 * HOUR);
+        let to = d.addr(&receiver);
+        let sent = d.send("codex:sender".into(), &to, "the plan\ndetails", None, true, false, None, Vec::new()).await;
+        let id = sent.unwrap().ids.remove(0);
+        {
+            let g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(&receiver).unwrap().unwrap();
+            g.store.forget_session(&r, &d.person).unwrap();
+        }
+        d.deliver_notices();
+        let inbox = d.inbox("codex:sender".into(), 0, false).await.unwrap();
+        assert_eq!(inbox.messages.len(), 1);
+        assert_eq!(inbox.messages[0].reply_to.as_ref(), Some(&id));
+        let text = &inbox.text;
+        assert!(text.contains(&format!("Not delivered: your message to {to}")), "{text}");
+        assert!(text.contains("dropped unread: \"the plan\"") && !text.contains("details"), "{text}");
+        assert!(text.contains(&format!("From Reason Network on {}'s machine.", d.person)), "{text}");
     }
 
     #[tokio::test]

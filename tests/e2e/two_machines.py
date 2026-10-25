@@ -5,7 +5,7 @@
 Needs internet (iroh relays/discovery). Run inside a Claude Code session, the simulated Claude session pushes its
 test messages into that real session (they say "ignore this").
 """
-import base64, json, os, re, subprocess, sys, tempfile, time
+import base64, json, os, re, sqlite3, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofs import TRUST, keygen, proof, serve_relay_lists
 
@@ -39,7 +39,9 @@ def check(name, ok, detail=""):
 def env(who, strip_claude=True):
     e = dict(os.environ, REASON_NETWORK_HOME=H[who], REASON_NETWORK_MACHINE=MACHINE[who], REASON_NETWORK_NO_MDNS="1", REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_CODEX_BIN=FAKE_CODEX)
     e.update({"HOME": os.path.join(D, "home"), "PATH": FAKE_BIN + os.pathsep + os.environ["PATH"], "REASON_NETWORK_NO_UPDATE": "1",
-              "REASON_NETWORK_NO_TRAY": "1", "REASON_NETWORK_TRUST_KEYS": TRUST, "REASON_NETWORK_RELAYS_URL": RELAYS_URL})
+              "REASON_NETWORK_NO_TRAY": "1", "REASON_NETWORK_TRUST_KEYS": TRUST, "REASON_NETWORK_RELAYS_URL": RELAYS_URL,
+              # Sessions gone a day are forgotten from the start, not six hours after it (debug builds only).
+              "REASON_NETWORK_FORGET_GRACE_MS": "0"})
     e.update({"REASON_NETWORK_OSASCRIPT_BIN": FAKE_NOTIFY, "REASON_NETWORK_NOTIFY-SEND_BIN": FAKE_NOTIFY, "DBUS_SESSION_BUS_ADDRESS": "test",
               "NOTIFY_LOG": os.path.join(D, f"notify-{who}.log")})
     if strip_claude:
@@ -632,6 +634,41 @@ cli("alice", "stop")
 time.sleep(3)
 cli("alice", "team")
 time.sleep(5)
+
+# --- a session forgotten with mail it never read: the sender hears, even when its machine was off then ---
+os.makedirs(os.path.join(D, "drop"))
+dropper = Mcp("alex", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "drop"))
+dropper.tool("list_team", {}, {"sessionId": "44444444-dddd", "threadId": "44444444-dddd"})
+dropper.close()
+time.sleep(4)
+body = "dropped unread (e2e test)\nthis second line isn't quoted"
+out = codex.tool("send_message", {"to": "alex/drop-codex", "message": body}, meta)
+check("mail for a session that is offline is queued on its machine", "queued: last seen" in out, out)
+cli("alice", "stop")
+db = sqlite3.connect(os.path.join(H["alex"], "network.db"), timeout=30)
+row = db.execute("SELECT id, sent_at FROM messages WHERE body = ?", (body,)).fetchone()
+db.execute("UPDATE sessions SET last_seen = ? WHERE name = 'drop-codex'", (int(time.time() * 1000) - 2 * 86_400_000,))
+db.commit()
+cli("alex", "who")  # a day gone: forgotten, with its mail
+time.sleep(1)
+outbox = [json.loads(m) for (m,) in db.execute("SELECT msg FROM outbox WHERE target = ?", (ep["alice"],))]
+dropped = db.execute("SELECT 1 FROM messages WHERE body = ?", (body,)).fetchone()
+db.close()
+check("…dropped once the session is forgotten, it leaves a notice for the sender's machine, which is off",
+      row is not None and dropped is None and [m.get("reply_to") for m in outbox if m.get("from_agent") == "reason-network"] == [row[0]], (row, outbox))
+cli("alice", "team")
+for _ in range(30):
+    if "Not delivered" in cli("alice", "held"):
+        break
+    time.sleep(1)
+cli("alice", "approve", "--all")  # alice holds messages from alex (the hold policy above)
+out = codex.tool("check_inbox", {}, meta)
+when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(row[1] / 1000)) if row else "?"
+check("the sender gets it once back: who the mail was for, when it was sent, its first line",
+      f'Not delivered: your message to alex/drop-codex (sent {when}) was dropped unread: "dropped unread (e2e test)"' in message_with(out, "Not delivered")
+      and "second line" not in out and "From Reason Network on alex's machine." in out, out)
+out = codex.tool("check_inbox", {}, meta)
+check("…once", "Not delivered" not in out, out)
 
 # --- offline machine: outbox ---
 codex.close()
