@@ -189,6 +189,10 @@ out = cli("alice", "proof", proof("u_alice", "alicia", ep["alice"]))
 check("…but not one for another name", "this proof is for alicia, but this machine is alice in the team" in out, out)
 # Someone else signed in, or not at all, can't be alex or alice; a proof Reason didn't sign, or for another machine, gets nobody in.
 mal = dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, "mallory"), REASON_NETWORK_MACHINE="evil")
+# mallory's machine keeps a debug log too: it dials the team's machines, which aren't its team's.
+os.makedirs(os.path.join(D, "mallory"), exist_ok=True)
+with open(os.path.join(D, "mallory", "config.toml"), "w") as f:
+    f.write("debug_log = true\n")
 mal_ep = run(mal, "endpoint")[0]
 out, both = run(mal, "join", link.group(1), "--proof", proof("u_mallory", "alex", mal_ep), "--no-setup", "--json")
 check("a name verified by another account is taken: name_taken", as_json(out) == {"error": "name_taken"}, both)
@@ -671,7 +675,7 @@ check("debug_log = true writes the networking library's events to debug.log",
       all(re.search(r"^\[\d+\] (DEBUG|INFO|WARN|ERROR) (iroh|noq)", t, re.M) for t in text.values()), {w: t[:300] for w, t in text.items()})
 check("…and the daemon's own network lines", "net: connected to" in text["alice"], text["alice"][:500])
 check("…readable by its owner only", os.name == "nt" or all(os.stat(p).st_mode & 0o777 == 0o600 for p in logs.values()), logs)
-check("without debug_log, no debug log", not any(os.path.exists(os.path.join(D, h, "debug.log")) for h in ("bob2", "mallory", "sam")))
+check("without debug_log, no debug log", not any(os.path.exists(os.path.join(D, h, "debug.log")) for h in ("bob2", "sam", "lena")))
 key = open(os.path.join(H["alice"], "machine.key"), "rb").read()
 said = ["hello from alex's terminal", "dinner at 8?", "can you approve the deploy?", "codex here", "yes, ship it",
         "first words from a new session", "answered at once", "broadcast", "sent while you were offline",
@@ -689,6 +693,11 @@ machines = [run(dict(env("alice"), REASON_NETWORK_HOME=os.path.join(D, h)), "end
 ids = set(re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{10})(?:…)?(?![0-9A-Za-z])", alltext))
 unknown = sorted(i for i in ids if re.search(r"[a-f]", i) and not any(m.startswith(i) for m in machines))
 check("…and every id in the logs is one of the machines'", not unknown, unknown)
+# A machine outside the team (mallory's, or one on the local network) shows only as [id], on either side.
+mal_log = open(os.path.join(D, "mallory", "debug.log"), errors="replace").read() if os.path.exists(os.path.join(D, "mallory", "debug.log")) else ""
+check("ids of machines outside this one's team show as [id]: mallory's log names the team's machines only that way",
+      "[id]" in mal_log and not any(ep[w][:10] in mal_log for w in ("alex", "alice")), mal_log[:300])
+check("…and the team's logs never show mallory's machine", mal_ep[:10] not in alltext and mal_ep[:8] not in alltext)
 for code_ in re.findall(r"One-time code for a teammate: ([a-z]+(?:-[a-z]+){3})", out_codes):
     check(f"…nor the code itself", code_ not in alltext and code_.replace("-", " ") not in alltext.lower())
 log = open(UNEXPECTED).read() if os.path.exists(UNEXPECTED) else ""

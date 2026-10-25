@@ -42,7 +42,18 @@ impl Daemon {
         g.team.as_ref().map(|t| t.active().map(|m| m.endpoint).filter(|e| *e != me).collect()).unwrap_or_default()
     }
 
+    /// The machines whose ids the debug log shows (in part): this one and its team's. Any other id is left out.
+    pub(super) fn known_to_debug_log(&self, team: Option<&TeamState>) {
+        if !self.cfg.debug_log {
+            return;
+        }
+        let mut ids = vec![self.key.public()];
+        ids.extend(team.into_iter().flat_map(|t| t.members.values().map(|m| m.body.endpoint)));
+        crate::debuglog::know(&ids);
+    }
+
     fn save_team(&self, g: &Inner) -> Result<()> {
+        self.known_to_debug_log(g.team.as_ref());
         match &g.team {
             Some(t) => g.store.set("team", &serde_json::to_string(t)?),
             None => g.store.delete_prefix("team"),

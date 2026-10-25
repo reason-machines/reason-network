@@ -1,16 +1,22 @@
 //! The debug log, for working out why connections drop or switch to a relay. Off unless `debug_log = true` in
 //! config.toml. The daemon then writes the networking library's own events (iroh and its QUIC, at debug level) and its
 //! own network lines to `debug.log` next to `daemon.log`, on this machine only. What could carry message text, files,
-//! tickets, links, codes or keys stays out of it: only networking targets are kept, fields named like secrets are
-//! dropped, and every line is scrubbed before it is written.
+//! tickets, links, codes, keys or other people's machines stays out of it: only networking targets are kept, fields
+//! named like secrets are dropped, and every line is scrubbed before it is written. Only ids of this machine and its
+//! team's show (cut to 10 characters); any other id is `[id]`.
 
 use crate::{paths, util};
 use std::{
+    cell::Cell,
     fmt,
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
+    },
     time::{Duration, Instant},
 };
 use tracing_core::{
@@ -25,26 +31,64 @@ use tracing_core::{
 const MAX_BYTES: u64 = 4 << 20;
 
 /// Lines in a burst, then this many a second: a flood (of packets from a peer, say) can't fill the file and push out
-/// what came before it.
-const BURST: f64 = 300.0;
-const PER_SECOND: f64 = 5.0;
+/// what came before it. Starting up and connecting is a few hundred.
+const BURST: f64 = 2000.0;
+const PER_SECOND: f64 = 50.0;
+
+/// Lines waiting for the writer; past this they are left out (and counted), never waited for.
+const QUEUE: usize = 4096;
 
 /// Where the networking library's events come from: iroh's crates, its QUIC (noq), and the network watchers.
 const TARGETS: &[&str] = &["iroh", "noq", "netwatch", "portmapper"];
 
+/// Left out although under `TARGETS`: mDNS discovery logs every machine on the local network and what it announces.
+const NOT_TARGETS: &[&str] = &["iroh_mdns_address_lookup"];
+
 /// Fields whose names say they may hold a secret or someone's content are left out whole.
-const SECRET_FIELDS: &[&str] =
-    &["secret", "private", "token", "password", "ticket", "auth", "cookie", "credential", "payload", "body", "content"];
+const SECRET_FIELDS: &[&str] = &[
+    "secret",
+    "private",
+    "token",
+    "password",
+    "username",
+    "ticket",
+    "auth",
+    "cookie",
+    "credential",
+    "payload",
+    "body",
+    "content",
+];
 
 /// What a hidden id or secret becomes, and how much of it is enough to recognize it.
 const HIDDEN: &str = "[invite]";
 const HIDDEN_PREFIX: usize = 8;
 
-static LOG: OnceLock<Mutex<Writer>> = OnceLock::new();
+/// iroh's z-base-32 alphabet (for keys in DNS names), and that length for a key.
+const Z32: &str = "ybndrfg8ejkmcpqxot1uwisza345h769";
+const Z32_KEY: usize = 52;
 
-/// Ids and secrets that stand for something guessable (an invite code's key and secret), in every form a line may show
-/// them in: even a short prefix of one would let someone holding the log test codes offline.
+enum Msg {
+    Line(String, bool),
+    Flush(SyncSender<()>),
+}
+
+static LOG: OnceLock<SyncSender<Msg>> = OnceLock::new();
+
+/// Lines left out because the writer was behind.
+static BEHIND: AtomicU64 = AtomicU64::new(0);
+
+/// Ids and secrets that stand for something guessable (an invite code, its key and secret), in every form a line may
+/// show them in: even a short prefix of one would let someone holding the log test codes offline.
 static HIDE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The machines whose ids may show (this one and its team's): hex and z-base-32.
+static KNOWN: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// Set while a line is scrubbed: a panic there drops the line, and its message (which would quote it) is not shown.
+    static SCRUBBING: Cell<bool> = const { Cell::new(false) };
+}
 
 pub fn path() -> PathBuf {
     paths::home().join("debug.log")
@@ -53,18 +97,35 @@ pub fn path() -> PathBuf {
 /// Turns the log on for this process (the daemon, when its config says so). Says why not if it can't be.
 pub fn start() -> Result<(), String> {
     let writer = Writer::open(path()).map_err(|e| format!("can't write {}: {e}", path().display()))?;
-    LOG.set(Mutex::new(writer)).map_err(|_| "already on".to_string())?;
+    let (tx, rx) = sync_channel(QUEUE);
+    std::thread::Builder::new().name("debug-log".into()).spawn(move || writer.run(rx)).map_err(|e| e.to_string())?;
     dispatcher::set_global_default(Dispatch::new(Networking)).map_err(|e| e.to_string())?;
-    // Written out every couple of seconds, so a quiet stretch still shows what came before it.
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
-            if let Some(log) = LOG.get() {
-                log.lock().unwrap_or_else(|e| e.into_inner()).flush();
-            }
+    LOG.set(tx).map_err(|_| "already on".to_string())?;
+    let shown = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if SCRUBBING.with(Cell::get) {
+            return;
         }
-    });
+        flush();
+        shown(info);
+    }));
     Ok(())
+}
+
+/// Writes out what is waiting (before the process exits, say), waiting at most a second.
+pub fn flush() {
+    if let Some(tx) = LOG.get() {
+        let (ack, done) = sync_channel(1);
+        if tx.try_send(Msg::Flush(ack)).is_ok() {
+            let _ = done.recv_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
+/// The machines whose ids the log may show: this one and its team's.
+pub fn know(ids: &[iroh::EndpointId]) {
+    let ids = ids.iter().map(|id| (id.to_string(), id.to_z32())).collect();
+    *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = ids;
 }
 
 /// Keeps `id` (an invite code's key) out of the log: its hex and z-base-32 forms, and any prefix of them.
@@ -73,11 +134,11 @@ pub fn hide(id: &iroh::EndpointId) {
     hide_text(&id.to_z32());
 }
 
-/// Keeps `text` (a secret that stands for a guessable code) and any prefix of it out of the log.
+/// Keeps `text` (a code, or a secret that stands for one) and any prefix of it out of the log.
 pub fn hide_text(text: &str) {
     let text = text.to_ascii_lowercase();
     let mut hide = HIDE.lock().unwrap_or_else(|e| e.into_inner());
-    if text.len() >= HIDDEN_PREFIX && !hide.contains(&text) {
+    if text.len() >= HIDDEN_PREFIX && text.is_ascii() && !hide.contains(&text) {
         hide.push(text);
     }
 }
@@ -87,14 +148,21 @@ pub fn hide_text(text: &str) {
 pub fn ours(what: &str, msg: &str) {
     if LOG.get().is_some() {
         let msg = unquote(&unquote(&unquote(msg, '"', 0), '`', 0), '\'', 0);
-        write(&format!("{what}: {msg}"));
+        write(&format!("{what}: {msg}"), false);
     }
 }
 
-fn write(line: &str) {
-    if let Some(log) = LOG.get() {
-        let line = format!("[{}] {}\n", util::now_ms(), util::one_line(&scrub(line), 4000));
-        log.lock().unwrap_or_else(|e| e.into_inner()).line(line.as_bytes());
+/// Scrubs `line` and hands it to the writer; `urgent` ones are written out at once. Dropped if scrubbing fails or the
+/// writer is behind.
+fn write(line: &str, urgent: bool) {
+    let Some(tx) = LOG.get() else { return };
+    SCRUBBING.with(|s| s.set(true));
+    let scrubbed = std::panic::catch_unwind(|| scrub(line));
+    SCRUBBING.with(|s| s.set(false));
+    let Ok(scrubbed) = scrubbed else { return };
+    let line = format!("[{}] {}\n", util::now_ms(), util::one_line(&scrubbed, 4000));
+    if let Err(TrySendError::Full(_)) = tx.try_send(Msg::Line(line, urgent)) {
+        BEHIND.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -116,7 +184,35 @@ impl Writer {
         Ok(Writer { path, file, len, tokens: BURST, filled: Instant::now(), dropped: 0 })
     }
 
-    /// Writes `line` unless the rate limit is spent; says how many were left out once there is room again.
+    /// The writer thread: lines as they come, written out every 2 seconds (at once for urgent ones), with a count of
+    /// any left out.
+    fn run(mut self, rx: Receiver<Msg>) {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Msg::Line(line, urgent)) => {
+                    self.line(line.as_bytes());
+                    if urgent {
+                        self.flush();
+                    }
+                }
+                Ok(Msg::Flush(ack)) => {
+                    self.note_dropped();
+                    self.flush();
+                    let _ = ack.send(());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.note_dropped();
+                    self.flush();
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.flush();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Writes `line` unless the rate limit is spent (then it is counted).
     fn line(&mut self, line: &[u8]) {
         let now = Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.filled).as_secs_f64() * PER_SECOND).min(BURST);
@@ -126,33 +222,45 @@ impl Writer {
             return;
         }
         self.tokens -= 1.0;
-        if self.dropped > 0 {
-            let note = format!("[{}] ({} lines left out: too many at once)\n", util::now_ms(), self.dropped);
-            self.dropped = 0;
-            let _ = self.write(note.as_bytes());
-        }
-        let _ = self.write(line);
+        self.write(line);
     }
 
-    fn write(&mut self, line: &[u8]) -> std::io::Result<()> {
-        if self.len > 0 && self.len + line.len() as u64 > MAX_BYTES {
-            // Closed first: Windows doesn't rename a file that is open.
+    /// Says how many lines were left out since it last said, if any.
+    fn note_dropped(&mut self) {
+        let n = self.dropped + BEHIND.swap(0, Ordering::Relaxed);
+        self.dropped = 0;
+        if n > 0 {
+            self.write(format!("[{}] ({n} lines left out: too many at once)\n", util::now_ms()).as_bytes());
+        }
+    }
+
+    fn write(&mut self, line: &[u8]) {
+        if self.len > 0 && self.len + line.len() as u64 > MAX_BYTES && self.file.is_some() {
             if let Some(mut file) = self.file.take() {
                 let _ = file.flush();
             }
+            // Closed first: Windows doesn't rename a file that is open.
             let mut old = self.path.clone().into_os_string();
             old.push(".1");
             if std::fs::rename(&self.path, old).is_err() {
                 let _ = std::fs::remove_file(&self.path);
             }
             // Started over even if the full one is still there: never past the cap. If that fails too, the log stops.
-            self.file = Some(BufWriter::with_capacity(64 << 10, open_private(&self.path, true)?));
-            self.len = 0;
+            match open_private(&self.path, true) {
+                Ok(file) => {
+                    self.file = Some(BufWriter::with_capacity(64 << 10, file));
+                    self.len = 0;
+                }
+                Err(e) => {
+                    eprintln!("[{}] debug log stopped: can't start {} over: {e}", util::now_ms(), self.path.display())
+                }
+            }
         }
-        let Some(file) = &mut self.file else { return Ok(()) };
-        file.write_all(line)?;
-        self.len += line.len() as u64;
-        Ok(())
+        if let Some(file) = &mut self.file
+            && file.write_all(line).is_ok()
+        {
+            self.len += line.len() as u64;
+        }
     }
 
     fn flush(&mut self) {
@@ -187,7 +295,11 @@ fn open_private(path: &Path, truncate: bool) -> std::io::Result<File> {
 struct Networking;
 
 fn wanted(meta: &Metadata) -> bool {
-    meta.is_event() && *meta.level() <= Level::DEBUG && TARGETS.iter().any(|t| meta.target().starts_with(t))
+    let target = meta.target();
+    meta.is_event()
+        && *meta.level() <= Level::DEBUG
+        && TARGETS.iter().any(|t| target.starts_with(t))
+        && !NOT_TARGETS.iter().any(|t| target.starts_with(t))
 }
 
 impl Subscriber for Networking {
@@ -215,7 +327,8 @@ impl Subscriber for Networking {
         let meta = event.metadata();
         let mut line = Line::default();
         event.record(&mut line);
-        write(&format!("{} {}: {}{}", meta.level(), meta.target(), line.message, line.fields));
+        let urgent = *meta.level() <= Level::WARN;
+        write(&format!("{} {}: {}{}", meta.level(), meta.target(), line.message, line.fields), urgent);
     }
 
     fn enter(&self, _: &span::Id) {}
@@ -266,10 +379,9 @@ fn unquote(s: &str, q: char, keep: usize) -> String {
             i += 1;
             continue;
         }
+        let closes = |j: usize| q != '\'' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric());
         let (mut j, mut escaped) = (i + 1, false);
-        while j < chars.len()
-            && !(chars[j] == q && !escaped && (q != '\'' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric())))
-        {
+        while j < chars.len() && !(chars[j] == q && !escaped && closes(j)) {
             escaped = chars[j] == '\\' && !escaped;
             j += 1;
         }
@@ -288,38 +400,23 @@ fn unquote(s: &str, q: char, keep: usize) -> String {
     out
 }
 
-/// Takes out what could be a secret or someone's content: invite codes' ids and secrets (and their prefixes), URLs'
-/// user info, query and fragment (where links carry tickets and proxies their passwords), tickets, long byte lists,
-/// long hex (ids and keys, cut to its first 10 characters), and any other long run of letters and digits (encoded
-/// keys, tokens, tickets).
+/// Takes out what could be a secret, someone's content or someone else's machine: invite codes and their ids and
+/// secrets (and prefixes), URLs' user info, query and fragment (where links carry tickets and proxies their passwords),
+/// credentials, tickets, byte lists, ids of machines outside this team (and cuts this team's to 10 characters), and any
+/// other long run of letters and digits (encoded keys, tokens, tickets).
 pub fn scrub(line: &str) -> String {
-    tokens(&byte_lists(&credentials(&urls(&hidden(line)))))
+    let hide = HIDE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    scrub_with(line, &hide, &known)
 }
 
-/// What follows `Basic `, `Bearer `, `username=` or `password=` (a proxy's sign-in, as iroh's relay client logs it),
-/// up to the next space or quote.
-fn credentials(line: &str) -> String {
-    const BEFORE: &[&str] = &["basic ", "bearer ", "username=", "password=", "user="];
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some((at, len)) = BEFORE.iter().filter_map(|b| lower.find(b).map(|at| (at, b.len()))).min() else { break };
-        let value = &rest[at + len..];
-        let end = value.find(|c: char| c.is_whitespace() || "\"'`,;)}]".contains(c)).unwrap_or(value.len());
-        out += &rest[..at + len];
-        if end > 0 {
-            out += "[redacted]";
-        }
-        rest = &value[end..];
-    }
-    out + rest
+fn scrub_with(line: &str, hide: &[String], known: &[(String, String)]) -> String {
+    tokens(&byte_lists(&credentials(&urls(&hidden(line, hide)))), known)
 }
 
-fn hidden(line: &str) -> String {
-    let hide = HIDE.lock().unwrap_or_else(|e| e.into_inner());
+fn hidden(line: &str, hide: &[String]) -> String {
     let mut line = line.to_string();
-    for text in hide.iter() {
+    for text in hide {
         loop {
             let lower = line.to_ascii_lowercase();
             let Some(at) = lower.find(&text[..HIDDEN_PREFIX]) else { break };
@@ -336,8 +433,11 @@ fn urls(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(sep) = rest.find("://") {
-        let scheme_at =
-            rest[..sep].rfind(|c: char| !(c.is_ascii_alphanumeric() || "+.-".contains(c))).map_or(0, |i| i + 1);
+        let scheme_at = rest[..sep]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || "+.-".contains(c)))
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let scheme = &rest[scheme_at..sep];
         let after = &rest[sep + 3..];
         let end = after.find(|c: char| c.is_whitespace() || "\"<>`".contains(c)).unwrap_or(after.len());
@@ -352,16 +452,75 @@ fn urls(line: &str) -> String {
     out + rest
 }
 
-/// A list of 8 or more small numbers (`[112, 145, …]`, a nonce or other raw bytes) becomes its length.
+/// The value after a sign-in marker, up to the next whitespace: `Basic`/`Bearer` (and the whitespace after them),
+/// `username=`/`password=`/`user=`, and the parts of a `Url` printed as a struct that can hold a secret.
+fn credentials(line: &str) -> String {
+    // (marker, whitespace must follow it, a value starting with `None` or `""` stays)
+    const MARKERS: &[(&str, bool, bool)] = &[
+        ("basic", true, false),
+        ("bearer", true, false),
+        ("username=", false, false),
+        ("password=", false, false),
+        ("user=", false, false),
+        ("username: ", false, true),
+        ("password: ", false, true),
+        ("query: ", false, true),
+        ("fragment: ", false, true),
+    ];
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let found = MARKERS
+            .iter()
+            .filter_map(|&(m, ws, keep_none)| {
+                let mut from = 0;
+                while let Some(at) = lower[from..].find(m).map(|i| i + from) {
+                    let next = lower[at + m.len()..].chars().next();
+                    if !ws || next.is_some_and(char::is_whitespace) {
+                        return Some((at, m.len(), keep_none));
+                    }
+                    from = at + m.len();
+                }
+                None
+            })
+            .min_by_key(|&(at, len, _)| (at, usize::MAX - len));
+        let Some((at, len, keep_none)) = found else { break };
+        let after = &rest[at + len..];
+        let gap = after.len() - after.trim_start().len();
+        let value = &after[gap..];
+        let end = value.find(char::is_whitespace).unwrap_or(value.len());
+        out += &rest[..at + len + gap];
+        let none = keep_none && (value.starts_with("None") || value.starts_with("\"\""));
+        if end > 0 && !none {
+            out += "[redacted]";
+        } else {
+            out += &value[..end];
+        }
+        rest = &value[end..];
+    }
+    out + rest
+}
+
+/// A list of bytes (`[112, 145, …]`, a nonce or raw data) becomes its length: 8 or more numbers up to 255, or 2 or more
+/// written `0x..`, or 4 or more right after a field named like data.
 fn byte_lists(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(open) = rest.find('[') {
         out += &rest[..open];
+        let before = out.to_ascii_lowercase();
+        let named = ["data=", "data: ", "bytes=", "bytes: ", "nonce=", "nonce: "].iter().any(|m| before.ends_with(m));
         let after = &rest[open + 1..];
         let bytes = after.find(']').and_then(|close| {
-            let items: Vec<&str> = after[..close].split(',').map(str::trim).collect();
-            (items.len() >= 8 && items.iter().all(|n| n.parse::<u8>().is_ok())).then_some((close, items.len()))
+            let mut items: Vec<&str> = after[..close].split(',').map(str::trim).collect();
+            if items.len() > 1 && items.last() == Some(&"") {
+                items.pop();
+            }
+            let hex = items.iter().all(|n| n.strip_prefix("0x").is_some_and(|h| u8::from_str_radix(h, 16).is_ok()));
+            let dec = items.iter().all(|n| n.parse::<u8>().is_ok());
+            let n = items.len();
+            ((hex && n >= 2) || (dec && (n >= 8 || named && n >= 4))).then_some((close, n))
         });
         match bytes {
             Some((close, n)) => {
@@ -377,7 +536,7 @@ fn byte_lists(line: &str) -> String {
     out + rest
 }
 
-fn tokens(line: &str) -> String {
+fn tokens(line: &str, known: &[(String, String)]) -> String {
     // `=` splits, so `name=value` is judged by its value; `/` and `+` don't, so base64 can't hide in short pieces.
     let opaque = |c: char| c.is_ascii_alphanumeric() || "-_+/".contains(c);
     let mut out = String::with_capacity(line.len());
@@ -386,21 +545,36 @@ fn tokens(line: &str) -> String {
         if opaque(c) {
             run.push(c);
         } else {
-            out += &token(&run);
+            out += &token(&run, known);
             run.clear();
             out.push(c);
         }
     }
-    out + &token(&run)
+    out + &token(&run, known)
 }
 
-fn token(run: &str) -> String {
+fn token(run: &str, known: &[(String, String)]) -> String {
     let n = run.len();
     if crate::team::Ticket::is_ticket(run) {
         return "[ticket]".into();
     }
-    if n >= 32 && run.chars().all(|c| c.is_ascii_hexdigit()) {
-        return format!("{}…", &run[..10]);
+    // An id (a key in hex, whole or its first characters): shown, cut to 10, only if it is this machine's or a
+    // teammate's. Digits alone are an id only at the lengths iroh shows ids in.
+    let hex = run.chars().all(|c| c.is_ascii_hexdigit());
+    if hex && n >= 8 && (run.chars().any(|c| c.is_ascii_alphabetic()) || n == 10 || n >= 32) {
+        let lower = run.to_ascii_lowercase();
+        let ours = known.iter().any(|(k, _)| if n <= k.len() { k.starts_with(&lower) } else { lower.starts_with(k) });
+        return match (ours, n > 10) {
+            (true, true) => format!("{}…", &run[..10]),
+            (true, false) => run.into(),
+            (false, _) => "[id]".into(),
+        };
+    }
+    if n == Z32_KEY && run.chars().all(|c| Z32.contains(c)) {
+        return match known.iter().any(|(_, z)| z == run) {
+            true => format!("{}…", &run[..10]),
+            false => "[id]".into(),
+        };
     }
     // A field name like `mapping_varies_by_dest_ipv4`: short lowercase words, joined by `_`.
     if run.contains('_')
@@ -418,6 +592,10 @@ fn token(run: &str) -> String {
 mod tests {
     use super::*;
 
+    fn none(line: &str) -> String {
+        scrub_with(line, &[], &[])
+    }
+
     #[test]
     fn links_tickets_and_keys_are_taken_out() {
         let ticket = format!("rn1-{}", "QUJDRA".repeat(30));
@@ -426,15 +604,54 @@ mod tests {
              ticket {ticket} old tincan1abcdefg key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
              b64 c2VjcmV0LWtleS1ieXRlcy0xMjM0NTY3ODkw zb32 ybndrfg8ejkmcpqxot1uwisza345h769ybndrfg8ejkmcpqxot1uwi"
         );
-        let out = scrub(&line);
-        for gone in [&ticket[..], "QUJDRA", "user:pw", "token=abc", "tincan1abcdefg", "abcdef0123456789abcdef01234"] {
+        let out = none(&line);
+        for gone in [&ticket[..], "QUJDRA", "user:pw", "token=abc", "tincan1abcdefg", "0123456789abcdef"] {
             assert!(!out.contains(gone), "{gone} in {out}");
         }
         for gone in ["c2VjcmV0LWtleS1ieXRlcy0xMjM0NTY3ODkw", "ybndrfg8ejkmcpqxot1uwisza345h769"] {
             assert!(!out.contains(gone), "{gone} in {out}");
         }
         assert!(out.contains("https://reasonmachines.com/network/join/ via https://proxy.example:8080/p"), "{out}");
-        assert!(out.contains("key 0123456789…"), "{out}");
+        assert!(out.contains("key [id]"), "{out}");
+    }
+
+    #[test]
+    fn only_this_teams_ids_show() {
+        let (me, mate) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+        // One whose first 8 hex characters aren't all digits (those count as an id only at 10 or 32+).
+        let other = std::iter::repeat_with(|| iroh::SecretKey::generate().public())
+            .find(|id| id.to_string()[..8].chars().any(|c| c.is_ascii_alphabetic()))
+            .unwrap();
+        let known = [(me.to_string(), me.to_z32()), (mate.to_string(), mate.to_z32())];
+        let line = |id: &iroh::EndpointId| {
+            format!(
+                "bound id={} remote_id={} discovered_endpoint_id=PublicKey({id}) dns=_iroh.{}.dns.iroh.link",
+                id.fmt_short(),
+                id.fmt_short(),
+                id.to_z32()
+            )
+        };
+        for id in [me, mate] {
+            let short = id.fmt_short().to_string();
+            let out = scrub_with(&line(&id), &[], &known);
+            assert_eq!(
+                out,
+                format!(
+                    "bound id={short} remote_id={short} discovered_endpoint_id=PublicKey({short}…) dns=_iroh.{}….dns.iroh.link",
+                    &id.to_z32()[..10]
+                )
+            );
+        }
+        // A machine on the local network, or anyone else's, that this one never knew.
+        let out = scrub_with(&line(&other), &[], &known);
+        assert_eq!(
+            out,
+            "bound id=[id] remote_id=[id] discovered_endpoint_id=PublicKey([id]) dns=_iroh.[id].dns.iroh.link"
+        );
+        let hex = other.to_string();
+        for n in [8, 10, 12, 32, 64] {
+            assert_eq!(scrub_with(&format!("x={}", &hex[..n]), &[], &known), "x=[id]", "{n}");
+        }
     }
 
     #[test]
@@ -442,72 +659,113 @@ mod tests {
         for pw in ["s3cr(et", "s3cr)et", "s3cr'et", "s3cr,et", "s3cr/et", "s3cr?et", "s3cr#et", "s3cr@et", "s3cr[et]"] {
             for scheme in ["http", "https", "socks5", "wss"] {
                 let line = format!("dial url via proxy url={scheme}://alice:{pw}@proxy.example:3128/ next=1");
-                let out = scrub(&line);
+                let out = none(&line);
                 assert!(!out.contains("s3cr") && !out.contains("alice"), "{pw}: {out}");
                 assert!(out.contains(&format!("{scheme}://proxy.example:3128/ next=1")), "{pw}: {out}");
             }
         }
-        assert_eq!(scrub("proxy_url=\"http://u:p(w@h:8080\""), "proxy_url=\"http://h:8080\"");
+        assert_eq!(none("proxy_url=\"http://u:p(w@h:8080\""), "proxy_url=\"http://h:8080\"");
         // iroh's relay client also logs the proxy's user name, and the request with its Basic header.
         assert_eq!(
-            scrub("setting proxy-authorization: username=alice"),
+            none("setting proxy-authorization: username=alice"),
             "setting proxy-authorization: username=[redacted]"
         );
         let req =
             r#"Sending proxy request: Request { method: CONNECT, headers: {"proxy-authorization": "Basic YTpi"} }"#;
-        assert!(!scrub(req).contains("YTpi") && !unquote(req, '"', 64).contains("YTpi"), "{}", scrub(req));
+        assert!(!none(req).contains("YTpi") && !unquote(req, '"', 64).contains("YTpi"), "{}", none(req));
+        assert_eq!(none("auth Basic\tYTpi,x next"), "auth Basic\t[redacted] next");
+        assert_eq!(none("Bearer a,b;c)d}e]f next"), "Bearer [redacted] next");
+        // A `Url` printed as a struct.
+        let url = r#"Url { scheme: "http", username: "alice", password: Some("s3cr"), host: Some(Domain("proxy")), port: Some(3128), path: "/", query: Some("t=1"), fragment: None }"#;
+        let out = none(url);
+        assert!(!out.contains("alice") && !out.contains("s3cr") && !out.contains("t=1"), "{out}");
+        assert!(out.contains("fragment: None") && out.contains("Domain(\"proxy\")"), "{out}");
+        assert!(none(r#"Url { username: "", password: None }"#).contains(r#"username: "", password: None"#));
     }
 
     #[test]
-    fn an_invite_codes_key_and_secret_never_show() {
+    fn an_invite_codes_key_secret_and_words_never_show() {
         let code = "acid-acorn-acre-acid";
         let id = crate::invite::key(code).public();
         let secret = crate::invite::secret(code);
         let (hex, z32) = (id.to_string(), id.to_z32());
         let line = format!(
             "iroh endpoint bound id={} remote_id={} full={hex} PublicKey({}…) dns=_iroh.{z32}.dns.iroh.link \
-             upper={} secret={secret} short={}",
+             upper={} secret={secret} short={} code {code} or acid acorn acre acid",
             id.fmt_short(),
             &hex[..10],
             &hex[..10],
             hex[..12].to_uppercase(),
             &secret[..9]
         );
-        let out = scrub(&line);
-        for gone in [&hex[..HIDDEN_PREFIX], &z32[..HIDDEN_PREFIX], &secret[..HIDDEN_PREFIX], &hex[..8].to_uppercase()] {
-            // No secret-derived text in the failure message either.
-            assert!(
-                !out.to_ascii_lowercase().contains(&gone.to_ascii_lowercase()),
-                "a form of the invite id or secret is left"
-            );
+        let hide = HIDE.lock().unwrap().clone();
+        // Even as if the invite's id were a teammate's: hidden comes first.
+        let out = scrub_with(&line, &hide, &[(hex.clone(), z32.clone())]).to_ascii_lowercase();
+        // No secret-derived text in a failure message.
+        for gone in [&hex[..HIDDEN_PREFIX], &z32[..HIDDEN_PREFIX], &secret[..HIDDEN_PREFIX], "acid-aco", "acid aco"] {
+            assert!(!out.contains(gone), "a form of the invite's code, id or secret is left");
         }
         assert!(
             out.contains("bound id=[invite]") && out.contains("_iroh.[invite].dns"),
             "the invite id isn't replaced"
         );
-        // Another endpoint's id stays (cut short, as iroh shows it).
-        let other = iroh::SecretKey::generate().public();
-        assert!(scrub(&format!("remote_id={}", other.fmt_short())).contains(&other.fmt_short().to_string()));
     }
 
     #[test]
     fn what_helps_diagnose_stays() {
-        let line = "path direct -> relay (rtt 41 ms) relay=https://relay-sfo1.compute.reasonmachines.com/ \
-                    remote=7f3a9c01de addr=192.168.1.20:41641 [2001:db8::1]:41641 err=\"timed out\" \
-                    mapping_varies_by_dest_ipv4: None conn_id=524305809616 [1, 2, 3]";
-        assert_eq!(scrub(line), line);
+        let me = iroh::SecretKey::generate().public();
+        let known = [(me.to_string(), me.to_z32())];
+        let line = format!(
+            "path direct -> relay (rtt 41 ms) relay=https://relay-sfo1.compute.reasonmachines.com/ remote={} \
+             addr=192.168.1.20:41641 [2001:db8::1]:41641 err=\"timed out\" mapping_varies_by_dest_ipv4: None \
+             conn_id=524305809616 [1, 2, 3] path_id=7 ports [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]",
+            me.fmt_short()
+        );
+        assert_eq!(scrub_with(&line, &[], &known), line);
     }
 
     #[test]
     fn byte_lists_become_their_length() {
         assert_eq!(
-            scrub("ping data=[112, 145, 70, 165, 181, 195, 189, 229] rtt=28ms"),
+            none("ping data=[112, 145, 70, 165, 181, 195, 189, 229] rtt=28ms"),
             "ping data=[<8 bytes>] rtt=28ms"
         );
-        assert_eq!(
-            scrub("ports [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]"),
-            "ports [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]"
-        );
+        assert_eq!(none("x [1, 2, 3, 4, 5, 6, 7, 8,] y"), "x [<8 bytes>] y");
+        assert_eq!(none("x [0x0a, 0xff] y"), "x [<2 bytes>] y");
+        assert_eq!(none("nonce: [9, 8, 7, 6] y"), "nonce: [<4 bytes>] y");
+        assert_eq!(none("ids [9, 8, 7, 6] y"), "ids [9, 8, 7, 6] y");
+    }
+
+    #[test]
+    fn non_ascii_text_never_breaks_it() {
+        for line in
+            ["éhttps://x", "接続https://u:p@h/", "…://x", "relay=é://x", "a\u{301}://u:p@h", "€[1,2]", "é=Basic é"]
+        {
+            let out = none(line);
+            assert!(!out.contains("u:p"), "{out}");
+        }
+        // Random text, heavy on what the scrubber looks for, never panics.
+        let pool: Vec<char> =
+            "aZ09fF-_+/=:@#?&[](){}<>\"'`\\,; \t\n.…éü接続€\u{301}\u{200b}xyzrn1-tincan1BasicBearerusername=password: None0x"
+                .chars()
+                .collect();
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let hide = vec!["0123456789abcdef".to_string()];
+        let known = vec![("abcdef0123456789".to_string(), "ybndrfg8ejkm".to_string())];
+        for _ in 0..20_000 {
+            let len = (next() % 80) as usize;
+            let s: String = (0..len).map(|_| pool[(next() % pool.len() as u64) as usize]).collect();
+            let s = if next() % 3 == 0 { format!("{s}://{s}@{s}") } else { s };
+            let _ = scrub_with(&s, &hide, &known);
+            let _ = unquote(&s, '"', 64);
+            let _ = unquote(&s, '\'', 0);
+        }
     }
 
     #[test]
@@ -532,7 +790,9 @@ mod tests {
 
     #[test]
     fn fields_named_like_secrets_are_left_out() {
-        for name in ["secret_key", "auth_token", "ticket", "Password", "payload", "body", "content_len", "key"] {
+        for name in
+            ["secret_key", "auth_token", "ticket", "Password", "username", "payload", "body", "content_len", "key"]
+        {
             assert!(secret_field(name), "{name}");
         }
         for name in ["remote", "public_key", "path", "rtt", "relay_url", "addr"] {
@@ -574,6 +834,8 @@ mod tests {
         assert!(wanted(&meta("iroh_relay::client", Level::INFO, Kind::EVENT)));
         assert!(!wanted(&meta("iroh::socket", Level::TRACE, Kind::EVENT)), "trace is too much");
         assert!(!wanted(&meta("iroh::socket", Level::DEBUG, Kind::SPAN)), "spans are off");
+        // mDNS discovery lists every machine on the local network.
+        assert!(!wanted(&meta("iroh_mdns_address_lookup", Level::DEBUG, Kind::EVENT)));
         // The MCP server's library would log tool calls, message text included.
         assert!(!wanted(&meta("rmcp::service", Level::ERROR, Kind::EVENT)));
         assert!(!wanted(&meta("hickory_proto::udp", Level::DEBUG, Kind::EVENT)));
@@ -594,7 +856,7 @@ mod tests {
         let mut w = Writer::open(path.clone()).unwrap();
         let line = vec![b'x'; 1 << 16];
         for _ in 0..(2 * MAX_BYTES / line.len() as u64 + 3) {
-            w.write(&line).unwrap();
+            w.write(&line);
         }
         w.flush();
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -618,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_holds_when_the_full_file_cant_be_moved_or_removed() {
+    fn the_cap_holds_when_the_full_file_cant_be_moved() {
         let dir = temp("stuck");
         let path = dir.join("debug.log");
         let mut w = Writer::open(path.clone()).unwrap();
@@ -626,7 +888,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("debug.log.1").join("x")).unwrap();
         let line = vec![b'x'; 1 << 16];
         for _ in 0..(2 * MAX_BYTES / line.len() as u64) {
-            w.write(&line).unwrap();
+            w.write(&line);
         }
         w.flush();
         assert!(std::fs::metadata(&path).unwrap().len() <= MAX_BYTES);
@@ -637,17 +899,25 @@ mod tests {
     fn a_flood_is_cut_off_and_counted() {
         let dir = temp("flood");
         let path = dir.join("debug.log");
-        let mut w = Writer::open(path.clone()).unwrap();
-        for i in 0..1000 {
-            w.line(format!("line {i}\n").as_bytes());
+        let w = Writer::open(path.clone()).unwrap();
+        let (tx, rx) = sync_channel(QUEUE);
+        let writer = std::thread::spawn(move || w.run(rx));
+        let n = BURST as usize + 500;
+        for i in 0..n {
+            tx.send(Msg::Line(format!("line {i}\n"), false)).unwrap();
         }
-        w.tokens = 1.0;
-        w.line(b"after\n");
-        w.flush();
+        // Counted on the next tick even with nothing more to write.
+        std::thread::sleep(Duration::from_millis(3500));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().filter(|l| l.starts_with("line ")).count(), BURST as usize);
-        assert!(text.contains(&format!("({} lines left out: too many at once)", 1000 - BURST as usize)), "{text}");
-        assert!(text.ends_with("after\n"));
+        let kept = text.lines().filter(|l| l.starts_with("line ")).count();
+        assert!((BURST as usize..BURST as usize + 150).contains(&kept), "{kept}");
+        assert!(
+            text.contains(&format!("({} lines left out: too many at once)", n - kept)),
+            "{}",
+            &text[text.len() - 200..]
+        );
+        drop(tx);
+        writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

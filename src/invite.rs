@@ -47,6 +47,8 @@ pub fn normalize(input: &str) -> Option<String> {
 pub fn key(code: &str) -> SecretKey {
     let key = SecretKey::from_bytes(&blake3::derive_key("tincan 2026 invite endpoint", code.as_bytes()));
     crate::debuglog::hide(&key.public());
+    crate::debuglog::hide_text(code);
+    crate::debuglog::hide_text(&code.replace('-', " "));
     key
 }
 
