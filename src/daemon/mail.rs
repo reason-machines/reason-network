@@ -925,15 +925,14 @@ impl Daemon {
     }
 
     /// Names the machine each message kept from before notices came from (see [`crate::store::Store::sourceless`]), so
-    /// its notice can go back there if it is dropped. Only on evidence: a session of this person's remembered here
-    /// under that name sent it from here, if each other machine of theirs has said which sessions it has and none named
-    /// it (agent sessions there have addresses without a machine too); else it came from the sender's machine its
-    /// address names (a terminal's), the sender's only machine (unless it is this person's, whose session here may be
-    /// forgotten), or the only one of theirs whose last presence names the session (unless a session here has the name
-    /// too). Otherwise it stays unknown, and goes without a notice if dropped: an engine from before notices kept nothing
-    /// more to tell by, and a guess could hand its first line to another conversation under the name. While some is
-    /// unknown, each presence looks again (`sourceless`): the team may have changed since, or that presence may be the
-    /// evidence.
+    /// its notice can go back there if it is dropped. A session of this person's remembered here under that name sent
+    /// it from here, unless the last presence of another machine of theirs in the team names it (agent sessions there
+    /// have addresses without a machine too); else it came from the sender's machine its address names (a terminal's),
+    /// the sender's only machine (unless it is this person's, whose session here may be forgotten), or the only one of
+    /// theirs whose last presence names the session (unless a session here has the name too). Otherwise it stays
+    /// unknown, and goes without a notice if dropped: an engine from before notices kept nothing more to tell by, and a
+    /// guess could hand its first line to another conversation under the name. While some is unknown, each presence
+    /// looks again (`sourceless`): the team may have changed since, or that presence may be the evidence.
     pub(super) fn find_sources(&self, g: &mut Inner) -> Result<()> {
         let rows = g.store.sourceless()?;
         let me = self.key.public();
@@ -963,9 +962,7 @@ impl Daemon {
             let mine = person == self.person && machine.is_none();
             let here = if mine { g.store.session_by_name(name)? } else { None };
             match (&theirs[..], &named[..], here) {
-                (_, _, Some(s)) if theirs.iter().all(|m| names(m, name) == Some(false)) => {
-                    found.push((id, String::new(), Some(s.key)))
-                }
+                (_, [], Some(s)) => found.push((id, String::new(), Some(s.key))),
                 (_, _, Some(_)) => unknown = true,
                 (_, [only], None) => found.push((id, only.endpoint.to_string(), None)),
                 ([only], _, None) if !mine => found.push((id, only.endpoint.to_string(), None)),
@@ -1514,6 +1511,16 @@ mod tests {
         team: Option<TeamState>,
         senders: &[(&str, &str)],
     ) -> (Arc<Daemon>, std::path::PathBuf) {
+        backlog_seen(key, team, senders, &[])
+    }
+
+    /// [`backlog`], with the last presence of each of `presences` (machine, the session names it gave) kept from before.
+    fn backlog_seen(
+        key: &SecretKey,
+        team: Option<TeamState>,
+        senders: &[(&str, &str)],
+        presences: &[(&SecretKey, &[&str])],
+    ) -> (Arc<Daemon>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("reason-network-backlog-{}", Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
         let (db, inbox) = (dir.join("network.db"), dir.join("inbox"));
@@ -1524,6 +1531,12 @@ mod tests {
             }
             for name in ["gone", "api", "terminal"] {
                 store.upsert_session(&remembered(name), "alex").unwrap();
+            }
+            for (machine, names) in presences {
+                let presence =
+                    crate::net::Presence { known: names.iter().map(|n| n.to_string()).collect(), ..Default::default() };
+                let saved = Remote { presence, last_seen: 0, online: true };
+                store.set(&format!("presence:{}", machine.public()), &serde_json::to_string(&saved).unwrap()).unwrap();
             }
             for (id, from) in senders {
                 let mut m = Message {
@@ -1577,19 +1590,14 @@ mod tests {
         // A session here that is forgotten since may have sent `alex/forgotten`'s, as much as alex's mini.
         let more = [("01DAVE", "dave/web"), ("01FORGOT", "alex/forgotten")];
         let (d, dir) = backlog(&key, Some(team), &[&senders[..], &more[..]].concat());
-        // Either of carol's or dave's machines could have sent theirs, and alex/api's an `api` session on alex's mini as
-        // much as the one here: unknown until a presence says which.
+        // Either of carol's or dave's machines could have sent theirs: unknown until a presence says which. alex/api's
+        // is from the `api` session here, as no presence of alex's mini names one there.
         let unknown = |d: &Daemon| -> Vec<String> {
             d.inner.lock().unwrap().store.sourceless().unwrap().into_iter().map(|(id, _)| id).collect()
         };
-        assert_eq!(unknown(&d), ["01HERE", "01CAROL", "01DAVE", "01FORGOT"]);
-        let named = |names: &[&str]| crate::net::Presence {
-            known: names.iter().map(|n| n.to_string()).collect(),
-            ..Default::default()
-        };
-        d.save_presence(&mini.public(), &Remote { presence: named(&[]), last_seen: 0, online: true });
         assert_eq!(unknown(&d), ["01CAROL", "01DAVE", "01FORGOT"]);
-        d.save_presence(&carol2.public(), &Remote { presence: named(&["web"]), last_seen: 0, online: true });
+        let presence = crate::net::Presence { known: vec!["web".into()], ..Default::default() };
+        d.save_presence(&carol2.public(), &Remote { presence, last_seen: 0, online: true });
         assert_eq!(unknown(&d), ["01DAVE", "01FORGOT"]);
         let g = d.inner.lock().unwrap();
         g.store.forget_session(&remembered("gone"), "alex").unwrap();
@@ -1615,28 +1623,42 @@ mod tests {
     }
 
     #[test]
-    fn mail_from_before_notices_is_not_put_down_as_sent_here_while_another_machine_of_the_persons_may_have_sent_it() {
-        let key = SecretKey::generate();
-        let mini = SecretKey::generate();
-        let mut team = TeamState::found("acme", "alex", "laptop", &key);
-        team.put_member(&key, mini.public(), "alex", "mini", true);
-        // An `api` session is remembered here, but agent sessions on alex's mini have addresses without a machine too.
-        let (d, dir) = backlog(&key, Some(team), &[("01API", "alex/api")]);
-        let unknown = |d: &Daemon| -> Vec<String> {
-            d.inner.lock().unwrap().store.sourceless().unwrap().into_iter().map(|(id, _)| id).collect()
-        };
-        assert_eq!(unknown(&d), ["01API"]);
-        // The mini has one too: still either.
-        let presence = crate::net::Presence { known: vec!["api".into()], ..Default::default() };
-        d.save_presence(&mini.public(), &Remote { presence, last_seen: 0, online: true });
-        assert_eq!(unknown(&d), ["01API"]);
-        let g = d.inner.lock().unwrap();
-        g.store.forget_session(&remembered("gone"), "alex").unwrap();
-        assert!(g.store.take_notices().is_empty() && g.store.unread("alex/api").unwrap().is_empty());
-        assert!(g.store.outbox_for(&mini.public().to_string(), 0).unwrap().0.is_empty());
-        drop(g);
-        drop(d);
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn mail_from_before_notices_is_put_down_as_sent_here_unless_another_machine_of_the_persons_names_the_session() {
+        // An `api` session is remembered here, but agent sessions on alex's other machines have addresses without a
+        // machine too. alex's pi left the team: no longer one of alex's machines, whatever it last said.
+        let cases: [(&str, bool, &[&str], bool); 5] = [
+            ("no other machine", false, &[], true),
+            ("one whose presence names it", true, &["api"], false),
+            ("one that hasn't said", true, &[], true),
+            ("one whose presence names others", true, &["web"], true),
+            ("one that left, naming it", false, &["api"], true),
+        ];
+        for (case, in_team, names, here) in cases {
+            let (key, mini, pi) = (SecretKey::generate(), SecretKey::generate(), SecretKey::generate());
+            let mut team = TeamState::found("acme", "alex", "laptop", &key);
+            team.put_member(&key, pi.public(), "alex", "pi", true);
+            team.put_member(&key, pi.public(), "alex", "pi", false);
+            if in_team {
+                team.put_member(&key, mini.public(), "alex", "mini", true);
+            }
+            let said =
+                if names.is_empty() && in_team { vec![] } else { vec![(if in_team { &mini } else { &pi }, names)] };
+            let (d, dir) = backlog_seen(&key, Some(team), &[("01API", "alex/api")], &said);
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.sourceless().unwrap().is_empty(), here, "{case}");
+            g.store.forget_session(&remembered("gone"), "alex").unwrap();
+            let notices: Vec<(String, Option<String>)> =
+                g.store.take_notices().into_iter().map(|m| (m.to, m.reply_to)).collect();
+            let told = if here { vec![("alex/api".to_string(), Some("01API".to_string()))] } else { vec![] };
+            assert_eq!(notices, told, "{case}");
+            // Never to a machine that may not have sent it.
+            for k in [&mini, &pi] {
+                assert!(g.store.outbox_for(&k.public().to_string(), 0).unwrap().0.is_empty(), "{case}");
+            }
+            drop(g);
+            drop(d);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
