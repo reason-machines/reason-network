@@ -275,9 +275,118 @@ pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
     Ok(exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")).map(std::path::PathBuf::from).unwrap_or(exe))
 }
 
+/// `cmd`, set to start without a console window of its own on Windows (CREATE_NO_WINDOW). The daemon runs without a
+/// console, so a console program it starts would otherwise get a new window, flashing up on the user's screen. Every
+/// program the daemon starts goes through here (a test checks).
+#[allow(dead_code)] // Red commit only: nothing uses it yet.
+pub fn no_window<C: NoWindow>(mut cmd: C) -> C {
+    cmd.hide_window();
+    cmd
+}
+
+#[allow(dead_code)]
+pub trait NoWindow {
+    fn hide_window(&mut self);
+}
+
+impl NoWindow for std::process::Command {
+    fn hide_window(&mut self) {}
+}
+
+impl NoWindow for tokio::process::Command {
+    fn hide_window(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The files with code the daemon runs, and the setup functions it calls. Tests (a trailing `mod tests`) aside.
+    fn daemon_sources() -> Vec<(std::path::PathBuf, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![root.join("relays.rs")];
+        for entry in std::fs::read_dir(root.join("daemon")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+        let mut out: Vec<_> = files
+            .into_iter()
+            .map(|path| {
+                let src = std::fs::read_to_string(&path).unwrap();
+                let code = src.split("\nmod tests {").next().unwrap().to_string();
+                (path, code)
+            })
+            .collect();
+        // The `reg` calls in setup.rs: the daemon asks whether its Run entry is installed.
+        let setup = std::fs::read_to_string(root.join("setup.rs")).unwrap();
+        let start = setup.find("fn run_entry()").unwrap();
+        let end = setup[start..].find("\n#[cfg(windows)]\nasync fn service(").unwrap() + start;
+        out.push((root.join("setup.rs"), setup[start..end].to_string()));
+        out
+    }
+
+    #[test]
+    fn every_program_the_daemon_starts_goes_through_no_window() {
+        let mut raw = Vec::new();
+        for (path, code) in daemon_sources() {
+            for (at, _) in code.match_indices("Command::").filter(|(at, _)| {
+                let rest = &code[at + "Command::".len()..];
+                rest.starts_with("new(") || rest.starts_with("from(")
+            }) {
+                // `Command::new` may be qualified (`tokio::process::Command::new`): look before the path.
+                let path_start =
+                    code[..at].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':').len();
+                if !code[..path_start].trim_end().ends_with("no_window(") {
+                    let line = code[..at].lines().count();
+                    raw.push(format!(
+                        "{}: {}",
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(&path).display(),
+                        code.lines().nth(line - 1).unwrap_or_default().trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "started without util::no_window (a console window flashes up on Windows):\n{}",
+            raw.join("\n")
+        );
+    }
+
+    /// A child started through `no_window` by a process with no console (as the daemon runs) has no console window.
+    #[cfg(windows)]
+    #[test]
+    fn a_child_started_without_a_console_gets_no_window() {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        const ROLE: &str = "REASON_NETWORK_NO_WINDOW_TEST";
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let me = std::env::current_exe().unwrap();
+        let this_test = "util::tests::a_child_started_without_a_console_gets_no_window";
+        let run = |cmd: &mut std::process::Command, role: &str| {
+            cmd.args([this_test, "--exact", "--nocapture", "--test-threads=1"]).env(ROLE, role).status().unwrap()
+        };
+        match std::env::var(ROLE).as_deref() {
+            // The program the daemon starts: fails if it has a window.
+            Ok("child") => {
+                let window = unsafe { GetConsoleWindow() };
+                assert!(window.is_null(), "the child has a console window");
+            }
+            // The daemon: no console of its own, starts the child as it would.
+            Ok("daemon") => {
+                assert!(unsafe { GetConsoleWindow() }.is_null(), "the daemon was started with a console");
+                let st = run(&mut no_window(std::process::Command::new(&me)), "child");
+                assert!(st.success(), "the child had a console window");
+            }
+            _ => {
+                let mut daemon = std::process::Command::new(&me);
+                daemon.creation_flags(DETACHED_PROCESS);
+                assert!(run(&mut daemon, "daemon").success(), "the daemon's child got a console window");
+            }
+        }
+    }
 
     #[test]
     fn slugs() {
