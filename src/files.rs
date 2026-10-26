@@ -331,6 +331,18 @@ pub fn save(dir: &Path, files: &[Attachment]) -> Result<Vec<Attachment>> {
             }
         }
     }
+    // The message's SQLite commit may release the sender's last copy. Its files and new directory entries must
+    // reach disk first, rather than leaving an acknowledged message pointing at files lost in a power failure.
+    #[cfg(unix)]
+    if let Err(e) = (|| -> std::io::Result<()> {
+        for path in [Some(dir), dir.parent(), dir.parent().and_then(Path::parent)].into_iter().flatten() {
+            std::fs::File::open(path)?.sync_all()?;
+        }
+        Ok(())
+    })() {
+        let _ = std::fs::remove_dir_all(dir);
+        return Err(anyhow!("can't sync the files' folder: {}", e.kind()));
+    }
     Ok(saved)
 }
 
@@ -345,6 +357,7 @@ fn save_one(dir: &Path, f: &Attachment) -> std::io::Result<String> {
             Ok(mut file) => {
                 std::io::Write::write_all(&mut file, f.content.as_bytes())?;
                 mark_downloaded(&dir.join(&name));
+                file.sync_all()?;
                 return Ok(name);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n <= 100 => {

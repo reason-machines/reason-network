@@ -28,6 +28,9 @@ pub struct Config {
     /// (read when the daemon starts). Off by default.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub debug_log: bool,
+    /// Durably hold this person's mail for offline permanent mailboxes on their other machines.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub anchor: bool,
     pub inbound: Inbound,
     /// Folders whose sessions stay off the network, e.g. `"~/personal" = "off"` (`reason-network folder`). The deepest
     /// entry that holds a session's folder decides; `off` is the only value so far.
@@ -73,6 +76,7 @@ impl Default for Config {
             auto_update: true,
             port: None,
             debug_log: false,
+            anchor: false,
             inbound: Inbound::default(),
             folders: BTreeMap::new(),
         }

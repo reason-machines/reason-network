@@ -14,6 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod anchor;
+pub use anchor::TTL_MS as ANCHOR_TTL_MS;
+
 pub struct Store {
     db: Connection,
     inbox: PathBuf,
@@ -294,7 +297,9 @@ impl Store {
             // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
             db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
-        Ok(Store { db, inbox })
+        let store = Store { db, inbox };
+        store.init_anchor()?;
+        Ok(store)
     }
 
     /// A folder named in the `files` column: only one of the ids made here (a ULID), so always just inside the inbox.
@@ -547,6 +552,18 @@ impl Store {
         }
         transaction.commit()?;
         Ok(removed)
+    }
+
+    pub fn outbox_done_from(&self, target: &str, id: &str, taken: bool) -> Result<bool> {
+        let matches = self
+            .db
+            .query_row("SELECT 1 FROM outbox WHERE id = ?1 AND target = ?2", params![id, target], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if matches {
+            return self.outbox_done(id, taken);
+        }
+        Ok(false)
     }
 
     /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
@@ -1131,6 +1148,28 @@ mod tests {
             approval: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn peer_scoped_acknowledgments_update_receipts_and_counts_once() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        for (id, taken, expected) in [("accepted", true, "accepted"), ("refused", false, "rejected")] {
+            let mut outgoing = message(id, "bob/terminal");
+            outgoing.sent_at = now;
+            store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+            store.outbox_add("laptop", &outgoing).unwrap();
+            let stage = || store.delivery_status("sender", &[id.into()]).unwrap()[0]["stage"].clone();
+            assert!(!store.outbox_done_from("other-peer", id, taken).unwrap());
+            assert_eq!(stage(), "queued");
+            assert_eq!(store.outbox_for("laptop", now).unwrap().0.len(), 1);
+            assert!(store.outbox_done_from("laptop", id, taken).unwrap());
+            assert_eq!(stage(), expected);
+            assert!(!store.outbox_done_from("laptop", id, !taken).unwrap());
+            assert_eq!(stage(), expected);
+        }
+        assert!(store.outbox_for("laptop", now).unwrap().0.is_empty());
+        assert_eq!(store.counts(now).unwrap().iter().map(|day| day.sent).sum::<u64>(), 1);
     }
 
     #[test]

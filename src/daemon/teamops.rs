@@ -129,6 +129,9 @@ impl Daemon {
     }
 
     pub fn save_presence(&self, id: &EndpointId, rem: &Remote) {
+        if let Err(e) = self.learn_mailboxes(id, &rem.presence) {
+            log(&format!("remembering permanent mailboxes: {e:#}"));
+        }
         if let Ok(s) = serde_json::to_string(rem) {
             let _ = self.inner.lock().unwrap().store.set(&format!("presence:{id}"), &s);
         }
@@ -143,9 +146,11 @@ impl Daemon {
         messages
     }
 
-    pub fn outbox_done(&self, id: &str, taken: bool) {
-        if self.inner.lock().unwrap().store.outbox_done(id, taken).unwrap_or(false) {
-            self.usage.stage(id, if taken { "accepted" } else { "rejected" });
+    pub fn outbox_done_from(&self, peer: &EndpointId, id: &str, taken: bool) {
+        match self.inner.lock().unwrap().store.outbox_done_from(&peer.to_string(), id, taken) {
+            Ok(true) => self.usage.stage(id, if taken { "accepted" } else { "rejected" }),
+            Ok(false) => {}
+            Err(e) => log(&format!("confirming sent mail: {e:#}")),
         }
     }
 
@@ -166,6 +171,11 @@ impl Daemon {
             let state = team.clone();
             let relay_changed = state.meta.body.relay != relay;
             let gone = !after.contains(&me);
+            for id in before.difference(&after) {
+                if let Err(e) = self.remove_anchor_machine(&g, id) {
+                    log(&format!("removing anchor mail: {e:#}"));
+                }
+            }
             // Removed: what came with the news (a team link that replaced the one this machine knew, from a teammate
             // on an older build) is never written here, not even to the database's log.
             if !gone {
@@ -619,6 +629,11 @@ impl Daemon {
             // They knew the team link; make a new one.
             team.new_link(&self.key);
             let state = team.clone();
+            for (id, ..) in &hits {
+                if let Err(e) = self.remove_anchor_machine(&g, id) {
+                    log(&format!("removing anchor mail: {e:#}"));
+                }
+            }
             self.save_team(&g)?;
             (state, hits)
         };
@@ -656,6 +671,9 @@ impl Daemon {
             let mut g = self.inner.lock().unwrap();
             g.team = None;
             self.save_team(&g)?;
+            if let Err(e) = self.remove_anchor_machine(&g, &me) {
+                log(&format!("removing anchor mail: {e:#}"));
+            }
             g.store.delete_prefix("presence:")?;
         }
         self.restart_soon();
