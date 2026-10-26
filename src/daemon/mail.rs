@@ -33,6 +33,9 @@ const LOOP_WINDOW: Duration = Duration::from_secs(600);
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
 /// How often a Codex session's rollout is checked while mail waits for a hook of its turn.
 const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
+/// How long the daemon waits for a turn it started to show up in the session's hooks before starting another: mail
+/// meanwhile goes to the hooks, which show it in that turn.
+const WOKEN_START_MS: i64 = 90_000;
 /// Turns teammates' agents may start through a session's route before its person starts one again: past that, their
 /// mail waits for that turn. Agents answering each other through routes, in a ring of any size, stop there.
 pub(super) const WAKE_BUDGET: u32 = 6;
@@ -363,7 +366,9 @@ impl Daemon {
         let busy = l.status.as_ref().is_some_and(|(s, _)| s == "busy");
         let by_agent = msgs.iter().any(|m| !render::from_terminal(&m.from));
         let spent = by_agent && l.woken >= WAKE_BUDGET;
-        let route = l.reg.route.clone().filter(|_| !busy);
+        // A turn it started for earlier mail is on its way: this joins it rather than starting another.
+        let starting = l.owed > 0 && l.woke_at.is_some_and(|t| now - t < WOKEN_START_MS);
+        let route = l.reg.route.clone().filter(|_| !busy && !starting);
         let channel = match (l.reg.tier, l.conn, &l.reg.agent_session_id) {
             // Its MCP server knows its inbox; else (it may not yet) the daemon posts into the one Claude Code lists.
             (Tier::Push, Some(conn), _) if l.reg.agent == agent::CLAUDE_CODE && l.mcp_push => {
@@ -392,7 +397,9 @@ impl Daemon {
         let text = render::for_agent(&msgs, Some(&l.reg.agent), cli);
         let claude_session = l.reg.agent_session_id.clone();
         let (session, label) = (l.reg.agent_session_id.clone(), agent::label(&l.reg.agent).to_string());
-        let hook_note = if spent && l.reg.route.is_some() {
+        let hook_note = if starting && l.reg.route.is_some() {
+            "queued: a turn woken for an earlier message is starting; it sees this in that turn"
+        } else if spent && l.reg.route.is_some() {
             "queued: teammates' agents have woken this session a lot since its user last used it; it sees this when \
              its user next starts a turn, or at its next tool call"
         } else if matches!(l.reg.agent.as_str(), "opencode" | "pi") {
@@ -446,6 +453,7 @@ impl Daemon {
                 if let Some(l) = g.live.get_mut(key) {
                     l.woken += u32::from(by_agent);
                     l.owed += 1;
+                    l.woke_at = Some(now);
                 }
                 let text = format!("{WOKEN_NOTE}\n{text}");
                 self.send_route(key.to_string(), route, session.unwrap_or_default(), ids, text);

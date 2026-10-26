@@ -188,6 +188,8 @@ struct Live {
     /// Turns the daemon started in it (or a hook carried on with mail) whose start its hooks haven't shown yet: the next
     /// that many turns starting are those, not its person's.
     owed: u32,
+    /// When the daemon last started a turn in it through its route (ms).
+    woke_at: Option<i64>,
     /// When its person last started a turn in it, as far as anyone can tell: since it registered, if never (ms).
     human_at: i64,
     /// Ask its agent for a route at the next chance (Antigravity, whose route only its shell can give).

@@ -315,7 +315,9 @@ counts the turns it started (and those a Stop hook carried on with mail) that it
 owes any, a turn starting is one of those, however late its first hook fires; only a turn starting when it owes none is
 the person's. Unlike the per-pair loop guard, that stops agents answering each other in a ring of any size. A send that
 times out counts as delivered (the turn may have started with it), so hooks don't show it a second time; one that fails
-leaves the mail to the hooks and drops the route.
+leaves the mail to the hooks and drops the route. While a turn the daemon started hasn't shown up in the hooks (for
+up to 90 s), more mail goes to the hooks, which show it in that turn, rather than starting a second one. Only an
+Antigravity session takes a route.
 
 | Agent | Tier | Mechanism |
 |---|---|---|

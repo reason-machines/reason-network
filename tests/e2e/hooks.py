@@ -19,6 +19,7 @@ env["CLAUDE_CONFIG_DIR"] = CLAUDE
 CALLS = os.path.join(D, "calls.jsonl")
 AGY_FAIL = os.path.join(D, "agy-fails")
 AGY_HANG = os.path.join(D, "agy-hangs")
+AGY_PID = os.path.join(D, "agy-pid")
 FAKE_AGY = os.path.join(D, "fake-agy")
 with open(FAKE_AGY, "w") as f:
     f.write(f"""#!{sys.executable}
@@ -27,6 +28,7 @@ with open({CALLS!r}, "a") as f:
     f.write(json.dumps({{"bin": "agy", "args": sys.argv[1:], "addr": os.environ.get("ANTIGRAVITY_LS_ADDRESS"),
                         "token": os.environ.get("ANTIGRAVITY_CSRF_TOKEN")}}) + "\\n")
 if os.path.exists({AGY_HANG!r}):
+    open({AGY_PID!r}, "w").write(str(os.getpid()))
     import time; time.sleep(45)
 sys.exit(1 if os.path.exists({AGY_FAIL!r}) else 0)
 """)
@@ -147,6 +149,7 @@ setup("--remove")
 kept = json.load(open(os.path.join(agy_cfg, "hooks.json")))
 check("…but a hooks file with others' hooks stays, without ours", kept == other, kept)
 
+STARTS = "it starts a turn for it now"
 # Waking an idle agy: `wake` in its shell hands the daemon its language server, and the daemon runs `agy agentapi`.
 out = run("wake")
 check("wake outside agy's shell says where to run it", "Antigravity's shell" in out, out)
@@ -155,17 +158,22 @@ shell = dict(env, ANTIGRAVITY_AGENT="1", ANTIGRAVITY_CONVERSATION_ID="a-1", ANTI
 r = subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
 check("wake in agy's shell links the conversation", "now wake alex/agyproj-agy" in r.stdout, r.stdout + r.stderr)
 check("…and the intro stops asking for it", " wake`" not in hook("agy", "session-start", agy))
+me = [x for x in json.loads(subprocess.run([BIN, "who", "--json"], env=shell, capture_output=True, text=True).stdout)["sessions"] if x["is_me"]]
+check("agy's shell is known by ANTIGRAVITY_AGENT: `who` there marks its session", [x["name"] for x in me] == ["agyproj-agy"], me)
 hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 out = run("send", "agyproj-agy", "agy: wake up")
-check("the sender hears the idle agy starts a turn", "starts a turn" in out, out)
+check("the sender hears the idle agy starts a turn", STARTS in out, out)
 settle(lambda: calls("agy"))
 c = (calls("agy") or [{}])[-1]
 text = (c.get("args") or ["", "", "", ""])[3]
 check("…through agentapi into its conversation, with its server and token",
       c.get("args", [])[:3] == ["agentapi", "send-message", "a-1"] and c.get("addr") == "127.0.0.1:1" and c.get("token") == "tok-1", c)
 check("…framed as a teammate's agent's, not the user's or the system's", "agy: wake up" in text and "not from your user or the system" in text, text)
+out = run("send", "agyproj-agy", "agy: and one more")
+check("a second message before the woken turn shows up goes to the hooks, not a second turn", STARTS not in out and len(calls("agy")) == 1, out)
 out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
-check("…and the hooks don't deliver it twice", "wake up" not in out, out)
+check("…and the hooks don't deliver the first twice", "wake up" not in out, out)
+check("…but show the second in the woken turn", "and one more" in out, out)
 out = run("send", "agyproj-agy", "agy: while you work")
 check("a busy agy gets mail through its hooks, not a new turn", "next tool call" in out and len(calls("agy")) == 1, out)
 out = hook("agy", "post-tool-use", dict(agy, invocationNum=2))
@@ -180,7 +188,14 @@ check("a wake that fails leaves the mail to the hooks", "are you there" in out, 
 check("…and asks agy to run wake again", '"ephemeralMessage"' in out and " wake` once now" in out, out)
 os.remove(AGY_FAIL)
 hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
+run("send", "agyproj-agy", "agy: before the new link")
+n = len(calls("agy"))
 subprocess.run([BIN, "wake"], env=shell, capture_output=True, text=True, timeout=30)
+settle(lambda: len(calls("agy")) == n + 1)
+said = (calls("agy")[-1].get("args") or [""] * 4)[3]
+check("running wake again starts a turn for mail that waited", len(calls("agy")) == n + 1 and "before the new link" in said, said)
+hook("agy", "post-tool-use", dict(agy, invocationNum=1))
+hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 # Agents answering each other through routes stop after WAKE_BUDGET turns its person didn't start. Each woken turn's
 # own hooks don't count as its person's turn, however late the first one fires (Grok's can come only after its first
 # tool): only a turn starting that the daemon didn't start resets the budget.
@@ -190,27 +205,45 @@ for i in range(5):
     outs.append(run("send", "agyproj-agy", f"agy: ping {i}", "--from", "alex/proj-cursor"))
     woken_turn()
 outs.append(run("send", "agyproj-agy", "agy: ping 5", "--from", "alex/proj-cursor"))
-check("teammates' agents wake an idle agy up to the budget", all("starts a turn" in o for o in outs), outs)
+check("teammates' agents wake an idle agy up to the budget", all(STARTS in o for o in outs), outs)
 time.sleep(61)
 woken_turn()
 out = run("send", "agyproj-agy", "agy: ping 6", "--from", "alex/proj-cursor")
 check("…then their mail waits for its person, though the last woken turn's first hook came a minute late", "woken this session a lot" in out, out)
 woken_turn()  # its person's turn: nothing here started it
 out = run("send", "agyproj-agy", "agy: ping 7", "--from", "alex/proj-cursor")
-check("its person's turn gives teammates' agents the budget again", "starts a turn" in out, out)
+check("its person's turn gives teammates' agents the budget again", STARTS in out, out)
+settle(lambda: any("ping 7" in (c.get("args") or [""] * 4)[3] for c in calls("agy")))
 woken_turn()
 # A wake that times out may have started the turn: the mail counts as read, so hooks don't show it a second time.
 n = len(calls("agy"))
 open(AGY_HANG, "w").close()
 out = run("send", "agyproj-agy", "agy: slow wake")
-check("a wake goes out", "starts a turn" in out, out)
+check("a wake goes out", STARTS in out, out)
 time.sleep(33)
 os.remove(AGY_HANG)
 out = hook("agy", "post-tool-use", dict(agy, invocationNum=1))
 check("…and when agentapi times out, hooks don't deliver it again", "slow wake" not in out and len(calls("agy")) == n + 1, out)
+hung = int(open(AGY_PID).read())
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+check("…and the hung agentapi is killed", settle(lambda: not alive(hung), 5), hung)
 hook("agy", "stop", dict(agy, terminationReason="NO_TOOL_CALL"))
 out = run("send", "agyproj-agy", "agy: after the slow one")
-check("…and the link stays", "starts a turn" in out, out)
+check("…and the link stays", STARTS in out, out)
+
+# agy names no folder for a session in a folder it doesn't trust, and runs hooks in the folder of its hooks.json: the
+# session's folder is the agy process's own (here, this script's).
+hook_dir = os.path.join(D, "agy-config")
+os.makedirs(hook_dir)
+run("hook", "agy", "session-start", stdin=json.dumps({"conversationId": "a-untrusted"}), cwd=hook_dir)
+rows = json.loads(run("who", "--json"))["sessions"]
+cwds = [x["cwd"] for x in rows if x["agent"] == "agy" and x["cwd"] != agy_dir]
+check("an agy session with no folder named takes the agy process's", [os.path.realpath(os.path.expanduser(c)) for c in cwds] == [os.path.realpath(os.getcwd())], cwds)
 
 # Copilot: camelCase sessionId
 cop = {"sessionId": "p-1", "cwd": proj, "timestamp": 1}

@@ -130,6 +130,7 @@ impl Daemon {
                     mailbox: key == TERMINAL,
                     woken: 0,
                     owed: 0,
+                    woke_at: None,
                     human_at: now,
                     relink,
                 },
@@ -489,6 +490,10 @@ impl Daemon {
         let Some(l) = g.live.get_mut(key) else {
             bail!("this session isn't on Reason Network yet: its hooks register it, at its next turn")
         };
+        // Only Antigravity hands out a way in: any other session's mail must not go to an address a caller chose.
+        if l.reg.agent != "agy" {
+            bail!("only an Antigravity session can be woken this way");
+        }
         log(&format!("session {} can be woken ({route:?})", self.addr(&l.name)));
         l.reg.route = Some(route);
         l.reg.tier = Tier::Push;
@@ -1540,5 +1545,50 @@ mod tests {
         // Once its folders are all on again, it is a session like any other.
         assert!(d.hook(call("c1", "prompt", &[])).await.unwrap().address.is_some());
         assert!(d.inner.lock().unwrap().live.contains_key("cursor:c1"));
+    }
+
+    fn hook_of(agent: &str, id: &str) -> HookCall {
+        HookCall {
+            agent: agent.into(),
+            event: "start".into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+        }
+    }
+
+    fn agy_route() -> Route {
+        Route::Agy { address: "127.0.0.1:1".into(), token: "t".into() }
+    }
+
+    #[tokio::test]
+    async fn only_an_antigravity_session_takes_a_route() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.hook(hook_of("cursor", "c1")).await.unwrap();
+        assert!(d.set_route("cursor:c1", agy_route()).is_err());
+        assert!(d.inner.lock().unwrap().live["cursor:c1"].reg.route.is_none());
+        d.hook(hook_of("agy", "a1")).await.unwrap();
+        assert!(d.set_route("agy:a1", agy_route()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_antigravity_route_lapses_when_its_person_is_away() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        d.hook(hook_of("agy", "a1")).await.unwrap();
+        d.set_route("agy:a1", agy_route()).unwrap();
+        let now = util::now_ms();
+        let mut g = d.inner.lock().unwrap();
+        let l = g.live.get_mut("agy:a1").unwrap();
+        super::super::mail::lapse(l, now);
+        assert!(l.reg.route.is_some(), "its person was just here");
+        l.human_at = now - HOOK_TTL_MS - 1;
+        super::super::mail::lapse(l, now);
+        assert!(l.reg.route.is_none() && l.relink && l.reg.tier == Tier::Turn);
     }
 }
