@@ -264,8 +264,25 @@ message in its outbox. A machine's presence lists `features: ["files"]` when its
 would drop the field without a word, so for a machine that doesn't say so, the files are written out in the text as
 fenced blocks when that fits the 64 KB body limit, and the message is refused for that recipient otherwise.
 
-Later (M4): an **anchor** is just a member daemon on an always-on box (VPS, Pi) with `role=anchor` that
-also holds mail for offline machines and keeps searchable team history. Same binary, no special server.
+An **anchor** is an opt-in member daemon on an always-on box (VPS, Pi), enabled locally with `anchor = true`.
+It announces `anchor` in `Presence.features`; upgraded engines also announce `anchor-mail` and their permanent
+`mailboxes`. The anchor remembers only direct, same-person mailbox announcements in SQLite and advertises those
+`anchor_routes` to that person's other computers. Fresh workspaces can discover the offline destinations without a
+registration step. Direct presence wins over a cached route; removal or revocation invalidates routes and pending mail.
+
+Direct delivery is tried first. For an offline own machine, `Anchor` carries its endpoint and the complete original
+message. `Anchored` confirms only after a durable SQLite transaction. `Forward` retains the original source endpoint,
+checked against the active same-person roster, so replies and approvals still name the original computer. The recipient
+uses its normal validation, policy, file storage and ID deduplication before acknowledging. Final acknowledgments are
+matched to the destination computer; anchor acceptance is a separate, correlated acknowledgment. New frames only go to
+engines advertising support; old engines and machines without an anchor use their existing path.
+
+The anchor keeps at most 1,000 pending envelopes, 64 MB of serialized payloads, and 10,000 receipts. Full storage refuses
+acceptance explicitly. Completed receipts retain the ID, source, destination and payload digest until the original
+seven-day expiry, so a lost acknowledgment cannot resurrect delivered mail or extend its lifetime. Expiry, mailbox
+removal and revocation save a notice in the anchor's own terminal inbox while releasing the payload in one transaction.
+This is trusted same-person custody over encrypted transport: the anchor can read the stored content. It is not an
+untrusted ciphertext store, searchable team history, or migration of ordinary hosted-assistant inboxes.
 
 ## Local layer (M0)
 

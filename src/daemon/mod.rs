@@ -2,6 +2,7 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod anchor;
 mod ask;
 mod directory;
 mod mail;

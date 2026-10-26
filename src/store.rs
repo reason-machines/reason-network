@@ -14,6 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod anchor;
+pub use anchor::TTL_MS as ANCHOR_TTL_MS;
+
 pub struct Store {
     db: Connection,
     inbox: PathBuf,
@@ -171,7 +174,9 @@ impl Store {
             )?;
             tx.commit()?;
         }
-        Ok(Store { db, inbox })
+        let store = Store { db, inbox };
+        store.init_anchor()?;
+        Ok(store)
     }
 
     /// A folder named in the `files` column: only one of the ids made here (a ULID), so always just inside the inbox.
@@ -397,6 +402,18 @@ impl Store {
     pub fn outbox_done(&self, id: &str, taken: bool) -> Result<()> {
         if self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1 && taken {
             let _ = self.count(crate::util::now_ms(), Counted::Sent);
+        }
+        Ok(())
+    }
+
+    pub fn outbox_done_from(&self, target: &str, id: &str, taken: bool) -> Result<()> {
+        let matches = self
+            .db
+            .query_row("SELECT 1 FROM outbox WHERE id = ?1 AND target = ?2", params![id, target], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if matches {
+            self.outbox_done(id, taken)?;
         }
         Ok(())
     }

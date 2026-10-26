@@ -231,7 +231,8 @@ impl Daemon {
                         ("queued".into(), note)
                     }
                     Target::Remote { machine, .. } => {
-                        let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE));
+                        let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE))
+                            || self.learned_routes(&g, &remotes).iter().any(|r| r.machine == machine);
                         match for_machine(msg.clone(), takes_files) {
                             Ok(m) => {
                                 msg = m;
@@ -255,10 +256,15 @@ impl Daemon {
         self.arrived.notify_waiters();
 
         if let Some(net) = net {
-            let sends = remote_jobs.into_iter().filter(|j| j.3).map(|(i, machine, name, _, msg)| {
+            let sends = remote_jobs.into_iter().map(|(i, machine, name, online, msg)| {
                 let net = net.clone();
                 async move {
-                    let verdict = net.send_msg(&machine, &msg).await;
+                    let verdict = if online { net.send_msg(&machine, &msg).await } else { None };
+                    let verdict = if verdict.is_none() && !net.is_online(&machine) {
+                        net.send_anchor(machine, &msg).await
+                    } else {
+                        verdict
+                    };
                     (i, name, verdict)
                 }
             });
@@ -564,7 +570,7 @@ impl Daemon {
     pub fn receive(self: &Arc<Self>, peer: EndpointId, msg: Message) -> Result<(String, String)> {
         let (sender, machine) = self
             .team_state()
-            .and_then(|t| t.member(&peer).map(|m| (m.person.clone(), m.machine.clone())))
+            .and_then(|t| t.member(&peer).filter(|m| m.active).map(|m| (m.person.clone(), m.machine.clone())))
             .ok_or_else(|| anyhow!("not a team member"))?;
         let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
@@ -698,7 +704,11 @@ impl Daemon {
                 if g.live.get(&key).is_none_or(|l| l.stop_gen != stop) {
                     return Ok(Inbox { messages: Vec::new(), text: String::new() });
                 }
-                let messages = g.pending(&address)?;
+                let mut messages = g.pending(&address)?;
+                if key == "cli:terminal" {
+                    messages.extend(g.pending(&self.addr(super::anchor::NOTICE_INBOX))?);
+                    messages.sort_by_key(|m| m.sent_at);
+                }
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     g.store.mark_read(&ids, util::now_ms())?;
@@ -795,7 +805,7 @@ fn fits(body: &str) -> Result<()> {
 }
 
 /// Validates a message from a peer and strips its metadata down to safe characters.
-fn clean(m: Message) -> Result<Message> {
+pub(super) fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
     };
