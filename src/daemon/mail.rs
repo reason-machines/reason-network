@@ -962,6 +962,9 @@ impl Daemon {
             let mine = person == self.person && machine.is_none();
             let here = if mine { g.store.session_by_name(name)? } else { None };
             match (&theirs[..], &named[..], here) {
+                // Put down as sent by the conversation that holds the name now: which one did isn't kept from before
+                // notices, so a later one under the name may be told in its place (the text is the person's own either
+                // way). Mail from then still in the outbox tells nobody instead: it has no key (see `Store::tell`).
                 (_, [], Some(s)) => found.push((id, String::new(), Some(s.key))),
                 (_, _, Some(_)) => unknown = true,
                 (_, [only], None) => found.push((id, only.endpoint.to_string(), None)),

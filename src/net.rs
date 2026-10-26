@@ -1138,16 +1138,16 @@ impl Net {
         Ok(())
     }
 
-    /// The receiving machine's answer for a message. The sender saw it if `send_msg` was still waiting for it (see
-    /// `Daemon::outbox_done`).
+    /// The receiving machine's answer for a message. The sender saw it if it reached `send_msg` still waiting for it
+    /// (see `Daemon::outbox_done`).
     fn acked(&self, daemon: &Daemon, id: String, state: String, note: String) {
         let waiter = self.acks.lock().unwrap().remove(&id);
+        // Handed over before anything waits on the daemon: `send_msg` may give up in the meantime, and then didn't see
+        // it, waiter or not.
+        let seen = waiter.is_some_and(|w| w.send((state.clone(), note)).is_ok());
         // "retry": the other side is busy; keep it in the outbox for the next flush.
         if state != "retry" {
-            daemon.outbox_done(&id, state != "refused", waiter.is_some());
-        }
-        if let Some(waiter) = waiter {
-            let _ = waiter.send((state, note));
+            daemon.outbox_done(&id, state != "refused", seen);
         }
     }
 }
@@ -1507,7 +1507,7 @@ mod tests {
                 mailbox: false,
             };
             store.upsert_session(&api, person).unwrap();
-            for id in ["01SEEN", "01LATE"] {
+            for id in ["01SEEN", "01LATE", "01GAVEUP"] {
                 let m = Message {
                     id: id.into(),
                     from: format!("{person}/api"),
@@ -1535,11 +1535,16 @@ mod tests {
         assert_eq!(verdict.await.unwrap().0, "refused");
         // Answered after it: `send_msg` has given up and taken its waiter out, so nobody told the sender.
         refused("01LATE");
+        // Answered as it gave up: its waiter was still in `acks`, but nothing was left to hand the refusal to.
+        let (waiter, gave_up) = oneshot::channel();
+        net.acks.lock().unwrap().insert("01GAVEUP".into(), waiter);
+        drop(gave_up);
+        refused("01GAVEUP");
         let told = daemon.with_store(|store, _| {
             assert!(store.outbox_for("sven-box", 0).unwrap().0.is_empty());
             store.take_notices().into_iter().map(|m| m.reply_to).collect::<Vec<_>>()
         });
-        assert_eq!(told, [Some("01LATE".to_string())]);
+        assert_eq!(told, [Some("01LATE".to_string()), Some("01GAVEUP".to_string())]);
         net.shutdown().await;
     }
 

@@ -660,7 +660,7 @@ impl Store {
 
     /// Keeps the notice that `m` was dropped on `person`'s machine: in the outbox for the teammate's machine it came
     /// from (`source`), or, sent here, in its sender's inbox, if the session under its name is still the one that sent
-    /// it (`key`). Returns that one.
+    /// it (`key`) and could come back. Returns that one.
     fn tell(&self, m: &Message, source: Option<&str>, key: Option<&str>, person: &str) -> Result<Option<Message>> {
         let Some(mut n) = notice(m, &format!("{person}/terminal"), util::now_ms()) else { return Ok(None) };
         if let Some(machine) = source {
@@ -672,10 +672,11 @@ impl Store {
             return Ok(None);
         }
         // A sender here has an address without a machine on it. A later conversation under the name isn't told:
-        // the mail and its first line were another's.
+        // the mail and its first line were another's. Nor one known only by its process (see `Remembered::kept`): a
+        // later process given the same id would pass for it.
         let here = n.to.split_once('/').filter(|(p, name)| *p == person && !name.contains('@')).map(|(_, name)| name);
         if let (Some(name), Some(key)) = (here, key)
-            && self.session_by_name(name)?.is_some_and(|s| s.key == key)
+            && self.session_by_name(name)?.is_some_and(|s| s.key == key && s.kept())
             && self.insert(&mut n, false)?
         {
             return Ok(Some(n));
@@ -1849,6 +1850,24 @@ mod tests {
         assert_eq!(told, [web("01OUT-web"), web("01IN-web")]);
         assert!(store.unread("lars/api").unwrap().is_empty());
         assert_eq!(store.unread("lars/web").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_session_known_only_by_its_process_is_not_told_as_a_later_one_could_have_its_id() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        // An MCP client with no session id of its own (Zed's) is known by its process, and leaves mail for a session
+        // that goes.
+        for (name, key) in [("api", "proc:111"), ("gone", "codex:gone")] {
+            store.upsert_session(&conversation(name, key), "lars").unwrap();
+        }
+        let mut m = Message { from: "lars/api".into(), ..message("01PROC", "lars/gone") };
+        store.insert_sent(&mut m, "proc:111").unwrap();
+        // Its key could come back on another process (and nothing says it hasn't): its notice isn't kept under the
+        // name, for whichever process takes it next to read.
+        store.forget_session(&conversation("gone", "codex:gone"), "lars").unwrap();
+        assert!(store.take_notices().is_empty());
+        store.upsert_session(&conversation("api", "proc:222"), "lars").unwrap();
+        assert!(store.unread("lars/api").unwrap().is_empty());
     }
 
     #[test]
