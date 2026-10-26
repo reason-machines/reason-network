@@ -1111,7 +1111,7 @@ pub fn start_service() -> bool {
 /// Our Run entry, as `reg query` shows it.
 #[cfg(windows)]
 fn run_entry() -> Option<String> {
-    let out = Command::new("reg")
+    let out = crate::util::no_window(Command::new("reg"))
         .args(["query", RUN_KEY, "/v", &service_name()])
         .stdin(std::process::Stdio::null())
         .output()
@@ -1122,7 +1122,7 @@ fn run_entry() -> Option<String> {
 /// The Run entry a standalone tincan install made, if it still starts this binary or the tincan it replaced.
 #[cfg(windows)]
 pub fn legacy_run_entry(exe: &Path) -> bool {
-    Command::new("reg")
+    crate::util::no_window(Command::new("reg"))
         .args(["query", RUN_KEY, "/v", "dev.tincan.daemon"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -1132,7 +1132,9 @@ pub fn legacy_run_entry(exe: &Path) -> bool {
 /// Moves that Run entry over to this binary (ours first, then the old one goes).
 #[cfg(windows)]
 pub fn move_legacy_run_entry(exe: &Path) {
-    let reg = |args: &[&str]| Command::new("reg").args(args).stdin(std::process::Stdio::null()).output();
+    let reg = |args: &[&str]| {
+        crate::util::no_window(Command::new("reg")).args(args).stdin(std::process::Stdio::null()).output()
+    };
     if legacy_run_entry(exe) {
         let command = format!("\"{}\" daemon --service", exe.display());
         if reg(&["add", RUN_KEY, "/v", &service_name(), "/d", &command, "/f"]).is_ok_and(|o| o.status.success()) {
@@ -1143,7 +1145,9 @@ pub fn move_legacy_run_entry(exe: &Path) {
 
 #[cfg(windows)]
 async fn service(exe: &Path, remove: bool, dry: bool) -> Result<String> {
-    let reg = |args: &[&str]| Command::new("reg").args(args).stdin(std::process::Stdio::null()).output();
+    let reg = |args: &[&str]| {
+        crate::util::no_window(Command::new("reg")).args(args).stdin(std::process::Stdio::null()).output()
+    };
     if remove {
         if !dry {
             let _ = reg(&["delete", RUN_KEY, "/v", &service_name(), "/f"]);

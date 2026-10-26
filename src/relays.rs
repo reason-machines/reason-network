@@ -192,7 +192,7 @@ fn curl_args(url: &str) -> Vec<String> {
 /// The body at `url`, if a 200 of at most `MAX_BYTES`: curl is stopped as soon as more comes, however it is sent.
 async fn fetch(url: &str) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
-    let mut curl = tokio::process::Command::new("curl")
+    let mut curl = crate::util::no_window(tokio::process::Command::new("curl"))
         .args(curl_args(url))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

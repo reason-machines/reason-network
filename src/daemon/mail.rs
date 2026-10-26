@@ -510,7 +510,7 @@ impl Daemon {
         tokio::spawn(async move {
             let run = async {
                 let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
-                let out = tokio::process::Command::from(program)
+                let out = crate::util::no_window(tokio::process::Command::from(program))
                     .args(&args)
                     .arg(&text)
                     .stdin(std::process::Stdio::null())

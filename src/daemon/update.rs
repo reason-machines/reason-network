@@ -41,7 +41,7 @@ async fn update() -> Result<Option<String>> {
     let dir = crate::util::current_exe()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     let exe = dir.join(format!("{}{}", crate::AGENT_NAME, std::env::consts::EXE_SUFFIX));
     let waiting = crate::migrate::waiting(&exe);
-    let mut cmd = tokio::process::Command::from(crate::installer(&dir));
+    let mut cmd = crate::util::no_window(tokio::process::Command::from(crate::installer(&dir)));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -71,7 +71,8 @@ async fn update() -> Result<Option<String>> {
         crate::migrate::keep_waiting_copy(&exe);
     }
     // Restart only on a binary that really is newer (a release tagged without bumping its version must not loop).
-    let installed = tokio::process::Command::new(&exe).arg("--version").kill_on_drop(true).output();
+    let installed =
+        crate::util::no_window(tokio::process::Command::new(&exe)).arg("--version").kill_on_drop(true).output();
     let installed = tokio::time::timeout(Duration::from_secs(30), installed).await??;
     let installed =
         String::from_utf8_lossy(&installed.stdout).trim().rsplit(' ').next().unwrap_or_default().to_string();
@@ -85,7 +86,7 @@ async fn update() -> Result<Option<String>> {
 async fn latest_version() -> Result<String> {
     let repo = crate::REPO;
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let out = tokio::process::Command::new("curl")
+    let out = crate::util::no_window(tokio::process::Command::new("curl"))
         .args([
             "-fsSLI",
             "--max-time",

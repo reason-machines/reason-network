@@ -278,23 +278,31 @@ pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
 /// `cmd`, set to start without a console window of its own on Windows (CREATE_NO_WINDOW). The daemon runs without a
 /// console, so a console program it starts would otherwise get a new window, flashing up on the user's screen. Every
 /// program the daemon starts goes through here (a test checks).
-#[allow(dead_code)] // Red commit only: nothing uses it yet.
 pub fn no_window<C: NoWindow>(mut cmd: C) -> C {
     cmd.hide_window();
     cmd
 }
 
-#[allow(dead_code)]
 pub trait NoWindow {
     fn hide_window(&mut self);
 }
 
+/// CREATE_NO_WINDOW.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 impl NoWindow for std::process::Command {
-    fn hide_window(&mut self) {}
+    fn hide_window(&mut self) {
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(self, CREATE_NO_WINDOW);
+    }
 }
 
 impl NoWindow for tokio::process::Command {
-    fn hide_window(&mut self) {}
+    fn hide_window(&mut self) {
+        #[cfg(windows)]
+        self.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 #[cfg(test)]
@@ -314,13 +322,14 @@ mod tests {
         let mut out: Vec<_> = files
             .into_iter()
             .map(|path| {
-                let src = std::fs::read_to_string(&path).unwrap();
+                let src = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
                 let code = src.split("\nmod tests {").next().unwrap().to_string();
                 (path, code)
             })
             .collect();
         // The `reg` calls in setup.rs: the daemon asks whether its Run entry is installed.
-        let setup = std::fs::read_to_string(root.join("setup.rs")).unwrap();
+        // Windows checks out with CRLF.
+        let setup = std::fs::read_to_string(root.join("setup.rs")).unwrap().replace("\r\n", "\n");
         let start = setup.find("fn run_entry()").unwrap();
         let end = setup[start..].find("\n#[cfg(windows)]\nasync fn service(").unwrap() + start;
         out.push((root.join("setup.rs"), setup[start..end].to_string()));

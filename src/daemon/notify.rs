@@ -48,7 +48,7 @@ impl Daemon {
 
 #[cfg(target_os = "macos")]
 fn command(title: &str, body: &str) -> Option<Command> {
-    let mut cmd = Command::new(agent::find_bin("osascript")?);
+    let mut cmd = crate::util::no_window(Command::new(agent::find_bin("osascript")?));
     let show = r#"display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass""#;
     cmd.args(["-e", "on run argv", "-e", show, "-e", "end run", title, body]);
     Some(cmd)
@@ -70,7 +70,7 @@ pub(super) fn notify_send() -> Option<Command> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn notify_send_at(bin: std::path::PathBuf) -> Option<Command> {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::util::no_window(Command::new(bin));
     let bus = match std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
         Some(bus) => bus,
         None => {
@@ -101,7 +101,7 @@ fn notifications_on(bus: &std::ffi::OsStr) -> bool {
         return true;
     };
     let call = |args: &[&str]| {
-        Command::new(&busctl)
+        crate::util::no_window(Command::new(&busctl))
             .env("DBUS_SESSION_BUS_ADDRESS", bus)
             .args(["--user", "--timeout=1", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus"])
             .arg("org.freedesktop.DBus")
@@ -157,11 +157,9 @@ pub(super) fn powershell(script: &str) -> Option<Command> {
 
 #[cfg(windows)]
 pub(super) fn powershell_at(bin: std::path::PathBuf, script: &str) -> Command {
-    use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new(bin);
+    // No console flashing up next to the notification.
+    let mut cmd = crate::util::no_window(Command::new(bin));
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    // CREATE_NO_WINDOW: no console flashing up next to the notification.
-    cmd.creation_flags(0x0800_0000);
     cmd
 }
 

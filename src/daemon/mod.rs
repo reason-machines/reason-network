@@ -92,7 +92,12 @@ pub async fn run(service: bool) -> Result<()> {
 async fn tray() {
     let Ok(exe) = util::current_exe() else { return };
     for _ in 0..5 {
-        match tokio::process::Command::new(&exe).arg("tray").stdin(std::process::Stdio::null()).status().await {
+        match util::no_window(tokio::process::Command::new(&exe))
+            .arg("tray")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .await
+        {
             Ok(st) if st.success() => return,
             Ok(st) => log(&format!("menu bar icon exited ({st}); restarting it")),
             Err(e) => return log(&format!("menu bar icon not started: {e}")),

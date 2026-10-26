@@ -314,7 +314,7 @@ const NOT_SHOWN: [&str; 2] = ["Actions are not supported", "Failed to show notif
 async fn show(cmd: Command) -> Result<String, String> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-    let mut child = tokio::process::Command::from(cmd)
+    let mut child = crate::util::no_window(tokio::process::Command::from(cmd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -424,7 +424,7 @@ function run([title, request, question, secs, icon]) {
 
 #[cfg(target_os = "macos")]
 fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
-    let mut cmd = Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?);
+    let mut cmd = crate::util::no_window(Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?));
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
     cmd.args(["-l", "JavaScript", "-e", PANEL, title, request, question, &OPEN_SECS.to_string(), &icon]);
     Some(cmd)

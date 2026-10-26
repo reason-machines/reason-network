@@ -59,7 +59,7 @@ impl Daemon {
                 None => {}
                 Some(bin) => {
                     missing = false;
-                    let child = tokio::process::Command::new(&bin)
+                    let child = crate::util::no_window(tokio::process::Command::new(&bin))
                         .args(["network", "__relay"])
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::null())
@@ -184,8 +184,11 @@ async fn list_sessions(bin: &std::path::Path, narrow: bool) -> Result<std::proce
     if narrow {
         args.extend(["--fields", FIELDS]);
     }
-    let out =
-        tokio::process::Command::new(bin).args(args).stdin(std::process::Stdio::null()).kill_on_drop(true).output();
+    let out = crate::util::no_window(tokio::process::Command::new(bin))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
     Ok(tokio::time::timeout(Duration::from_secs(30), out).await??)
 }
 
