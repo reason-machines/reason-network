@@ -95,7 +95,7 @@ async fn handle(
         cwd,
         pid: agent::hook_agent_pid(),
         mail,
-        transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
+        transcript: transcript_of(agent, &v),
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
@@ -140,9 +140,19 @@ fn grok_ignores(event: &str, v: &Value) -> bool {
 }
 
 /// Antigravity runs Stop however the turn ended, and continuing a turn its user cancelled (or that failed) would undo
-/// that: mail waits for the next one.
+/// that: mail waits for the next one. Only a normal finish (`NO_TOOL_CALL`, or `model_stop` in some builds) continues.
 fn agy_holds_mail(event: &str, v: &Value) -> bool {
-    event == "stop" && v["terminationReason"].as_str().is_some_and(|r| r != "NO_TOOL_CALL")
+    event == "stop"
+        && !v["terminationReason"]
+            .as_str()
+            .is_some_and(|r| r.eq_ignore_ascii_case("NO_TOOL_CALL") || r.eq_ignore_ascii_case("model_stop"))
+}
+
+/// The transcript a hook names. Only agy spells it `transcriptPath`: Copilot's agentStop sends a `transcriptPath` too,
+/// but its events aren't a transcript the daemon reads.
+fn transcript_of(agent: &str, v: &Value) -> Option<String> {
+    let str_at = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    str_at("transcript_path").or_else(|| if agent == "agy" { str_at("transcriptPath") } else { None })
 }
 
 /// The JSON (or text) each agent expects from this hook to put `text` in front of the model.
@@ -186,7 +196,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{agy_holds_mail, format_for, grok_ignores, takes_mail};
+    use super::{agy_holds_mail, format_for, grok_ignores, takes_mail, transcript_of};
     use serde_json::json;
 
     #[test]
@@ -214,6 +224,22 @@ mod tests {
         assert!(agy_holds_mail("stop", &json!({ "terminationReason": "USER_CANCELED" })));
         assert!(agy_holds_mail("stop", &json!({ "terminationReason": "ERROR" })));
         assert!(!agy_holds_mail("post-tool-use", &json!({})));
+        // A normal finish, however a build spells it; no reason at all isn't one.
+        assert!(!agy_holds_mail("stop", &json!({ "terminationReason": "model_stop" })));
+        assert!(!agy_holds_mail("stop", &json!({ "terminationReason": "MODEL_STOP" })));
+        assert!(!agy_holds_mail("stop", &json!({ "terminationReason": "no_tool_call" })));
+        assert!(agy_holds_mail("stop", &json!({})));
+    }
+
+    #[test]
+    fn only_agy_names_its_transcript_in_camel_case() {
+        let v = json!({ "transcriptPath": "/t/events.jsonl" });
+        assert_eq!(transcript_of("agy", &v).as_deref(), Some("/t/events.jsonl"));
+        // Copilot's agentStop sends it too: its events aren't a transcript the daemon reads.
+        assert_eq!(transcript_of("copilot", &v), None);
+        let v = json!({ "transcript_path": "/t/c.jsonl" });
+        assert_eq!(transcript_of("copilot", &v).as_deref(), Some("/t/c.jsonl"));
+        assert_eq!(transcript_of("agy", &v).as_deref(), Some("/t/c.jsonl"));
     }
 
     #[test]
