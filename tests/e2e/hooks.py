@@ -1,4 +1,4 @@
-"""Hook flows for Cursor, Gemini, Copilot and opencode against one isolated daemon.
+"""Hook and setup flows for Command Code, Cursor, Gemini, Copilot and opencode against one isolated daemon.
 
     cargo build && python3 tests/e2e/hooks.py
 """
@@ -35,6 +35,64 @@ def hook(agent, event, payload):
 proj = os.path.join(D, "proj")
 os.makedirs(proj)
 run("init", "hooks", "--as", "alex", "--no-setup")
+
+cmd_home = os.path.join(D, "cmd-home")
+cmd_bin = os.path.join(D, "cmd-bin")
+os.makedirs(cmd_bin)
+with open(os.path.join(cmd_bin, "cmd"), "w") as f:
+    f.write("#!/bin/sh\nexit 0\n")
+os.chmod(os.path.join(cmd_bin, "cmd"), 0o755)
+os.makedirs(os.path.join(cmd_home, ".commandcode"))
+cmd_mcp_path = os.path.join(cmd_home, ".commandcode", "mcp.json")
+cmd_settings_path = os.path.join(cmd_home, ".commandcode", "settings.json")
+with open(cmd_mcp_path, "w") as f:
+    json.dump({"mcpServers": {"other": {"transport": "stdio", "command": "other-mcp"}}}, f)
+with open(cmd_settings_path, "w") as f:
+    json.dump({"model": "kept", "hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": "other start"}]}],
+        "PostToolUse": [{"matcher": "shell", "hooks": [{"type": "command", "command": "other tool"}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": "other stop"}]}],
+    }}, f)
+cmd_setup_env = dict(env, HOME=cmd_home, PATH=cmd_bin + os.pathsep + env.get("PATH", ""))
+def setup_cmd(*args):
+    return subprocess.run([BIN, "setup", *args, "--no-service"], env=cmd_setup_env, capture_output=True, text=True, timeout=30)
+setup_result = setup_cmd()
+setup_again = setup_cmd()
+with open(cmd_mcp_path) as f:
+    cmd_mcp = json.load(f)["mcpServers"]
+with open(cmd_settings_path) as f:
+    cmd_settings = json.load(f)
+cmd_server = cmd_mcp.get("reason-network", {})
+cmd_hooks = cmd_settings["hooks"]
+check("setup adds Command Code's local stdio server and preserves other MCP servers",
+      setup_result.returncode == 0 and cmd_mcp.get("other", {}).get("command") == "other-mcp"
+      and cmd_server.get("transport") == "stdio" and cmd_server.get("command") == BIN
+      and cmd_server.get("args") == ["mcp"] and cmd_server.get("env", {}).get("REASON_NETWORK_AGENT") == "cmd", setup_result.stdout + setup_result.stderr)
+check("setup merges only supported Command Code hooks once and preserves unrelated settings",
+      cmd_settings.get("model") == "kept"
+      and setup_again.returncode == 0
+      and all(sum("hook cmd " in h.get("command", "") for group in cmd_hooks[event] for h in group.get("hooks", [])) == 1
+              for event in ("SessionStart", "PostToolUse", "Stop"))
+      and any(h.get("command") == "other tool" for group in cmd_hooks["PostToolUse"] for h in group.get("hooks", [])), cmd_settings)
+remove_result = setup_cmd("--remove")
+with open(cmd_mcp_path) as f:
+    cmd_mcp = json.load(f)["mcpServers"]
+with open(cmd_settings_path) as f:
+    cmd_settings = json.load(f)
+check("setup remove leaves the user's MCP server and hooks intact",
+      remove_result.returncode == 0 and cmd_mcp == {"other": {"transport": "stdio", "command": "other-mcp"}}
+      and cmd_settings.get("model") == "kept"
+      and all(any(h.get("command", "").startswith("other ") for group in cmd_settings["hooks"].get(event, []) for h in group.get("hooks", []))
+              for event in ("SessionStart", "PostToolUse", "Stop"))
+      and "hook cmd " not in json.dumps(cmd_settings), remove_result.stdout + remove_result.stderr + str(cmd_settings))
+cmd_detect_home = os.path.join(D, "cmd-detect-home")
+cmd_detect_env = dict(env, HOME=cmd_detect_home, PATH=cmd_bin + os.pathsep + env.get("PATH", ""))
+cmd_detect = subprocess.run([BIN, "setup", "--no-service"], env=cmd_detect_env, capture_output=True, text=True, timeout=30)
+with open(os.path.join(cmd_detect_home, ".commandcode", "mcp.json")) as f:
+    cmd_detect_mcp = json.load(f)["mcpServers"]
+check("setup detects Command Code from its CLI without existing config",
+      cmd_detect.returncode == 0 and cmd_detect_mcp.get("reason-network", {}).get("env", {}).get("REASON_NETWORK_AGENT") == "cmd",
+      cmd_detect.stdout + cmd_detect.stderr + str(cmd_detect_mcp))
 
 # Cursor: conversation_id + workspace_roots; prompt-submit can't show context.
 cur = {"conversation_id": "c-1", "workspace_roots": [proj], "hook_event_name": "sessionStart"}
@@ -234,6 +292,32 @@ def reply(p, want):
         m = json.loads(p.stdout.readline())
         if m.get("id") == want:
             return m
+
+cmd_project = os.path.join(D, "cmd-project")
+os.makedirs(cmd_project)
+cmd_payload = {"session_id": "cmd-1", "cwd": cmd_project, "hook_event_name": "SessionStart"}
+out = hook("cmd", "session-start", cmd_payload)
+check("Command Code SessionStart injects the session address as context",
+      '"hookEventName":"SessionStart"' in out and '"additionalContext"' in out and "alex/cmd-project-cmd" in out, out)
+cmdproc = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env=dict(env, REASON_NETWORK_AGENT="cmd"), cwd=cmd_project, text=True)
+rpc(cmdproc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "Command Code", "version": "1"}}})
+reply(cmdproc, 1)
+rpc(cmdproc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+rpc(cmdproc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}})
+reply(cmdproc, 2)
+out = run("who", "cmd-project")
+check("Command Code MCP calls attach to its hook-registered conversation", "cmd-project-cmd" in out and "cmd-project-cmd-2" not in out, out)
+run("send", "cmd-project-cmd", "Command Code: inspect the failing test")
+out = hook("cmd", "stop", cmd_payload)
+check("Command Code Stop injects pending mail as a revision request", '"decision":"block"' in out and "inspect the failing test" in out, out)
+run("send", "cmd-project-cmd", "Command Code: one more note")
+out = hook("cmd", "post-tool-use", cmd_payload)
+check("Command Code PostToolUse adds pending mail to the next tool result",
+      '"hookEventName":"PostToolUse"' in out and '"additionalContext"' in out and "one more note" in out, out)
+cmdproc.kill()
+cmdproc.wait(timeout=5)
+
 cx_dir = os.path.join(D, "cancel-proj")
 os.makedirs(cx_dir)
 cx = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cx_dir, text=True)

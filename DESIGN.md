@@ -3,7 +3,7 @@
 > This is how the engine works inside. **AI agent asked to join the Reason Network?** Follow
 > https://reasonmachines.com/network instead.
 
-A team directory and message bus for coding agents. Any agent (Claude Code, Codex, Cursor, Gemini CLI,
+A team directory and message bus for coding agents. Any agent (Claude Code, Codex, Command Code, Cursor, Gemini CLI,
 opencode, Copilot CLI, Amp, …) on any teammate's machine can see who is working on what, right now, and
 message the right session directly: across the LAN or the internet, with no server to host.
 
@@ -277,11 +277,10 @@ session connection also receives pushed `deliver` events for its sessions.
 2. Env: `REASON_NETWORK_SESSION` (set by our pi extension), else the agent's own: `CLAUDE_CODE_SESSION_ID` (Claude),
    `CODEX_THREAD_ID` (Codex), `OPENCODE_SESSION_ID` (opencode), `COPILOT_AGENT_SESSION_ID` (Copilot),
    `GROK_SESSION_ID` (Grok).
-3. Hook stdin `session_id` (`SessionStart`), for Gemini, which gives its MCP servers no id (`GEMINI_SESSION_ID` is in its
-   hooks' env only): the one session the hooks of the MCP server's agent process (its parent, past a shell) registered,
-   asked on each call so `/clear` is followed. At start the MCP server waits up to 20 s for those hooks; registered by
-   process after all, it moves to their session once they come. A new conversation's `SessionStart` ends the one
-   before in the same process, and `SessionEnd` ends one though its MCP server is still connected.
+3. Hook stdin `session_id` (`SessionStart`). Gemini keeps `GEMINI_SESSION_ID` in hook environments only, and Command Code
+   provides the session id to its hooks rather than its MCP server. The MCP server follows the session registered by its
+   agent process and checks that link on each call. At startup, it waits up to 20 seconds for the hooks. A later
+   `SessionStart` moves the server to the new conversation. Gemini also ends a session on `SessionEnd`.
 4. Fallback: one session per MCP process.
 
 The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each agent's id comes from:
@@ -295,6 +294,7 @@ The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each
 | Hermes | profile-scoped conversation id | profile name, hash of the plugin state directory, and captured route key (or session id); compaction keeps the registered identity |
 | Cursor | conversation id | hooks' `conversation_id` (its shared MCP server takes the session its hooks registered) |
 | Gemini CLI | session id | hooks' `session_id` (its MCP server takes the session its process's hooks registered) |
+| Command Code | session id | hooks' `session_id` (its user-scoped MCP server takes the session its process's hooks registered) |
 | Copilot CLI | session id | `COPILOT_AGENT_SESSION_ID`, hooks' `sessionId` |
 | Grok CLI | session id | `GROK_SESSION_ID`, hooks' `session_id` |
 | Reason | session id | `reason session list` |
@@ -305,7 +305,7 @@ A conversation keeps its name across a resume as long as its agent keeps the id 
 the session; `/clear` starts a new one).
 
 Agent kind comes from MCP `clientInfo.name` plus env (`CLAUDECODE`, `CODEX_*`, `GEMINI_CLI`,
-`CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`, `GROK_SESSION_ID`).
+`CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`, `GROK_SESSION_ID`, `REASON_NETWORK_AGENT=cmd`).
 
 **Passive discovery.** Claude Code writes every live session to `~/.claude/sessions/<pid>.json` (name, cwd,
 busy/idle). The daemon reads these, so Claude sessions show up with live busy/idle status even without our
@@ -345,6 +345,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
+| Command Code | turn | `SessionStart` context; `PostToolUse` `additionalContext`; `Stop` `decision:block`. The MCP server follows the session registered by its hooks. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
@@ -456,8 +457,9 @@ still installs from this repo's releases and runs `reason-network init <name> --
 
 `join`/`init` run `setup`, which detects installed agents and wires each one (backing up every file it
 edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/config.toml` + `hooks.json`,
-`~/.cursor/mcp.json` + `hooks.json`, `~/.gemini/settings.json`, opencode plugin + MCP, Copilot
-`mcp-config.json` + hooks, `~/.grok/config.toml` + `hooks/reason-network.json`. Or paste the invite line into any agent.
+`~/.commandcode/mcp.json` + `~/.commandcode/settings.json` hooks, `~/.cursor/mcp.json` + `hooks.json`, `~/.gemini/settings.json`,
+opencode plugin + MCP, Copilot `mcp-config.json` + hooks, `~/.grok/config.toml` + `hooks/reason-network.json`.
+Or paste the invite line into any agent.
 
 ## Milestones
 
@@ -465,8 +467,8 @@ edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/c
   delivery, passive Claude discovery, pull delivery for everything else.
 - **M1, the team** (done): iroh endpoint, signed roster, `init`/`invite`/`join`/`remove`/`leave`, presence
   sync, routing with acks and outbox, hold/refuse policies, rate limit, mDNS, custom relay.
-- **M2, adapters** (done): Codex (`codex queue` + hooks), Cursor, Gemini, Copilot (hooks), opencode (plugin);
-  `setup [--remove]`, launchd/systemd service, `doctor`. Amp: MCP only, by hand.
+- **M2, adapters** (done): Codex (`codex queue` + hooks), Command Code (stdio MCP + hooks), Cursor, Gemini,
+  Copilot (hooks), opencode (plugin); `setup [--remove]`, launchd/systemd service, `doctor`. Amp: MCP only, by hand.
 - **M3, ship** (done): GitHub Actions builds for macOS, Linux and Windows; `install.sh` / `install.ps1` (install and
   join in one line, or hand over to the Reason CLI), with the release. Standalone installs update themselves; the
   Reason CLI pins its own. Later: Homebrew.

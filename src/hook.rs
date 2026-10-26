@@ -137,7 +137,9 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let block = || json!({ "decision": "block", "reason": text });
     let out = match (agent, ev) {
         ("opencode", _) if event == "poll" => return text.to_string(),
-        ("codex", "start") => specific("SessionStart"),
+        ("codex" | "cmd", "start") => specific("SessionStart"),
+        ("cmd", "tool") => specific("PostToolUse"),
+        ("cmd", "stop") => block(),
         ("codex", "prompt") => specific("UserPromptSubmit"),
         ("codex", "tool") => specific("PostToolUse"),
         ("grok", "tool") => specific("PostToolUse"),
@@ -175,6 +177,9 @@ mod tests {
     #[test]
     fn formats() {
         assert!(format_for("codex", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
+        assert!(format_for("cmd", "session-start", "start", "hi").contains("\"SessionStart\""));
+        assert!(format_for("cmd", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
+        assert_eq!(format_for("cmd", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("codex", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("cursor", "stop", "stop", "hi"), r#"{"followup_message":"hi"}"#);
         assert_eq!(format_for("cursor", "post-tool-use", "tool", "hi"), r#"{"additional_context":"hi"}"#);

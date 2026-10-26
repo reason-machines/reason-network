@@ -42,6 +42,15 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
     let has = |s: &str| n.contains(s);
     Some(if has("claude-code") || has("claude code") {
         CLAUDE_CODE
+    } else if n == "cmd"
+        || n == "cmdc"
+        || n.starts_with("cmdc-")
+        || n.starts_with("cmdc ")
+        || has("command-code")
+        || has("command code")
+        || has("commandcode")
+    {
+        "cmd"
     } else if has("codex") {
         "codex"
     } else if has("cursor") {
@@ -215,10 +224,8 @@ fn executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Agents that give their MCP servers no session id, only their hooks: their MCP server goes by the session the hooks
-/// of its own agent process registered. Gemini (`GEMINI_SESSION_ID` is in its hooks' env only).
 pub fn session_from_hooks(agent: &str) -> bool {
-    agent == "gemini"
+    matches!(agent, "gemini" | "cmd")
 }
 
 /// The agent process we serve, as [`hook_agent_pid`] finds it for a hook: found once (each step up can run `ps`).
@@ -253,6 +260,7 @@ pub fn label(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
         "grok" => "Grok",
+        "cmd" => "Command Code",
         "reason" => "Reason",
         a => a,
     }
@@ -442,6 +450,11 @@ mod tests {
     fn client_names() {
         assert_eq!(from_client_name("claude-code"), Some(CLAUDE_CODE));
         assert_eq!(from_client_name("codex-mcp-client"), Some("codex"));
+        assert_eq!(from_client_name("Command Code"), Some("cmd"));
+        assert_eq!(from_client_name("command-code-mcp-client"), Some("cmd"));
+        assert_eq!(from_client_name("cmd"), Some("cmd"));
+        assert_eq!(from_client_name("cmdc"), Some("cmd"));
+        assert_eq!(from_client_name("unrelated-command"), None);
         assert_eq!(from_client_name("cursor-vscode"), Some("cursor"));
         assert_eq!(from_client_name("gemini-cli-mcp-client"), Some("gemini"));
         // grok names its client after the server, so this one also contains "reason".
@@ -470,8 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn only_geminis_mcp_server_goes_by_its_hooks_session() {
+    fn gemini_and_command_code_mcp_servers_go_by_their_hooks_session() {
         assert!(session_from_hooks("gemini"));
+        assert!(session_from_hooks("cmd"));
         for a in [CLAUDE_CODE, "codex", "cursor", "opencode", "copilot", "grok", "pi", "zed", ""] {
             assert!(!session_from_hooks(a), "{a}");
         }

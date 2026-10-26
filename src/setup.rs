@@ -84,6 +84,20 @@ fn opencode_home() -> PathBuf {
     home().join(".config").join("opencode")
 }
 
+fn command_code_home() -> PathBuf {
+    home().join(".commandcode")
+}
+
+#[cfg(windows)]
+fn command_code_bin() -> Option<PathBuf> {
+    agent::find_bin("cmdc").or_else(|| agent::find_bin("command-code"))
+}
+
+#[cfg(not(windows))]
+fn command_code_bin() -> Option<PathBuf> {
+    agent::find_bin("cmd").or_else(|| agent::find_bin("command-code"))
+}
+
 fn pi_home() -> PathBuf {
     std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".pi").join("agent"))
 }
@@ -606,6 +620,41 @@ fn copilot(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         }});
         r.lines.push(changed(&hooks_path, write_json(&hooks_path, &v, dry)?));
     }
+    Ok(Some(r))
+}
+
+fn command_code(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+    let dir = command_code_home();
+    if !dir.exists() && command_code_bin().is_none() {
+        return Ok(None);
+    }
+    let mut r = Report { agent: "Command Code", lines: Vec::new(), notes: Vec::new() };
+
+    let mcp_path = dir.join("mcp.json");
+    let mut v = read_json(&mcp_path)?;
+    let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
+    drop_legacy(servers, exe);
+    if remove {
+        servers.remove(AGENT_NAME);
+    } else {
+        servers.insert(
+            AGENT_NAME.into(),
+            json!({ "transport": "stdio", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "cmd" } }),
+        );
+    }
+    r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
+
+    let settings_path = dir.join("settings.json");
+    let mut v = read_json(&settings_path)?;
+    let hooks = obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?;
+    let group = |event: &str| json!({ "hooks": [{ "type": "command", "command": shell_cmd(exe, &format!("hook cmd {event}")), "timeout": 10 }] });
+    let groups = vec![
+        ("SessionStart", group("session-start")),
+        ("PostToolUse", group("post-tool-use")),
+        ("Stop", group("stop")),
+    ];
+    merge_hook_groups(hooks, "cmd", groups, remove);
+    r.lines.push(changed(&settings_path, write_json(&settings_path, &v, dry)?));
     Ok(Some(r))
 }
 
@@ -1205,7 +1254,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 12] = [
+const AGENTS: [Agent; 13] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -1233,6 +1282,17 @@ const AGENTS: [Agent; 12] = [
                 && has(codex_home().join("hooks.json"), "hook codex")
         },
         apply: codex,
+    },
+    Agent {
+        id: "cmd",
+        name: "Command Code",
+        hint: "at the next tool call or end of turn",
+        installed: || command_code_home().exists() || command_code_bin().is_some(),
+        wired: |exe| {
+            has(command_code_home().join("mcp.json"), &me(exe))
+                && has(command_code_home().join("settings.json"), "hook cmd ")
+        },
+        apply: command_code,
     },
     Agent {
         id: "grok",
@@ -1423,7 +1483,7 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
     println!("{verb} ({}):", crate::util::tilde(&exe.display().to_string()));
     if found.is_empty() && !remove {
         println!(
-            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
+            "  no supported agents found (Claude Code, Codex, Command Code, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
         );
     }
     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();

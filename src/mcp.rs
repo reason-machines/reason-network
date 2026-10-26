@@ -128,8 +128,6 @@ pub async fn run() -> Result<()> {
         if agent::multiplexed(agent) || off_here() {
             return;
         }
-        // Gemini's hooks name its session, and can take seconds to run (PowerShell on Windows): they are waited for
-        // a while before it is registered by process.
         let hooks = agent::session_from_hooks(agent);
         for _ in 0..if hooks { 40 } else { 0 } {
             if s.linked(agent).await.is_some() {
@@ -345,8 +343,6 @@ impl ReasonNetworkMcp {
             }
         }
         let mut id = meta_id.or_else(|| agent::env_session_id(agent));
-        // Gemini gives its MCP servers no session id, only its hooks: the session they registered for its process.
-        // Asked each time, so a new conversation in the same window (`/clear`) is followed.
         if id.is_none() && agent::session_from_hooks(agent) {
             id = self.linked(agent).await;
             // Between one conversation's end and the next one's start (`/clear`): the next, a moment.
