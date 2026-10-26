@@ -42,6 +42,8 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
     let has = |s: &str| n.contains(s);
     Some(if has("claude-code") || has("claude code") {
         CLAUDE_CODE
+    } else if has("command-code") || has("command code") || has("commandcode") {
+        "command-code"
     } else if has("codex") {
         "codex"
     } else if has("cursor") {
@@ -442,6 +444,8 @@ mod tests {
     fn client_names() {
         assert_eq!(from_client_name("claude-code"), Some(CLAUDE_CODE));
         assert_eq!(from_client_name("codex-mcp-client"), Some("codex"));
+        assert_eq!(from_client_name("command-code-mcp-client"), Some("command-code"));
+        assert_eq!(from_client_name("Command Code"), Some("command-code"));
         assert_eq!(from_client_name("cursor-vscode"), Some("cursor"));
         assert_eq!(from_client_name("gemini-cli-mcp-client"), Some("gemini"));
         // grok names its client after the server, so this one also contains "reason".

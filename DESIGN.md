@@ -299,7 +299,7 @@ The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each
 | Grok CLI | session id | `GROK_SESSION_ID`, hooks' `session_id` |
 | Reason | session id | `reason session list` |
 | `listen --as <name>`, `terminal` | the name | `cli:<name>` |
-| DeepSeek Harness, ZCode, other MCP clients | none | `proc:<pid>` (`REASON_NETWORK_SESSION`, when set, gives one) |
+| DeepSeek Harness, ZCode, Command Code, other MCP clients | none | `proc:<pid>` (`REASON_NETWORK_SESSION`, when set, gives one) |
 
 A conversation keeps its name across a resume as long as its agent keeps the id (Claude Code does unless told to fork
 the session; `/clear` starts a new one).
@@ -457,7 +457,8 @@ still installs from this repo's releases and runs `reason-network init <name> --
 `join`/`init` run `setup`, which detects installed agents and wires each one (backing up every file it
 edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/config.toml` + `hooks.json`,
 `~/.cursor/mcp.json` + `hooks.json`, `~/.gemini/settings.json`, opencode plugin + MCP, Copilot
-`mcp-config.json` + hooks, `~/.grok/config.toml` + `hooks/reason-network.json`. Or paste the invite line into any agent.
+`mcp-config.json` + hooks, `~/.grok/config.toml` + `hooks/reason-network.json`,
+`~/.commandcode/mcp.json`. Or paste the invite line into any agent.
 
 ## Milestones
 
@@ -465,7 +466,7 @@ edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/c
   delivery, passive Claude discovery, pull delivery for everything else.
 - **M1, the team** (done): iroh endpoint, signed roster, `init`/`invite`/`join`/`remove`/`leave`, presence
   sync, routing with acks and outbox, hold/refuse policies, rate limit, mDNS, custom relay.
-- **M2, adapters** (done): Codex (`codex queue` + hooks), Cursor, Gemini, Copilot (hooks), opencode (plugin);
+- **M2, adapters** (done): Codex (`codex queue` + hooks), Cursor, Gemini, Copilot (hooks), opencode (plugin), Command Code (MCP pull);
   `setup [--remove]`, launchd/systemd service, `doctor`. Amp: MCP only, by hand.
 - **M3, ship** (done): GitHub Actions builds for macOS, Linux and Windows; `install.sh` / `install.ps1` (install and
   join in one line, or hand over to the Reason CLI), with the release. Standalone installs update themselves; the

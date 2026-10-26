@@ -88,6 +88,22 @@ fn pi_home() -> PathBuf {
     std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).unwrap_or_else(|| home().join(".pi").join("agent"))
 }
 
+fn command_code_home() -> PathBuf {
+    home().join(".commandcode")
+}
+
+fn command_code_bin() -> Option<PathBuf> {
+    if cfg!(windows) {
+        agent::find_bin("command-code").or_else(|| agent::find_bin("cmdc"))
+    } else {
+        agent::find_bin("command-code").or_else(|| agent::find_bin("cmd"))
+    }
+}
+
+fn command_code_config(home: &Path) -> PathBuf {
+    home.join(".commandcode").join("mcp.json")
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(json!({})),
@@ -524,6 +540,49 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     merge_hook_groups(hooks, "cursor", ours, remove);
     r.lines.push(changed(&hooks_path, write_json(&hooks_path, &v, dry)?));
     Ok(Some(r))
+}
+
+fn command_code_wired_in(home: &Path, exe: &Path) -> bool {
+    read_json(&command_code_config(home))
+        .ok()
+        .and_then(|v| v.get("mcpServers")?.get(AGENT_NAME)?.get("command")?.as_str().map(str::to_owned))
+        .is_some_and(|command| same_path(&command, exe))
+}
+
+fn command_code_in(home: &Path, exe: &Path, remove: bool, dry: bool) -> Result<Report> {
+    let path = command_code_config(home);
+    let mut v = read_json(&path)?;
+    let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
+    drop_legacy(servers, exe);
+    if remove {
+        servers.remove(AGENT_NAME);
+    } else {
+        servers.insert(
+            AGENT_NAME.into(),
+            json!({
+                "transport": "stdio",
+                "enabled": true,
+                "command": exe.display().to_string(),
+                "args": ["mcp"],
+                "env": { "REASON_NETWORK_AGENT": "command-code" }
+            }),
+        );
+    }
+    let mut r = Report { agent: "Command Code", lines: Vec::new(), notes: Vec::new() };
+    let did = write_json(&path, &v, dry)?;
+    r.lines.push(changed(&path, did));
+    if did && !remove {
+        r.notes.push("Start a new Command Code session to load Reason Network.".into());
+    }
+    Ok(r)
+}
+
+fn command_code(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+    let user_home = home();
+    if !command_code_home().exists() && command_code_bin().is_none() {
+        return Ok(None);
+    }
+    command_code_in(&user_home, exe, remove, dry).map(Some)
 }
 
 // ---- Gemini CLI ----
@@ -1205,7 +1264,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 12] = [
+const AGENTS: [Agent; 13] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -1233,6 +1292,14 @@ const AGENTS: [Agent; 12] = [
                 && has(codex_home().join("hooks.json"), "hook codex")
         },
         apply: codex,
+    },
+    Agent {
+        id: "command-code",
+        name: "Command Code",
+        hint: "when it checks its inbox",
+        installed: || command_code_home().exists() || command_code_bin().is_some(),
+        wired: |exe| command_code_wired_in(&home(), exe),
+        apply: command_code,
     },
     Agent {
         id: "grok",
@@ -1423,7 +1490,7 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
     println!("{verb} ({}):", crate::util::tilde(&exe.display().to_string()));
     if found.is_empty() && !remove {
         println!(
-            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
+            "  no supported agents found (Claude Code, Codex, Command Code, Grok CLI, Cursor, ZCode Desktop, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
         );
     }
     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
@@ -1514,6 +1581,43 @@ pub async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_code_user_scope_mcp_setup_is_idempotent_and_removable() {
+        let home = std::env::temp_dir().join(format!("reason-command-code-{}", ulid::Ulid::generate()));
+        let path = command_code_config(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{"provider":"keep","mcpServers":{"memory":{"command":"npx"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let exe = Path::new("/opt/reason/reason-network");
+
+        assert!(!command_code_wired_in(&home, exe));
+        command_code_in(&home, exe, false, false).unwrap();
+        let once = std::fs::read(&path).unwrap();
+        command_code_in(&home, exe, false, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), once);
+
+        let v = read_json(&path).unwrap();
+        assert_eq!(path.strip_prefix(&home).unwrap(), Path::new(".commandcode").join("mcp.json"));
+        assert_eq!(v["provider"], "keep");
+        assert_eq!(v["mcpServers"]["memory"], json!({ "command": "npx" }));
+        assert_eq!(v["mcpServers"][AGENT_NAME]["transport"], "stdio");
+        assert_eq!(v["mcpServers"][AGENT_NAME]["enabled"], true);
+        assert_eq!(v["mcpServers"][AGENT_NAME]["command"], exe.display().to_string());
+        assert_eq!(v["mcpServers"][AGENT_NAME]["args"], json!(["mcp"]));
+        assert_eq!(v["mcpServers"][AGENT_NAME]["env"]["REASON_NETWORK_AGENT"], "command-code");
+        assert!(command_code_wired_in(&home, exe));
+        assert!(!command_code_wired_in(&home, Path::new("/elsewhere/reason-network")));
+
+        let backup = PathBuf::from(format!("{}.bak-reason", path.display()));
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        command_code_in(&home, Path::new("/elsewhere/reason-network"), true, false).unwrap();
+        let after_remove = read_json(&path).unwrap();
+        assert_eq!(after_remove["provider"], "keep");
+        assert_eq!(after_remove["mcpServers"], json!({ "memory": { "command": "npx" } }));
+        assert!(!command_code_wired_in(&home, exe));
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn grok_allow_rule() {

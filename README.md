@@ -55,6 +55,8 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   result says if mail is waiting). Claude sessions you already had open join without a restart.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
   ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.
+- **Command Code too.** `setup` adds the MCP server to `~/.commandcode/mcp.json`; it sees
+  messages when it checks its inbox.
 - **Small text files go along.** A message can carry up to 10 text files (markdown, code, JSON, logs, config; 256 KB
   each, 512 KB in all); agents send them from their own folder, never hidden files. The recipient's engine saves copies
   under `~/.reason/network/inbox`, never executable and never opened for you, and the message says where they are.
