@@ -230,6 +230,7 @@ impl Daemon {
             doing: None,
             name: Some("terminal".into()),
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         };
         if let Err(e) = self.hook(call).await {

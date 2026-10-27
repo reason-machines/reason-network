@@ -134,6 +134,7 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    through_reason: false,
                 },
             );
             self.presence_changed();
@@ -317,7 +318,8 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep } = h;
+        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
+            h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
@@ -390,6 +392,10 @@ impl Daemon {
         if let Some(t) = transcript {
             l.transcript = Some(t.into());
         }
+        if through_reason {
+            l.through_reason = true;
+            l.reg.tier = Tier::Pull;
+        }
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
             if let Some(d) = doing {
@@ -399,7 +405,9 @@ impl Daemon {
             return Ok(HookReply::default());
         }
         l.last_hook = Some(now);
-        l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
+        if !l.through_reason {
+            l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
+        }
         if pid.is_some() {
             l.reg.pid = pid;
         }
@@ -791,6 +799,7 @@ mod tests {
             doing: Some(line.clone()),
             name: None,
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         };
         d.hook(doing).await.unwrap();
@@ -839,6 +848,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         };
         // Its MCP server registered it; then it ends.
@@ -870,6 +880,7 @@ mod tests {
                 doing: None,
                 name: None,
                 dirs: Vec::new(),
+                through_reason: false,
                 keep: false,
             })
             .await
@@ -965,6 +976,7 @@ mod tests {
             doing: None,
             name: Some(id.into()),
             dirs: Vec::new(),
+            through_reason: false,
             keep,
         };
         // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
@@ -1122,6 +1134,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
@@ -1154,6 +1167,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         }
     }
@@ -1492,6 +1506,7 @@ mod tests {
             doing: None,
             name: Some("terminal".into()),
             dirs: Vec::new(),
+            through_reason: false,
             keep: false,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
@@ -1667,6 +1682,7 @@ mod tests {
             doing: None,
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
+            through_reason: false,
             keep: false,
         };
         // Working in /work/api, with /work/private open too.
