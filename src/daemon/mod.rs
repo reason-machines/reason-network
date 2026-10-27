@@ -341,6 +341,11 @@ impl Daemon {
                 self.stop_waiting(&key).await;
                 Value::Null
             }
+            Request::EndSession { key } => {
+                self.stop_waiting(&key).await;
+                self.end_session(conn, &key);
+                Value::Null
+            }
             Request::Delivered { ids, .. } => {
                 let mut g = self.inner.lock().unwrap();
                 g.store.mark_read(&ids, util::now_ms())?;

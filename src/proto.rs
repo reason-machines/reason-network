@@ -161,6 +161,10 @@ pub enum Request {
         key: String,
         ids: Vec<String>,
     },
+    /// A conversation on a connection that carries others ended: it leaves now, not when the connection closes.
+    EndSession {
+        key: String,
+    },
     /// An agent hook fired (`reason network hook`): keeps hook-only sessions alive and returns mail to inject.
     Hook(HookCall),
     /// For agents whose MCP calls carry no session id (Cursor, opencode): the hook-known session of this agent

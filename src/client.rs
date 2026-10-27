@@ -86,6 +86,13 @@ impl Link {
         Ok(r)
     }
 
+    /// Ends a registered session, which a reconnect then leaves out.
+    pub async fn end_session(self: &Arc<Self>, key: &str) -> Result<()> {
+        self.regs.lock().unwrap().remove(key);
+        self.call::<Value>(Request::EndSession { key: key.into() }).await?;
+        Ok(())
+    }
+
     /// How a registered session was said to be reached.
     pub fn registered_tier(&self, key: &str) -> Option<Tier> {
         self.regs.lock().unwrap().get(key).map(|r| r.tier)
@@ -302,7 +309,7 @@ fn detach(cmd: &mut Command) -> std::io::Result<std::process::Child> {
 /// Remembers a registration, to make again after a reconnect. An agent with an MCP server per session is in one
 /// conversation at a time: a new one (Claude Code's `/clear`) replaces the one before, which must not come back.
 fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
-    if !crate::agent::multiplexed(&reg.agent) {
+    if !crate::agent::shares_connection(&reg.agent) {
         regs.retain(|_, r| r.agent != reg.agent);
     }
     regs.insert(reg.key.clone(), reg);
@@ -365,9 +372,12 @@ mod tests {
         // A shared server (Codex's) serves several at once.
         super::remember(&mut regs, reg("codex:1", "codex"));
         super::remember(&mut regs, reg("codex:2", "codex"));
+        // So does a Hermes gateway's bridge, one per chat.
+        super::remember(&mut regs, reg("hermes:1", "hermes"));
+        super::remember(&mut regs, reg("hermes:2", "hermes"));
         let mut keys: Vec<&String> = regs.keys().collect();
         keys.sort();
-        assert_eq!(keys, ["claude-code:after-clear", "codex:1", "codex:2"]);
+        assert_eq!(keys, ["claude-code:after-clear", "codex:1", "codex:2", "hermes:1", "hermes:2"]);
     }
 
     #[test]

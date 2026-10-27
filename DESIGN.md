@@ -131,8 +131,10 @@ subcommands:
 - `reason-network mcp`: stdio MCP server spawned by the agent. Thin client of the daemon. **Must handle many
   sessions per process**: Codex, opencode and Cursor share one MCP process across threads/tabs.
 - `reason-network bridge`: JSON-lines subprocess transport for native adapters. The Hermes plugin starts one per
-  conversation, registers its profile-scoped identity and working directory, and uses it for messaging and activity.
-  The bridge confines attachment paths and accepts acknowledgements only for messages it gave that session.
+  Hermes process and shares it across that process's conversations (a gateway's many chats on one connection). Each
+  conversation registers its own profile-scoped identity and working directory, and one that closes ends with
+  `end_session` while the others stay. The bridge confines attachment paths and accepts acknowledgements only for
+  messages it gave that session.
 - `reason-network hook <agent>`: hook handler (status, context injection, stop-continuation, wake).
 - `reason-network who | send | listen | status | init | invite | join | setup | doctor`: the CLI. `send` goes out as
   the agent session whose shell runs it, `--from <session>`, or from a plain terminal as `<you>/terminal`;

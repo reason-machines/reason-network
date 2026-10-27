@@ -27,6 +27,7 @@ struct Session {
     received: HashSet<String>,
 }
 type Sessions = Mutex<HashMap<String, Session>>;
+const FRAME: usize = 1024 * 1024;
 
 fn parse(line: &str) -> (u64, Result<Call>) {
     let value = match serde_json::from_str::<Value>(line) {
@@ -69,15 +70,27 @@ pub async fn run() -> Result<()> {
     let mut calls = JoinSet::new();
     loop {
         // Messages are limited to 64 KiB; a generous frame cap also accommodates JSON escaping.
-        let mut line = String::new();
-        let read = (&mut input).take(1024 * 1024 + 1).read_line(&mut line).await?;
+        let mut frame = Vec::new();
+        let read = (&mut input).take(FRAME as u64 + 1).read_until(b'\n', &mut frame).await?;
         if read == 0 {
             break;
         }
-        if read > 1024 * 1024 {
-            bail!("adapter frame exceeds 1 MiB");
+        if read > FRAME {
+            // The rest of the line is dropped unread: that call fails, and the conversations sharing this bridge go on.
+            while !frame.ends_with(b"\n") {
+                frame.clear();
+                if (&mut input).take(FRAME as u64).read_until(b'\n', &mut frame).await? == 0 {
+                    break;
+                }
+            }
+            let _ = output.send(serde_json::to_value(Reply::err(0, anyhow::anyhow!("adapter frame exceeds 1 MiB")))?);
+            continue;
         }
-        let (parsed_id, parsed) = parse(&line);
+        let Ok(line) = std::str::from_utf8(&frame) else {
+            let _ = output.send(serde_json::to_value(Reply::err(0, anyhow::anyhow!("adapter frame is not UTF-8")))?);
+            continue;
+        };
+        let (parsed_id, parsed) = parse(line);
         let (link, sessions, output) = (link.clone(), sessions.clone(), output.clone());
         calls.spawn(async move {
             let (id, result) = match parsed {
@@ -169,7 +182,8 @@ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<V
         | Request::Ask { key, .. }
         | Request::StopWaiting { key }
         | Request::Delivered { key, .. }
-        | Request::PushFailed { key, .. } => key.clone(),
+        | Request::PushFailed { key, .. }
+        | Request::EndSession { key } => key.clone(),
         Request::Send { from, .. } => from.clone(),
         Request::Hook(hook) => format!("{}:{}", hook.agent, hook.session_id),
         _ => bail!("the adapter bridge only accepts its registered sessions' messaging operations"),
@@ -219,6 +233,11 @@ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<V
                 session.received.extend(hook.ids.iter().cloned());
             }
             Ok(serde_json::to_value(hook)?)
+        }
+        Request::EndSession { .. } => {
+            sessions.lock().await.remove(&key);
+            link.end_session(&key).await?;
+            Ok(Value::Null)
         }
         _ => link.call(request).await,
     }
