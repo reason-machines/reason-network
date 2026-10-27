@@ -217,7 +217,7 @@ impl Daemon {
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
         Ok(Daemon {
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
-            machine: member.map_or_else(util::hostname, |m| m.machine),
+            machine: member.map_or_else(|| util::hostname(cfg.machine.as_deref()), |m| m.machine),
             key,
             cfg,
             inner: Mutex::new(Inner {
