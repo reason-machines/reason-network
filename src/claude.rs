@@ -73,17 +73,15 @@ pub fn wired() -> bool {
     }
 }
 
-/// `~/.claude.json` goes with `~/.claude`; a `CLAUDE_CONFIG_DIR` keeps its own inside.
+/// A `CLAUDE_CONFIG_DIR` keeps its `.claude.json` inside; `~/.claude` has it beside, as `~/.claude.json`.
 fn wired_in(dir: &std::path::Path) -> bool {
-    let file = if *dir == paths::user_home().join(".claude") {
-        paths::user_home().join(".claude.json")
-    } else {
-        dir.join(".claude.json")
-    };
-    std::fs::read(file)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v["mcpServers"][crate::AGENT_NAME].is_object())
+    let beside = (*dir == paths::user_home().join(".claude")).then(|| paths::user_home().join(".claude.json"));
+    std::iter::once(dir.join(".claude.json")).chain(beside).any(|file| {
+        std::fs::read(file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v["mcpServers"][crate::AGENT_NAME].is_object())
+    })
 }
 
 const HELD: &str = "held by Claude Code for its user's approval: the session skips permission prompts and has no \

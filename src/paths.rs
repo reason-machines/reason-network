@@ -257,7 +257,8 @@ pub fn claude_dirs() -> Vec<PathBuf> {
 /// Notes the `CLAUDE_CONFIG_DIR` we run under, so the daemon finds this profile's sessions too.
 pub fn remember_claude_dir() {
     let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) else { return };
-    let Some(dir) = std::path::absolute(dir).ok().and_then(|d| d.to_str().map(str::to_string)) else { return };
+    let dir = std::fs::canonicalize(&dir).or_else(|_| std::path::absolute(&dir));
+    let Some(dir) = dir.ok().and_then(|d| d.to_str().map(str::to_string)) else { return };
     let file = claude_dirs_file();
     let recorded = std::fs::read_to_string(&file).unwrap_or_default();
     if dir.contains('\n') || recorded.lines().any(|l| l == dir) || ensure_home().is_err() {
