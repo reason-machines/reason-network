@@ -1,5 +1,6 @@
-//! Claude Code keeps one `~/.claude/sessions/<pid>.json` per live session (name, cwd, busy/idle). Reading them
-//! lists every Claude session on this machine, including ones that don't have Reason Network loaded.
+//! Claude Code keeps one `~/.claude/sessions/<pid>.json` per live session (name, cwd, busy/idle), under
+//! `CLAUDE_CONFIG_DIR` when that is set. Reading them lists every Claude session on this machine, including ones that
+//! don't have Reason Network loaded.
 
 use crate::{agent::ClaudeSocket, paths, util};
 use serde::Deserialize;
@@ -21,14 +22,18 @@ pub struct ClaudeSession {
 }
 
 pub fn scan() -> Vec<ClaudeSession> {
-    let Ok(dir) = std::fs::read_dir(paths::claude_sessions()) else {
-        return Vec::new();
-    };
-    dir.flatten()
+    scan_dirs(&paths::claude_dirs())
+}
+
+fn scan_dirs(dirs: &[std::path::PathBuf]) -> Vec<ClaudeSession> {
+    let mut seen = std::collections::HashSet::new();
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d.join("sessions")).ok())
+        .flat_map(|dir| dir.flatten())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| serde_json::from_str::<ClaudeSession>(&std::fs::read_to_string(p).ok()?).ok())
-        .filter(|s| util::pid_alive(s.pid))
+        .filter(|s| util::pid_alive(s.pid) && seen.insert(s.pid))
         .collect()
 }
 
@@ -52,20 +57,33 @@ impl ClaudeSession {
     }
 }
 
-/// Whether Reason Network is one of Claude Code's MCP servers here (`reason network setup` chose Claude Code). Read once: the
-/// daemon restarts after setup.
+/// Whether Reason Network is one of Claude Code's MCP servers here (`reason network setup` chose Claude Code), in any of
+/// its directories. Read again only when a directory turns up: the daemon restarts after setup.
 pub fn wired() -> bool {
-    static WIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WIRED.get_or_init(|| {
-        let file = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-            Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
-            None => paths::user_home().join(".claude.json"),
-        };
-        std::fs::read(file)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .is_some_and(|v| v["mcpServers"][crate::AGENT_NAME].is_object())
-    })
+    static WIRED: std::sync::Mutex<Option<(Vec<std::path::PathBuf>, bool)>> = std::sync::Mutex::new(None);
+    let dirs = paths::claude_dirs();
+    let mut wired = WIRED.lock().unwrap();
+    match &*wired {
+        Some((read, yes)) if *read == dirs => *yes,
+        _ => {
+            let yes = dirs.iter().any(|d| wired_in(d));
+            *wired = Some((dirs, yes));
+            yes
+        }
+    }
+}
+
+/// `~/.claude.json` goes with `~/.claude`; a `CLAUDE_CONFIG_DIR` keeps its own inside.
+fn wired_in(dir: &std::path::Path) -> bool {
+    let file = if *dir == paths::user_home().join(".claude") {
+        paths::user_home().join(".claude.json")
+    } else {
+        dir.join(".claude.json")
+    };
+    std::fs::read(file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v["mcpServers"][crate::AGENT_NAME].is_object())
 }
 
 const HELD: &str = "held by Claude Code for its user's approval: the session skips permission prompts and has no \
@@ -78,8 +96,11 @@ const HELD: &str = "held by Claude Code for its user's approval: the session ski
 /// those for its user unless `crossSessionInbound` is `accept`. `None`: not known to be held (the mode is not in its
 /// transcript).
 pub fn held_note(session: Option<&str>) -> Option<&'static str> {
-    let mode = permission_mode(&crate::doing::claude_transcript(session?)?)?;
-    held_by(&mode, inbound_setting().as_deref()).then_some(HELD)
+    let transcript = crate::doing::claude_transcript(session?)?;
+    let mode = permission_mode(&transcript)?;
+    // `<dir>/projects/<project>/<session>.jsonl`: the settings are the session's profile's.
+    let dir = transcript.parent()?.parent()?.parent()?;
+    held_by(&mode, inbound_setting(dir).as_deref()).then_some(HELD)
 }
 
 fn held_by(mode: &str, setting: Option<&str>) -> bool {
@@ -88,8 +109,8 @@ fn held_by(mode: &str, setting: Option<&str>) -> bool {
 
 /// `crossSessionInbound` in the user's own `settings.json`, if set. Managed settings and a session's `--settings`
 /// take precedence over it and are not read, so a session can differ.
-fn inbound_setting() -> Option<String> {
-    let text = std::fs::read_to_string(paths::claude_dir().join("settings.json")).ok()?;
+fn inbound_setting(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v["crossSessionInbound"].as_str().map(str::to_string)
 }
@@ -124,19 +145,39 @@ pub fn peer_token(pid: u32) -> Option<String> {
         return None;
     }
     let prefix = format!("{pid}.");
-    std::fs::read_dir(paths::claude_sessions()).ok()?.flatten().find_map(|e| {
-        let name = e.file_name().into_string().ok()?;
-        if !name.starts_with(&prefix) || !name.ends_with(".key") {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
-        v["peerToken"].as_str().map(str::to_string)
-    })
+    paths::claude_dirs().iter().filter_map(|d| std::fs::read_dir(d.join("sessions")).ok()).flatten().flatten().find_map(
+        |e| {
+            let name = e.file_name().into_string().ok()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".key") {
+                return None;
+            }
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            v["peerToken"].as_str().map(str::to_string)
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_are_read_from_every_claude_dir() {
+        let root = std::env::temp_dir().join(format!("reason-network-dirs-{}", std::process::id()));
+        let (a, b) = (root.join("claude"), root.join("claude-b"));
+        let pid = std::process::id();
+        std::fs::create_dir_all(a.join("sessions")).unwrap();
+        std::fs::create_dir_all(b.join("sessions")).unwrap();
+        let entry = format!(r#"{{"pid":{pid},"sessionId":"s","name":"my-session","nameSource":"user"}}"#);
+        std::fs::write(b.join("sessions").join(format!("{pid}.json")), &entry).unwrap();
+        let found = scan_dirs(&[a.clone(), b.clone()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].chosen_name(), Some("my-session"));
+        // The same process listed twice (a profile recorded under two spellings) is one session.
+        std::fs::write(a.join("sessions").join(format!("{pid}.json")), &entry).unwrap();
+        assert_eq!(scan_dirs(&[a, b]).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn held_only_when_the_session_skips_prompts_and_the_setting_doesnt_accept() {

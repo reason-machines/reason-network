@@ -163,9 +163,10 @@ pub(crate) fn claude_transcript(session: &str) -> Option<PathBuf> {
         return Some(p.clone());
     }
     let file = format!("{session}.jsonl");
-    let path = std::fs::read_dir(paths::claude_dir().join("projects"))
-        .ok()?
-        .flatten()
+    let path = paths::claude_dirs()
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d.join("projects")).ok())
+        .flat_map(|dir| dir.flatten())
         .map(|e| e.path().join(&file))
         .find(|p| p.exists())?;
     found.insert(session.to_string(), path.clone());
@@ -174,8 +175,10 @@ pub(crate) fn claude_transcript(session: &str) -> Option<PathBuf> {
 
 /// The task in progress on the session's task list (`~/.claude/tasks/<session>/<n>.json`).
 fn claude_task(session: &str) -> Option<String> {
-    let dir = std::fs::read_dir(paths::claude_dir().join("tasks").join(session)).ok()?;
-    dir.flatten()
+    let dirs = paths::claude_dirs();
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d.join("tasks").join(session)).ok())
+        .flat_map(|dir| dir.flatten())
         .filter_map(|e| serde_json::from_slice::<Value>(&std::fs::read(e.path()).ok()?).ok())
         .filter(in_progress)
         .max_by_key(|t| t.get("id").and_then(Value::as_str).and_then(|i| i.parse::<u64>().ok()))

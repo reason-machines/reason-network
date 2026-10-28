@@ -317,6 +317,9 @@ async fn main() -> Result<()> {
     migrate::as_ours();
     let cmd = Cli::parse().cmd;
     paths::migrate();
+    if matches!(cmd, Some(Cmd::Mcp | Cmd::Hook { .. })) {
+        paths::remember_claude_dir();
+    }
     match cmd {
         Some(Cmd::Daemon { service }) => {
             let r = daemon::run(service).await;
