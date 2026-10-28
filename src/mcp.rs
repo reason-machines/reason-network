@@ -382,6 +382,9 @@ impl ReasonNetworkMcp {
             },
             tier,
             name: None,
+            // Where its Claude Code keeps the registry that names it: ours, which the daemon may not share.
+            claude_dir: (agent == agent::CLAUDE_CODE)
+                .then(|| crate::paths::claude_dir().to_string_lossy().into_owned()),
         };
         self.link.register(reg).await?;
         Ok(key)

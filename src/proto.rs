@@ -53,6 +53,10 @@ pub struct SessionReg {
     pub tier: Tier,
     #[serde(default)]
     pub name: Option<String>,
+    /// The Claude Code directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) of the session's Claude Code, whose registry
+    /// names it. The daemon may run with another's (one started by another profile, or by no Claude at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

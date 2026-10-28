@@ -21,14 +21,26 @@ pub struct ClaudeSession {
 }
 
 pub fn scan() -> Vec<ClaudeSession> {
-    let Ok(dir) = std::fs::read_dir(paths::claude_sessions()) else {
-        return Vec::new();
-    };
-    dir.flatten()
+    scan_in(&[])
+}
+
+/// `scan`, also reading the registries in the Claude Code directories `others` (profiles other than ours, from
+/// `CLAUDE_CONFIG_DIR`). A session listed in more than one is read once.
+pub fn scan_in(others: &[std::path::PathBuf]) -> Vec<ClaudeSession> {
+    let mut dirs = vec![paths::claude_sessions()];
+    for d in others.iter().map(|d| d.join("sessions")) {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|dir| dir.flatten())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| serde_json::from_str::<ClaudeSession>(&std::fs::read_to_string(p).ok()?).ok())
-        .filter(|s| util::pid_alive(s.pid))
+        .filter(|s| util::pid_alive(s.pid) && seen.insert(s.pid))
         .collect()
 }
 
