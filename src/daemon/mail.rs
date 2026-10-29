@@ -712,13 +712,7 @@ impl Daemon {
             let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
             if g.store.insert(&mut msg, held)? && !held {
-                let dims = crate::usage::Dimensions {
-                    source: msg.from_agent.as_deref().map(crate::usage::family).unwrap_or_else(|| "unknown".into()),
-                    locality: "remote".into(),
-                    ..Default::default()
-                };
-                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref(), true);
-                self.usage.count("received", dims, 1);
+                self.record_remote_received(&msg);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
             let (state, note) = match key {
@@ -795,6 +789,18 @@ impl Daemon {
         }
     }
 
+    // Both immediate receipt and an approved hold enter the eligible inbox once.
+    // Keep their observation together; neither telemetry failure can hold up delivery.
+    fn record_remote_received(&self, msg: &Message) {
+        let dims = crate::usage::Dimensions {
+            source: msg.from_agent.as_deref().map(crate::usage::family).unwrap_or_else(|| "unknown".into()),
+            locality: "remote".into(),
+            ..Default::default()
+        };
+        self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref(), true);
+        self.usage.count("received", dims, 1);
+    }
+
     /// Approves or drops held messages. Approved ones go to their session now.
     pub(super) fn settle(self: &Arc<Self>, ids: &[String], release: bool) -> Result<usize> {
         let mut g = self.inner.lock().unwrap();
@@ -804,6 +810,7 @@ impl Daemon {
         }
         if release {
             for m in &msgs {
+                self.record_remote_received(m);
                 let name = m.to.split_once('/').map_or("", |(_, n)| n);
                 if let Some(key) = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone()) {
                     self.deliver(&mut g, &key, vec![m.clone()], m.wake);
