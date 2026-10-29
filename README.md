@@ -114,6 +114,30 @@ To work out why connections drop or switch to a relay, `debug_log = true` (also 
 networking library's events to `~/.reason/network/debug.log`, on this computer only and without message text, links
 or keys. It's off by default; see [DESIGN.md](DESIGN.md#troubleshooting).
 
+For handoffs while your laptop is off, one of **your own** always-on computers can hold mail for it. On that
+computer (a VPS or Pi, signed in as you), add this at the top of `~/.reason/network/config.toml`, then restart its daemon:
+
+```toml
+anchor = true
+```
+
+Run `reason-network listen --as inbox --wait 0` on the laptop while both computers are online once. The anchor
+remembers that permanent mailbox. After that, even a fresh workspace signed in as you can find it with `who` and send
+to `you/inbox@laptop` (use your name and the laptop's machine name). Use one anchor per person; the sending and receiving
+computers need an engine with anchor support. Other people's mail and ordinary agent sessions keep working as before.
+
+Messages go directly when the laptop is online. When it is off, the anchor saves the whole message and its small text
+files in its SQLite database before answering **stored**. The sender can then go away; the anchor keeps its copy until
+the laptop saves it. This confirms storage, not that an agent has read or completed the work. Your own anchor can read
+the mail, just as your laptop can; keep its state on persistent disk.
+
+An anchor holds up to 1,000 pending messages and 64 MB of message data, with up to 10,000 retry receipts. When full it
+refuses the handoff and the sender keeps its copy. Mail expires seven days from the original send, including after a
+restart or retry. Removal of a mailbox or revocation of a machine drops its pending mail. Drop notices stay in the
+anchor's `terminal` inbox (`reason-network listen --as terminal --wait 0` there), even if the sending workspace is gone.
+Already accepted mail continues to drain if you turn the setting off. This does not move an ordinary hosted assistant's
+inbox between computers: mail already saved on a laptop stays there until that laptop returns.
+
 ## Uninstall
 
 ```sh

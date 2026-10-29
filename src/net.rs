@@ -35,6 +35,9 @@ pub const JOIN_ALPN: &[u8] = b"tincan/join/1";
 const PROTO: u32 = 1;
 const MAX_FRAME: usize = 4 << 20;
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod anchor_tests;
 /// Two machines that dial each other at once open their connections within this long of each other.
 const DIALED_TOGETHER: Duration = Duration::from_secs(5);
 /// The relay of a team that doesn't run its own while this machine has no list of Reason's relays (see `relays`).
@@ -53,6 +56,16 @@ pub enum Wire {
     Presence { presence: Presence },
     Msg { msg: Message },
     Ack { id: String, state: String, note: String },
+    Anchor { target: EndpointId, msg: Message },
+    Anchored { target: EndpointId, id: String, state: String, note: String },
+    Forward { source: EndpointId, msg: Message },
+}
+
+/// Permanent destinations learned directly by an owner's anchor, never ordinary agent sessions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailboxRoute {
+    pub machine: EndpointId,
+    pub names: Vec<String>,
 }
 
 /// What a machine tells its teammates about itself.
@@ -69,6 +82,10 @@ pub struct Presence {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailboxes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchor_routes: Vec<MailboxRoute>,
 }
 
 impl Presence {
@@ -121,7 +138,11 @@ struct Link {
     conn: Connection,
     dialer: EndpointId,
     since: Instant,
+    presence_seen: bool,
 }
+
+type AckWaiters = HashMap<(EndpointId, String), oneshot::Sender<(String, String)>>;
+type AnchorAttempts = HashMap<(EndpointId, String), (Instant, Option<EndpointId>)>;
 
 pub struct Net {
     endpoint: Endpoint,
@@ -139,12 +160,13 @@ pub struct Net {
     daemon: Weak<Daemon>,
     links: Mutex<HashMap<EndpointId, Link>>,
     remote: Mutex<HashMap<EndpointId, Remote>>,
-    acks: Mutex<HashMap<String, oneshot::Sender<(String, String)>>>,
+    acks: Mutex<AckWaiters>,
     dialing: Mutex<HashSet<EndpointId>>,
     wake: Notify,
     /// A local session came or went: announce it now, not at the next tick.
     changed: Notify,
     next_link: AtomicU64,
+    anchor_sent: Mutex<AnchorAttempts>,
 }
 
 /// How long a relay gets to answer one way (directly, or through the proxy) when the other way is still worth trying.
@@ -795,6 +817,7 @@ impl Net {
             wake: Notify::new(),
             changed: Notify::new(),
             next_link: AtomicU64::new(1),
+            anchor_sent: Default::default(),
         });
         tokio::spawn(log_relay(net.endpoint.clone()));
         tokio::spawn(route_loop(Arc::downgrade(&net)));
@@ -913,18 +936,68 @@ impl Net {
     pub async fn send_msg(&self, target: &EndpointId, msg: &Message) -> Option<(String, String)> {
         let tx = self.links.lock().unwrap().get(target).map(|l| l.tx.clone())?;
         let (otx, orx) = oneshot::channel();
-        self.acks.lock().unwrap().insert(msg.id.clone(), otx);
+        self.acks.lock().unwrap().insert((*target, msg.id.clone()), otx);
         if tx.send(Wire::Msg { msg: msg.clone() }).is_err() {
-            self.acks.lock().unwrap().remove(&msg.id);
+            self.acks.lock().unwrap().remove(&(*target, msg.id.clone()));
             return None;
         }
         match tokio::time::timeout(ACK_TIMEOUT, orx).await {
             Ok(Ok(verdict)) => Some(verdict),
             _ => {
-                self.acks.lock().unwrap().remove(&msg.id);
+                self.acks.lock().unwrap().remove(&(*target, msg.id.clone()));
                 None
             }
         }
+    }
+
+    /// New frames only go to engines that announced support. Repeated ticks don't flood a busy receiver.
+    pub fn anchor_send(&self, peer: EndpointId, id: &str, frame: Wire) {
+        let links = self.links.lock().unwrap();
+        let Some(link) = links.get(&peer).filter(|l| l.presence_seen) else { return };
+        let feature = match &frame {
+            Wire::Anchor { .. } => "anchor",
+            Wire::Forward { .. } => "anchor-mail",
+            _ => return,
+        };
+        if !self.remote.lock().unwrap().get(&peer).is_some_and(|r| r.presence.has(feature)) {
+            return;
+        }
+        let mut sent = self.anchor_sent.lock().unwrap();
+        sent.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+        if sent.contains_key(&(peer, id.to_string())) {
+            return;
+        }
+        let target = if let Wire::Anchor { target, .. } = &frame { Some(*target) } else { None };
+        if link.tx.send(frame).is_ok() {
+            sent.insert((peer, id.to_string()), (Instant::now(), target));
+        }
+    }
+
+    pub async fn send_anchor(&self, target: EndpointId, msg: &Message) -> Option<(String, String)> {
+        let daemon = self.daemon.upgrade()?;
+        if daemon.anchor_local() {
+            return match daemon.accept_anchor(self.me, target, msg.clone()) {
+                Ok(()) => {
+                    daemon.outbox_done_from(&target, &msg.id, true);
+                    daemon.anchor_tick(self);
+                    Some(("stored".into(), "stored durably on this anchor".into()))
+                }
+                Err(e) => Some(("queued".into(), format!("anchor did not accept: {e:#}; sender retains the message"))),
+            };
+        }
+        let peer = daemon.anchor_peer(&self.remotes(), &target)?;
+        let (tx, rx) = oneshot::channel();
+        self.acks.lock().unwrap().insert((peer, msg.id.clone()), tx);
+        self.anchor_send(peer, &msg.id, Wire::Anchor { target, msg: msg.clone() });
+        let verdict = tokio::time::timeout(ACK_TIMEOUT, rx).await.ok().and_then(Result::ok);
+        self.acks.lock().unwrap().remove(&(peer, msg.id.clone()));
+        verdict.map(|(state, note)| {
+            if state == "stored" {
+                (state, note)
+            } else {
+                ("queued".into(), format!("{note}; sender retains the message"))
+            }
+        })
     }
 
     async fn dial_loop(self: Arc<Self>) {
@@ -1026,6 +1099,7 @@ impl Net {
                     }
                 }
             }
+            daemon.anchor_tick(&self);
         }
     }
 
@@ -1050,7 +1124,10 @@ impl Net {
                 }
                 old.conn.close(0u32.into(), b"replaced");
             }
-            links.insert(peer, Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now() });
+            links.insert(
+                peer,
+                Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now(), presence_seen: false },
+            );
         }
         log(&format!("connected to {} ({})", peer.fmt_short(), if outgoing { "out" } else { "in" }));
         let paths = tokio::spawn(log_paths(conn.clone()));
@@ -1118,8 +1195,16 @@ impl Net {
             Wire::State { state } => daemon.merge_state(&state),
             Wire::Presence { presence } => {
                 let rem = Remote { presence: tidy_presence(presence), last_seen: util::now_ms(), online: true };
+                {
+                    let mut links = self.links.lock().unwrap();
+                    let Some(link) = links.get_mut(&peer).filter(|l| l.tx.same_channel(tx)) else {
+                        return Ok(());
+                    };
+                    self.remote.lock().unwrap().insert(peer, rem.clone());
+                    link.presence_seen = true;
+                }
                 daemon.save_presence(&peer, &rem);
-                self.remote.lock().unwrap().insert(peer, rem);
+                daemon.anchor_tick(self);
             }
             Wire::Msg { msg } => {
                 let id = msg.id.clone();
@@ -1132,11 +1217,48 @@ impl Net {
             Wire::Ack { id, state, note } => {
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
                 if state != "retry" {
-                    daemon.outbox_done(&id, state != "refused");
+                    daemon.outbox_done_from(&peer, &id, state != "refused");
+                    daemon.forward_done(&peer, &id, &state, &note)?;
                 }
-                if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
+                if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
                     let _ = waiter.send((state, note));
                 }
+            }
+            Wire::Anchor { target, msg } => {
+                let id = msg.id.clone();
+                let (state, note) = match daemon.accept_anchor(peer, target, msg) {
+                    Ok(()) => ("stored".into(), "stored durably on your anchor".into()),
+                    Err(e) => ("retry".into(), format!("anchor did not accept: {e:#}")),
+                };
+                let _ = tx.send(Wire::Anchored { target, id, state, note });
+            }
+            Wire::Anchored { target, id, state, note } => {
+                let offered = self
+                    .anchor_sent
+                    .lock()
+                    .unwrap()
+                    .get(&(peer, id.clone()))
+                    .is_some_and(|(_, offered)| *offered == Some(target));
+                if offered
+                    && self.remotes().get(&peer).is_some_and(|r| r.presence.has("anchor"))
+                    && daemon.same_owner(&peer)
+                {
+                    self.anchor_sent.lock().unwrap().remove(&(peer, id.clone()));
+                    if state == "stored" {
+                        daemon.outbox_done_from(&target, &id, true);
+                    }
+                    if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
+                        let _ = waiter.send((state, note));
+                    }
+                }
+            }
+            Wire::Forward { source, msg } => {
+                let id = msg.id.clone();
+                let (state, note) = match daemon.receive_forward(peer, source, msg) {
+                    Ok(v) => v,
+                    Err(e) => ("retry".into(), format!("forward not saved: {e:#}")),
+                };
+                let _ = tx.send(Wire::Ack { id, state, note });
             }
         }
         Ok(())
@@ -1183,7 +1305,19 @@ fn tidy_presence(mut p: Presence) -> Presence {
         .collect();
     p.features.truncate(20);
     p.features.iter_mut().for_each(|f| *f = util::slug(f).chars().take(32).collect());
+    p.mailboxes = tidy_mailboxes(p.mailboxes);
+    p.anchor_routes.truncate(100);
+    for route in &mut p.anchor_routes {
+        route.names = tidy_mailboxes(std::mem::take(&mut route.names));
+    }
     p
+}
+
+fn tidy_mailboxes(mut names: Vec<String>) -> Vec<String> {
+    names.retain(|n| !n.is_empty() && n.len() <= 64 && util::slug(n) == *n);
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
