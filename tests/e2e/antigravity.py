@@ -67,7 +67,7 @@ def main():
                     mcp.terminate(); _,error=mcp.communicate(timeout=5)
                     raise AssertionError('MCP timeout: '+error)
                 return json.loads(mcp.stdout.readline())
-            rpc(1,'initialize',dict(protocolVersion='2025-06-18',capabilities={},clientInfo=dict(name='antigravity',version='fixture')))
+            rpc(1,'initialize',dict(protocolVersion='2025-06-18',capabilities={},clientInfo=dict(name='gemini-cli-mcp-client',version='fixture')))
             mcp.stdin.write(json.dumps(dict(jsonrpc='2.0',method='notifications/initialized'))+'\n');mcp.stdin.flush()
             for i,sid in enumerate([first,second],2):
                 response=rpc(i,'tools/call',dict(name='list_team',arguments=dict(session_id=sid)))

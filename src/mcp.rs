@@ -364,6 +364,8 @@ impl ReasonNetworkMcp {
             .or_else(|| meta?.get("io.modelcontextprotocol/clientInfo")?.get("name")?.as_str().map(str::to_string));
         match name.as_deref().and_then(agent::from_client_name) {
             Some(a) => {
+                // The explicit Antigravity profile selects its native hook ABI even with a shared Gemini SDK name.
+                let a = if a == "gemini" && self.env_agent == Some("antigravity") { "antigravity" } else { a };
                 *self.client_agent.lock().unwrap() = Some(a);
                 a
             }
