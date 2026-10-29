@@ -189,21 +189,26 @@ impl Store {
         }
         Ok(out)
     }
-    pub fn begin_send(&self, key: &str, fingerprint: &str, now: i64) -> Result<Option<crate::proto::SendResult>> {
+    pub fn begin_send(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: i64,
+    ) -> Result<(String, Option<crate::proto::SendResult>)> {
         self.db.execute("DELETE FROM send_keys WHERE created_at < ?1", [now - 7 * 86_400_000])?;
         self.db.execute(
-            "INSERT OR IGNORE INTO send_keys(key,fingerprint,created_at) VALUES(?1,?2,?3)",
-            params![key, fingerprint, now],
+            "INSERT OR IGNORE INTO send_keys(key,fingerprint,created_at,nonce) VALUES(?1,?2,?3,?4)",
+            params![key, fingerprint, now, ulid::Ulid::generate().to_string()],
         )?;
-        let (old, receipt): (String, Option<String>) =
-            self.db.query_row("SELECT fingerprint,receipt FROM send_keys WHERE key=?1", [key], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        let (old, receipt, nonce): (String, Option<String>, String) =
+            self.db.query_row("SELECT fingerprint,receipt,nonce FROM send_keys WHERE key=?1", [key], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
         anyhow::ensure!(
             old == fingerprint,
             "idempotency key already used for a different message; use a new key for a corrected or different message"
         );
-        receipt.map(|v| serde_json::from_str(&v).map_err(Into::into)).transpose()
+        Ok((nonce, receipt.map(|v| serde_json::from_str(&v)).transpose()?))
     }
 
     pub fn finish_send(&self, key: &str, receipt: &crate::proto::SendResult) -> Result<()> {
@@ -262,10 +267,18 @@ impl Store {
             )?;
             tx.commit()?;
         }
-        for (column, definition) in [("native_app", "INTEGER NOT NULL DEFAULT 0"), ("native_hook_at", "INTEGER")] {
+        for (column, definition) in [
+            ("native_app", "INTEGER NOT NULL DEFAULT 0"),
+            ("native_hook_at", "INTEGER"),
+            ("native_dirs", "TEXT NOT NULL DEFAULT '[]'"),
+        ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
             }
+        }
+        if !db.prepare("SELECT 1 FROM pragma_table_info('send_keys') WHERE name='nonce'")?.exists([])? {
+            // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
+            db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
         Ok(Store { db, inbox })
     }
@@ -617,7 +630,8 @@ impl Store {
                  attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END,
                  mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
                  native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
-                 native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END"
+                 native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
+                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END"
             ),
             params![
                 s.name,
@@ -693,19 +707,24 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>) -> Result<()> {
+    pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>, dirs: &[String]) -> Result<()> {
         self.db.execute(
-            "UPDATE sessions SET native_app=?2,native_hook_at=?3 WHERE key=?1 AND agent='antigravity'",
-            params![key, hook_at.is_some(), hook_at],
+            "UPDATE sessions SET native_app=?2,native_hook_at=?3,native_dirs=?4 WHERE key=?1 AND agent='antigravity'",
+            params![key, hook_at.is_some(), hook_at, serde_json::to_string(dirs)?],
         )?;
         Ok(())
     }
 
-    pub fn is_native_app(&self, key: &str) -> Result<bool> {
-        Ok(self
+    pub fn native_app_roots(&self, key: &str) -> Result<Option<Vec<String>>> {
+        let roots: Option<String> = self
             .db
-            .prepare("SELECT 1 FROM sessions WHERE key=?1 AND agent='antigravity' AND native_app=1")?
-            .exists([key])?)
+            .query_row(
+                "SELECT native_dirs FROM sessions WHERE key=?1 AND agent='antigravity' AND native_app=1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(roots.map(|value| serde_json::from_str::<Vec<String>>(&value)).transpose()?.filter(|dirs| !dirs.is_empty()))
     }
 
     pub fn native_app_sessions(&self, since: i64) -> Result<Vec<(Remembered, i64)>> {
@@ -1033,6 +1052,19 @@ mod tests {
         store.settle_held(&[reply.id], true).unwrap();
         assert_eq!(stage(), "replied");
         assert_eq!(store.delivery_status("other-session", &["accepted".into()]).unwrap()[0]["stage"], "unknown");
+    }
+
+    #[test]
+    fn an_expired_idempotency_key_gets_a_new_generation() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        let (first, _) = store.begin_send("key", "original", now).unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(store.begin_send("key", "original", now + 1000).unwrap().0, first);
+        assert!(store.begin_send("key", "different", now + 1000).is_err());
+        let (next, receipt) = store.begin_send("key", "different", now + 8 * 86_400_000).unwrap();
+        assert_ne!(next, first);
+        assert!(receipt.is_none());
     }
 
     #[test]

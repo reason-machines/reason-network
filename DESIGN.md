@@ -363,6 +363,8 @@ or acted on it. `reason session send` only acknowledges its remote server, so it
 Antigravity App bindings are marked by native hooks on the canonical persisted session rows; its sidecar restores
 them after daemon restarts without relying on the lifetime of a hook-runner process. Explicit native session ids
 are a local-user routing mechanism, not isolation between conversations owned by that same user on the machine.
+The sidecar is authorized by the same local socket permissions. Restoring a binding revalidates every workspace
+reported by its native hook, and an off-folder hook revokes that binding until a new allowed hook registers it.
 
 Gotcha: Cursor, Copilot CLI and Devin load **Claude Code's** hooks from `~/.claude/settings.json`, so
 `reason-network hook` must detect which agent is actually calling it.

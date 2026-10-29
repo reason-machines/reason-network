@@ -36,8 +36,8 @@ def main():
                 if result:return result
                 time.sleep(.1)
             raise AssertionError('condition did not become true')
-        def hooks(sid,event):
-            return cli('hook','antigravity',event,payload=dict(conversationId=sid,workspacePaths=[str(project)],transcriptPath=str(root/'.gemini/antigravity/brain'/sid/'transcript.jsonl'),invocationNum=0,initialNumSteps=0))
+        def hooks(sid,event,workspaces=None):
+            return cli('hook','antigravity',event,payload=dict(conversationId=sid,workspacePaths=workspaces or [str(project)],transcriptPath=str(root/'.gemini/antigravity/brain'/sid/'transcript.jsonl'),invocationNum=0,initialNumSteps=0))
         def sessions():return call('who')['result']['sessions']
         def receipt(ids):return call('delivery_status',**{'from':'cli:sender','ids':ids})['result']
         def sent(to,body,key):
@@ -118,6 +118,20 @@ def main():
             assert first not in serialized and str(project) not in serialized and 'Retry the failed handoff' not in serialized
             assert any(s['agent']=='antigravity' and s['adapterConnected'] for s in health['sessions'])
             print('PASS health reports capabilities without content, conversation ids or project paths')
+            blocked=root/'disabled-project';blocked.mkdir()
+            cli('folder',str(blocked),'off')
+            assert hooks(first,'user-prompt-submit',[str(project),str(blocked)])==''
+            cli('stop')
+            wait(lambda:len([s for s in sessions() if s['agent']=='antigravity' and s['tier']=='push'])==1)
+            assert not any(s['address']==recipient for s in sessions())
+            print('PASS a hook with a disabled secondary workspace revokes its persistent App binding')
+            cli('folder',str(blocked),'on')
+            hooks(first,'user-prompt-submit',[str(project),str(blocked)])
+            wait(lambda:len([s for s in sessions() if s['agent']=='antigravity' and s['tier']=='push'])==2)
+            cli('folder',str(blocked),'off')
+            wait(lambda:len([s for s in sessions() if s['agent']=='antigravity' and s['tier']=='push'])==1)
+            assert not any(s['address']==recipient for s in sessions())
+            print('PASS restoration revalidates all saved workspaces even without a new hook')
         finally:
             for process in [mcp,sidecar]:
                 if process is not None:

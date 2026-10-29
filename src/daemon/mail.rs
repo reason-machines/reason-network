@@ -158,6 +158,7 @@ impl Daemon {
         let mut res = SendResult { ids: Vec::new(), recipients: Vec::new() };
         let mut remote_jobs = Vec::new();
         let mut send_key = None;
+        let mut send_nonce = String::new();
         {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
@@ -185,9 +186,11 @@ impl Daemon {
                     blake3::hash(serde_json::to_string(&(to, body, &reply_to, wake, notify, &files))?.as_bytes())
                         .to_hex()
                         .to_string();
-                if let Some(receipt) = g.store.begin_send(&key, &fingerprint, now)? {
+                let (nonce, receipt) = g.store.begin_send(&key, &fingerprint, now)?;
+                if let Some(receipt) = receipt {
                     return Ok(receipt);
                 }
+                send_nonce = nonce;
                 send_key = Some(key);
             }
             // It talks to teammates: its name stays its own.
@@ -240,7 +243,8 @@ impl Daemon {
             for t in targets {
                 // A crash between queuing and saving the receipt retries the same peer id, never a new message.
                 let id = if let Some(key) = &send_key {
-                    let hash = blake3::hash(format!("{key}:{}", t.shown_address()).as_bytes());
+                    let generation = if send_nonce.is_empty() { key.clone() } else { format!("{key}:{send_nonce}") };
+                    let hash = blake3::hash(format!("{generation}:{}", t.shown_address()).as_bytes());
                     Ulid::from(u128::from_be_bytes(hash.as_bytes()[..16].try_into().expect("16 bytes"))).to_string()
                 } else {
                     Ulid::generate().to_string()

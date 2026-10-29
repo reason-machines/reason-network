@@ -14,7 +14,17 @@ impl Daemon {
         let bindings = {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
-            g.store.native_app_sessions(util::now_ms() - super::sessions::FORGET_MS)?
+            let candidates = g.store.native_app_sessions(util::now_ms() - super::sessions::FORGET_MS)?;
+            let mut allowed = Vec::new();
+            for candidate in candidates {
+                if g.store
+                    .native_app_roots(&candidate.0.key)?
+                    .is_some_and(|roots| roots.iter().all(|root| !self.cfg.off_in(root)))
+                {
+                    allowed.push(candidate);
+                }
+            }
+            allowed
         };
         for (known, hook_at) in &bindings {
             if self.inner.lock().unwrap().live.contains_key(&known.key) {

@@ -66,8 +66,12 @@ impl Daemon {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
-        if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push && !g.store.is_native_app(&key)? {
-            bail!("Antigravity App binding is no longer registered by a native hook");
+        if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push {
+            let allowed =
+                g.store.native_app_roots(&key)?.is_some_and(|roots| roots.iter().all(|root| !self.cfg.off_in(root)));
+            if !allowed {
+                bail!("Antigravity App binding is unavailable or includes a disabled workspace");
+            }
         }
         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
         if g.off.contains_key(&key) {
@@ -331,9 +335,13 @@ impl Daemon {
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
+        let mut native_dirs: Vec<String> = cwd.iter().chain(&dirs).cloned().collect();
         // In a folder that is off, by any folder the agent names: never a session here, only noted as off.
         if cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d)) {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None, &[])?;
+            }
             if let Some(l) = g.live.remove(&key) {
                 let _ = g.store.touch_session(&l.name, now);
                 self.presence_changed();
@@ -355,7 +363,7 @@ impl Daemon {
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             if agent == "antigravity" {
-                g.store.remember_native_app(&key, None)?;
+                g.store.remember_native_app(&key, None, &[])?;
             }
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
             if g.live
@@ -429,7 +437,10 @@ impl Daemon {
             && l.transcript.as_ref().is_some_and(|p| crate::antigravity::app_transcript(&p.to_string_lossy()));
         if native_app {
             l.reg.pid = None;
-            g.store.remember_native_app(&key, Some(now))?;
+            if !native_dirs.contains(&l.reg.cwd) {
+                native_dirs.push(l.reg.cwd.clone());
+            }
+            g.store.remember_native_app(&key, Some(now), &native_dirs)?;
         }
         // Mid-turn, only what should interrupt; at a pause, everything.
         let msgs: Vec<Message> = if mail {
