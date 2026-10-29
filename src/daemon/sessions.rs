@@ -66,6 +66,9 @@ impl Daemon {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
+        if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push && !g.store.is_native_app(&key)? {
+            bail!("Antigravity App binding is no longer registered by a native hook");
+        }
         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
         if g.off.contains_key(&key) {
             bail!(OFF_HERE);
@@ -351,6 +354,9 @@ impl Daemon {
         self.inner.lock().unwrap().off.remove(&key);
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None)?;
+            }
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
             if g.live
                 .get(&key)
@@ -419,6 +425,12 @@ impl Daemon {
         }
         let address = self.addr(&l.name);
         let agent_kind = l.reg.agent.clone();
+        let native_app = agent == "antigravity"
+            && l.transcript.as_ref().is_some_and(|p| crate::antigravity::app_transcript(&p.to_string_lossy()));
+        if native_app {
+            l.reg.pid = None;
+            g.store.remember_native_app(&key, Some(now))?;
+        }
         // Mid-turn, only what should interrupt; at a pause, everything.
         let msgs: Vec<Message> = if mail {
             g.pending(&address)?.into_iter().filter(|m| event != "tool" || m.wake).collect()
@@ -504,7 +516,12 @@ impl Daemon {
         for key in mine {
             let l = g.live.get_mut(&key).expect("listed above");
             // Hooks still vouch for it: keep it, reachable through them.
-            if l.last_hook.is_some() && l.reg.pid.is_some_and(util::pid_alive) {
+            if l.last_hook.is_some()
+                && (l.reg.pid.is_some_and(util::pid_alive)
+                    || l.reg.agent == "antigravity"
+                        && l.reg.pid.is_none()
+                        && l.last_hook.is_some_and(|at| now - at < HOOK_TTL_MS))
+            {
                 l.conn = None;
                 if l.reg.agent == "antigravity" {
                     l.reg.tier = Tier::Turn;

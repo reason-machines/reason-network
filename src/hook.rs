@@ -89,13 +89,15 @@ async fn handle(
         && !(agent == "antigravity" && event == "stop" && v["terminationReason"] != "model_stop");
 
     let key = format!("{agent}:{session_id}");
+    let native_app =
+        agent == "antigravity" && str_at("transcriptPath").as_deref().is_some_and(crate::antigravity::app_transcript);
     let req = Request::Hook(HookCall {
         through_reason: Some(false),
         agent: agent.to_string(),
         event: ev.to_string(),
         session_id,
         cwd,
-        pid: agent::hook_agent_pid(),
+        pid: if native_app { None } else { agent::hook_agent_pid() },
         mail,
         transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
         doing,

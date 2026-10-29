@@ -139,7 +139,7 @@ const MESSAGE_COLS: &str =
 const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox";
 
 impl Store {
-    pub fn record_sent(&self, key: &str, message: &Message, state: &str) -> Result<()> {
+    pub fn record_sent(&self, key: &str, message: &Message, recipient: &str, state: &str) -> Result<()> {
         let stage = match state {
             "refused" => "rejected",
             "held" => "held",
@@ -149,7 +149,7 @@ impl Store {
         self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1", [crate::util::now_ms() - 7 * 86_400_000])?;
         self.db.execute(
             "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",
-            params![message.id, key, message.from, message.to, stage, message.sent_at],
+            params![message.id, key, message.from, recipient, stage, message.sent_at],
         )?;
         Ok(())
     }
@@ -199,7 +199,10 @@ impl Store {
             self.db.query_row("SELECT fingerprint,receipt FROM send_keys WHERE key=?1", [key], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
-        anyhow::ensure!(old == fingerprint, "idempotency key already used for a different message");
+        anyhow::ensure!(
+            old == fingerprint,
+            "idempotency key already used for a different message; use a new key for a corrected or different message"
+        );
         receipt.map(|v| serde_json::from_str(&v).map_err(Into::into)).transpose()
     }
 
@@ -259,6 +262,11 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        for (column, definition) in [("native_app", "INTEGER NOT NULL DEFAULT 0"), ("native_hook_at", "INTEGER")] {
+            if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
+                db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
+            }
+        }
         Ok(Store { db, inbox })
     }
 
@@ -279,12 +287,6 @@ impl Store {
     /// Stores a message; false if one with this id is already here (a retried delivery). Unless it is held, its files
     /// are saved in a new folder of their own first, and `m` then lists them by path.
     pub fn insert(&self, m: &mut Message, held: bool) -> Result<bool> {
-        if !held && let Some(reply) = &m.reply_to {
-            self.db.execute(
-                "UPDATE sent_receipts SET stage='replied',updated_at=?4 WHERE id=?1 AND recipient=?2 AND sender=?3",
-                params![reply, m.from, m.to, crate::util::now_ms()],
-            )?;
-        }
         if self.has(&m.id)? {
             return Ok(false);
         }
@@ -319,6 +321,9 @@ impl Store {
                 held
             ],
         );
+        if n.as_ref().is_ok_and(|n| *n == 1) && !held {
+            let _ = self.observe_reply(m);
+        }
         match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
                 m.files = files::located(&dir, &k.files);
@@ -337,6 +342,13 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let sql = format!("SELECT {MESSAGE_COLS}, held FROM messages WHERE id = ?1");
         Ok(self.db.query_row(&sql, [id], |r| self.row(r)).optional()?)
+    }
+
+    fn observe_reply(&self, message: &Message) -> Result<()> {
+        if let Some(reply) = &message.reply_to {
+            self.db.execute("UPDATE sent_receipts SET stage='replied',updated_at=?4 WHERE id=?1 AND recipient=?2 AND sender=?3 AND stage <> 'replied'", params![reply,message.from,message.to,crate::util::now_ms()])?;
+        }
+        Ok(())
     }
 
     pub fn has(&self, id: &str) -> Result<bool> {
@@ -465,6 +477,7 @@ impl Store {
                 return Err(e.into());
             }
             let _ = self.count(crate::util::now_ms(), Counted::Received);
+            let _ = self.observe_reply(&m);
             done.push(m);
         }
         Ok((done, unsaved))
@@ -490,12 +503,14 @@ impl Store {
     /// (once, however many answers come).
     pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
         let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
-        if removed && taken {
+        if removed {
             self.db.execute(
-                "UPDATE sent_receipts SET stage='accepted',updated_at=?2 WHERE id=?1 AND stage='queued'",
-                params![id, crate::util::now_ms()],
+                "UPDATE sent_receipts SET stage=?3,updated_at=?2 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')",
+                params![id, crate::util::now_ms(), if taken {"accepted"} else {"rejected"}],
             )?;
-            let _ = self.count(crate::util::now_ms(), Counted::Sent);
+            if taken {
+                let _ = self.count(crate::util::now_ms(), Counted::Sent);
+            }
         }
         Ok(removed)
     }
@@ -600,7 +615,9 @@ impl Store {
                  ON CONFLICT (name) DO UPDATE SET key = ?2, agent = ?3, cwd = ?4, repo = ?5, branch = ?6,
                  doing = ?7, tier = ?8, last_seen = ?9,
                  attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END,
-                 mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END"
+                 mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
+                 native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
+                 native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END"
             ),
             params![
                 s.name,
@@ -674,6 +691,28 @@ impl Store {
         let mut st = self.db.prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY name"))?;
         let rows = st.query_map([], remembered)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET native_app=?2,native_hook_at=?3 WHERE key=?1 AND agent='antigravity'",
+            params![key, hook_at.is_some(), hook_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_native_app(&self, key: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .prepare("SELECT 1 FROM sessions WHERE key=?1 AND agent='antigravity' AND native_app=1")?
+            .exists([key])?)
+    }
+
+    pub fn native_app_sessions(&self, since: i64) -> Result<Vec<(Remembered, i64)>> {
+        let mut statement=self.db.prepare(&format!("SELECT {SESSION_COLS},native_hook_at FROM sessions WHERE native_app=1 AND agent='antigravity' AND last_seen>=?1 AND native_hook_at IS NOT NULL"))?;
+        Ok(statement
+            .query_map([since], |row| Ok((remembered(row)?, row.get(11)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 }
 
@@ -966,6 +1005,34 @@ mod tests {
             approval: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn receipts_track_remote_refusal_and_only_the_approved_matching_terminal_reply() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let mut outgoing = message("refused", "bob/terminal");
+        outgoing.sent_at = crate::util::now_ms();
+        store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+        store.outbox_add("peer", &outgoing).unwrap();
+        store.outbox_done("refused", false).unwrap();
+        assert_eq!(store.delivery_status("sender", &["refused".into()]).unwrap()[0]["stage"], "rejected");
+        outgoing.id = "accepted".into();
+        store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+        store.outbox_add("peer", &outgoing).unwrap();
+        store.outbox_done("accepted", true).unwrap();
+        let stage = || store.delivery_status("sender", &["accepted".into()]).unwrap()[0]["stage"].clone();
+        let mut reply = message("wrong-machine", &outgoing.from);
+        reply.from = "bob/terminal@desktop".into();
+        reply.reply_to = Some(outgoing.id.clone());
+        store.insert(&mut reply, false).unwrap();
+        assert_eq!(stage(), "accepted");
+        reply.id = "held-reply".into();
+        reply.from = "bob/terminal@laptop".into();
+        store.insert(&mut reply, true).unwrap();
+        assert_eq!(stage(), "accepted");
+        store.settle_held(&[reply.id], true).unwrap();
+        assert_eq!(stage(), "replied");
+        assert_eq!(store.delivery_status("other-session", &["accepted".into()]).unwrap()[0]["stage"], "unknown");
     }
 
     #[test]

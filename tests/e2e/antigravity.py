@@ -31,7 +31,8 @@ def main():
         def wait(predicate,timeout=20):
             end=time.monotonic()+timeout
             while time.monotonic()<end:
-                result=predicate()
+                try: result=predicate()
+                except (OSError,ValueError,KeyError): result=False
                 if result:return result
                 time.sleep(.1)
             raise AssertionError('condition did not become true')
@@ -92,6 +93,27 @@ def main():
             lines=[json.loads(line) for line in log.read_text().splitlines()]
             assert len(lines)==2 and ids[0] in lines[-1][2]
             print('PASS refused handoff remains unread and retries with the original message id')
+            cli('stop')
+            wait(lambda:len([s for s in sessions() if s['agent']=='antigravity' and s['tier']=='push'])==2)
+            call('hook',agent='cli',event='stop',session_id='sender',name='sender',cwd=str(project),pid=os.getpid(),mail=False,through_reason=False)
+            ids=sent(recipient,'Still reachable after a daemon restart','restart-message')
+            wait(lambda:receipt(ids)[0]['stage']=='handed_to_agent')
+            assert not rpc(5,'tools/call',dict(name='list_team',arguments=dict(session_id=first)))['result'].get('isError')
+            print('PASS idle App bindings and MCP identity recover after a daemon restart without another hook')
+            sidecar.terminate();sidecar.wait(timeout=5)
+            sidecar=subprocess.Popen([str(BIN),'antigravity-sidecar'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            wait(lambda:len([s for s in sessions() if s['agent']=='antigravity' and s['tier']=='push'])==2)
+            ids=sent(recipient,'Still reachable after a sidecar restart','sidecar-restart-message')
+            wait(lambda:receipt(ids)[0]['stage']=='handed_to_agent')
+            print('PASS sidecar restart preserves native conversation identity')
+            cloud_command=executables/'reason'
+            cloud_command.write_text('#!/bin/sh\nexit 0\n');cloud_command.chmod(0o700)
+            registered=call('hook',agent='reason',event='stop',session_id='cloud-check',name='cloud-check',cwd=str(project),mail=False,through_reason=True)
+            cloud=registered['result']['address']
+            ids=sent(cloud,'Only a cloud server acknowledgment','cloud-acceptance')
+            wait(lambda:next(s['unread'] for s in sessions() if s['address']==cloud)==0)
+            assert receipt(ids)[0]['stage']=='accepted',receipt(ids)
+            print('PASS Reason cloud server acceptance is not claimed as agent handoff')
             health=call('diagnostics')['result'];serialized=json.dumps(health)
             assert first not in serialized and str(project) not in serialized and 'Retry the failed handoff' not in serialized
             assert any(s['agent']=='antigravity' and s['adapterConnected'] for s in health['sessions'])

@@ -5,6 +5,10 @@ use serde_json::Value;
 use std::{process::Stdio, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
 
+pub fn app_transcript(path: &str) -> bool {
+    path.replace('\\', "/").contains("/.gemini/antigravity/brain/")
+}
+
 pub async fn run() -> Result<()> {
     agent::command_for("agentapi").context("Antigravity must launch this sidecar with agentapi on PATH")?;
     let (tx, mut events) = mpsc::unbounded_channel();

@@ -322,7 +322,7 @@ impl Daemon {
                 let mut attachment_size = dims.clone();
                 attachment_size.bucket = crate::usage::size(files.iter().map(|f| f.content.len()).sum()).into();
                 self.usage.count("attachment_bytes", attachment_size, 1);
-                g.store.record_sent(&exclude, &msg, "queued")?;
+                g.store.record_sent(&exclude, &msg, &shown, "queued")?;
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
                         ("refused".into(), LOOP_NOTE.into())
@@ -667,9 +667,12 @@ impl Daemon {
             match res {
                 Ok(()) => {
                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
-                    let _ = g.store.handoff(&changed, util::now_ms());
-                    for id in &changed {
-                        this.usage.stage(id, "delivered");
+                    // A local native queue is an agent input handoff; the cloud command only acknowledges its server.
+                    if bin != "reason" {
+                        let _ = g.store.handoff(&changed, util::now_ms());
+                        for id in &changed {
+                            this.usage.stage(id, "delivered");
+                        }
                     }
                     if let Some(l) = g.live.get_mut(&key) {
                         l.retry = None;
