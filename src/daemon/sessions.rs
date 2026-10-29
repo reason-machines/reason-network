@@ -352,7 +352,9 @@ impl Daemon {
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
-            if g.live.get(&key).is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent))
+            if g.live
+                .get(&key)
+                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
@@ -495,12 +497,19 @@ impl Daemon {
         let now = util::now_ms();
         let mut g = self.inner.lock().unwrap();
         g.conns.remove(&conn);
+        if g.antigravity_conn == Some(conn) {
+            g.antigravity_conn = None;
+        }
         let mine: Vec<String> = g.live.iter().filter(|(_, l)| l.conn == Some(conn)).map(|(k, _)| k.clone()).collect();
         for key in mine {
             let l = g.live.get_mut(&key).expect("listed above");
             // Hooks still vouch for it: keep it, reachable through them.
             if l.last_hook.is_some() && l.reg.pid.is_some_and(util::pid_alive) {
                 l.conn = None;
+                if l.reg.agent == "antigravity" {
+                    l.reg.tier = Tier::Turn;
+                    l.mcp_push = false;
+                }
                 continue;
             }
             if let Some(l) = g.live.remove(&key) {

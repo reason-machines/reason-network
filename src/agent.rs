@@ -55,6 +55,8 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
         "codex"
     } else if has("cursor") {
         "cursor"
+    } else if has("antigravity") {
+        "antigravity"
     } else if has("gemini") {
         "gemini"
     } else if has("grok") {
@@ -87,7 +89,7 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
 
 /// Agents that run one MCP server process for many sessions, so the session must come from each call.
 pub fn multiplexed(agent: &str) -> bool {
-    matches!(agent, "codex" | "opencode" | "cursor")
+    matches!(agent, "codex" | "opencode" | "cursor" | "antigravity")
 }
 
 /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
@@ -117,7 +119,7 @@ pub fn env_session_id(agent: &str) -> Option<String> {
 /// The session id carried in a tool call's `_meta`. Codex sends `sessionId` (the root thread, the same id its
 /// hooks see) and `threadId` (which differs inside subagents); opencode V2 sends `ai.opencode/sessionID`.
 pub fn meta_session_id(meta: &serde_json::Map<String, Value>) -> Option<String> {
-    ["sessionId", "ai.opencode/sessionID", "threadId"]
+    ["conversationId", "sessionId", "ai.opencode/sessionID", "threadId"]
         .iter()
         .find_map(|k| meta.get(*k).and_then(Value::as_str))
         .filter(|s| !s.is_empty())

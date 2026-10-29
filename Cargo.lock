@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "reason-network"
-version = "0.12.15"
+version = "0.12.16"
 dependencies = [
  "anyhow",
  "blake3",

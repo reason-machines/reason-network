@@ -14,6 +14,8 @@ use std::{
     process::Command,
 };
 
+mod antigravity;
+mod gemini;
 mod hermes;
 mod zcode;
 
@@ -1258,7 +1260,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 13] = [
+const AGENTS: [Agent; 14] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -1330,8 +1332,16 @@ const AGENTS: [Agent; 13] = [
         name: "Gemini CLI",
         hint: "at its next step; trusted folders only",
         installed: || gemini_home().exists() || agent::find_bin("gemini").is_some(),
-        wired: |exe| has(gemini_home().join("settings.json"), &me(exe)),
+        wired: gemini::wired,
         apply: gemini,
+    },
+    Agent {
+        id: "antigravity",
+        name: "Antigravity",
+        hint: "native conversation hooks; App sidecar wakes idle conversations",
+        installed: antigravity::installed,
+        wired: antigravity::wired,
+        apply: antigravity::apply,
     },
     Agent {
         id: "copilot",
@@ -1572,6 +1582,7 @@ pub async fn doctor() -> Result<()> {
             println!("- {}: installed, not on Reason Network (`{CLI} setup`)", f.name);
         }
     }
+    gemini::doctor(&exe, &link).await;
     Ok(())
 }
 

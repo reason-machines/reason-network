@@ -120,6 +120,28 @@ impl Daemon {
         approval: Option<Box<Signed<Approval>>>,
         files: Vec<Attachment>,
     ) -> Result<SendResult> {
+        self.send_idempotent(from, to, body, reply_to, wake, notify, approval, files, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn send_idempotent(
+        self: &Arc<Self>,
+        from: String,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+        wake: bool,
+        notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
+        files: Vec<Attachment>,
+        idempotency_key: Option<String>,
+    ) -> Result<SendResult> {
+        if idempotency_key.as_ref().is_some_and(|key| key.is_empty() || key.len() > 200) {
+            bail!("idempotency key must be 1 to 200 bytes");
+        }
+        if idempotency_key.is_some() && (is_group(to.trim()) || notify && to.trim() == self.person) {
+            bail!("idempotency keys are for one agent session");
+        }
         let (body, to) = (body.trim(), to.trim());
         if body.is_empty() {
             bail!("empty message");
@@ -135,6 +157,7 @@ impl Daemon {
 
         let mut res = SendResult { ids: Vec::new(), recipients: Vec::new() };
         let mut remote_jobs = Vec::new();
+        let mut send_key = None;
         {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
@@ -154,6 +177,19 @@ impl Daemon {
                 None => "unknown",
             };
             let exclude = sender.reg.key.clone();
+            if let Some(key) = &idempotency_key {
+                let key = blake3::hash(serde_json::to_string(&(&self.person, &exclude, key))?.as_bytes())
+                    .to_hex()
+                    .to_string();
+                let fingerprint =
+                    blake3::hash(serde_json::to_string(&(to, body, &reply_to, wake, notify, &files))?.as_bytes())
+                        .to_hex()
+                        .to_string();
+                if let Some(receipt) = g.store.begin_send(&key, &fingerprint, now)? {
+                    return Ok(receipt);
+                }
+                send_key = Some(key);
+            }
             // It talks to teammates: its name stays its own.
             self.reached(&mut g, &exclude);
             // A person at a terminal may message a group; an agent picks the one session it needs.
@@ -202,8 +238,27 @@ impl Daemon {
             }
             let targets = if own { Vec::new() } else { self.resolve(&g, &remotes, to, Some(&exclude))? };
             for t in targets {
+                // A crash between queuing and saving the receipt retries the same peer id, never a new message.
+                let id = if let Some(key) = &send_key {
+                    let hash = blake3::hash(format!("{key}:{}", t.shown_address()).as_bytes());
+                    Ulid::from(u128::from_be_bytes(hash.as_bytes()[..16].try_into().expect("16 bytes"))).to_string()
+                } else {
+                    Ulid::generate().to_string()
+                };
+                if let Some(old) = g.store.message(&id)? {
+                    res.ids.push(id);
+                    res.recipients.push(Recipient {
+                        address: t.shown_address(),
+                        state: "accepted".into(),
+                        note: format!(
+                            "already accepted for {}; the original message is retained without resending",
+                            old.to
+                        ),
+                    });
+                    continue;
+                }
                 let mut msg = Message {
-                    id: Ulid::generate().to_string(),
+                    id,
                     from: from_addr.clone(),
                     from_agent: from_agent.clone(),
                     from_repo: from_repo.clone(),
@@ -267,6 +322,7 @@ impl Daemon {
                 let mut attachment_size = dims.clone();
                 attachment_size.bucket = crate::usage::size(files.iter().map(|f| f.content.len()).sum()).into();
                 self.usage.count("attachment_bytes", attachment_size, 1);
+                g.store.record_sent(&exclude, &msg, "queued")?;
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
                         ("refused".into(), LOOP_NOTE.into())
@@ -310,6 +366,11 @@ impl Daemon {
                     note = format!("{note}; {}", self.notify(&msg).1);
                 }
                 res.recipients.push(Recipient { address: shown, state, note });
+                let _ = g.store.send_outcome(&msg.id, &res.recipients.last().expect("just added").state);
+            }
+            // The durable outbox now owns remote retries. A lost API response returns this same receipt.
+            if let Some(key) = &send_key {
+                g.store.finish_send(key, &res)?;
             }
         }
         self.arrived.notify_waiters();
@@ -337,6 +398,9 @@ impl Daemon {
                     None => r.note = format!("queued: no answer from {name} yet; it will be retried"),
                 }
             }
+        }
+        if let Some(key) = &send_key {
+            self.inner.lock().unwrap().store.finish_send(key, &res)?;
         }
         Ok(res)
     }
@@ -391,7 +455,7 @@ impl Daemon {
             // These adapters take Deliver events on this connection. Codex and Reason still
             // use their native channels below, even when their MCP client registers as push.
             (Tier::Push, Some(conn), _)
-                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes") =>
+                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes" | "antigravity") =>
             {
                 Channel::ClaudeSocket(conn)
             }
@@ -433,10 +497,7 @@ impl Daemon {
                 for id in ids {
                     g.in_flight.insert(id, Instant::now());
                 }
-                (
-                    "pushed".into(),
-                    "delivered into the session: it reads it between tool calls, or wakes up if idle".into(),
-                )
+                ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
             }
             Channel::Command(bin, args) => {
                 for id in &ids {
@@ -515,12 +576,20 @@ impl Daemon {
             self.usage.stage(id, "push_failed");
         }
         let mut g = self.inner.lock().unwrap();
+        let _ = g.store.queue_again(ids);
         for id in ids {
             g.in_flight.remove(id);
         }
         if let Some(l) = g.live.get_mut(key) {
             l.mcp_push = false;
             l.reg.tier = l.reg.tier.max(Tier::Pull);
+            if l.reg.agent == "antigravity" {
+                let wait = l.retry.map_or(Duration::from_secs(10), |(_, wait)| (wait * 2).min(Duration::from_secs(60)));
+                l.retry = Some((Instant::now() + wait, wait));
+                if l.last_hook.is_some() {
+                    l.reg.tier = Tier::Turn;
+                }
+            }
         }
         log(&format!("pushing to {}: its MCP server knows no inbox; left unread", self.logged(&g, key)));
         drop(g);
@@ -539,6 +608,7 @@ impl Daemon {
             match res {
                 Ok(Ok(())) => {
                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                    let _ = g.store.handoff(&changed, util::now_ms());
                     for id in &changed {
                         this.usage.stage(id, "delivered");
                     }
@@ -597,6 +667,7 @@ impl Daemon {
             match res {
                 Ok(()) => {
                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                    let _ = g.store.handoff(&changed, util::now_ms());
                     for id in &changed {
                         this.usage.stage(id, "delivered");
                     }
@@ -773,6 +844,7 @@ impl Daemon {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     let changed = g.store.mark_read(&ids, util::now_ms())?;
                     if g.live.get(&key).is_some_and(|l| l.through_reason == Some(false)) {
+                        g.store.handoff(&changed, util::now_ms())?;
                         for id in &changed {
                             self.usage.stage(id, "delivered");
                         }

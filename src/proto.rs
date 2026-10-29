@@ -112,6 +112,9 @@ pub enum Request {
     },
     /// From an agent session: its key (or, for agents that reply through the CLI, its address or name).
     Send {
+        /// Reuse for the same logical send, including after a lost response. Scoped to the sending session.
+        #[serde(default)]
+        idempotency_key: Option<String>,
         /// Local analytics only; never included in the peer message.
         #[serde(default, deserialize_with = "crate::usage::purpose")]
         purpose: Option<String>,
@@ -208,6 +211,19 @@ pub enum Request {
     Team,
     /// Local aggregate counters, read only by clients that opt into usage reporting.
     Usage,
+    /// App-managed Antigravity sidecar subscribes to native delivery events on this connection.
+    AntigravityAttach,
+    /// Resolve an explicit native conversation only after its hook registered it.
+    AntigravitySession {
+        conversation_id: String,
+    },
+    /// Local delivery health, without message contents.
+    Diagnostics,
+    /// Delivery progress for this session's own outgoing messages; never returns their bodies.
+    DeliveryStatus {
+        from: String,
+        ids: Vec<String>,
+    },
     /// The team link, which anyone can use to join; `new` replaces it.
     Link {
         #[serde(default)]

@@ -57,10 +57,12 @@ async fn handle(
     let session_id = session
         .or_else(|| str_at("session_id"))
         .or_else(|| str_at("conversation_id"))
+        .or_else(|| str_at("conversationId"))
         .or_else(|| str_at("sessionId"))?;
     // Every folder the agent names for the session, the one it works in first.
     let mut dirs: Vec<String> = str_at("cwd").into_iter().collect();
     dirs.extend(v["workspace_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+    dirs.extend(v["workspacePaths"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
     dirs.extend(
         ["CURSOR_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"]
             .iter()
@@ -82,7 +84,9 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    let mail = !off && takes_mail(agent, event);
+    let mail = !off
+        && takes_mail(agent, event)
+        && !(agent == "antigravity" && event == "stop" && v["terminationReason"] != "model_stop");
 
     let key = format!("{agent}:{session_id}");
     let req = Request::Hook(HookCall {
@@ -93,7 +97,7 @@ async fn handle(
         cwd,
         pid: agent::hook_agent_pid(),
         mail,
-        transcript: str_at("transcript_path"),
+        transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
@@ -107,12 +111,20 @@ async fn handle(
     let text = match (reply.text, ev, reply.address) {
         (Some(t), ..) => t,
         // Say who it is on Reason Network once, at session start.
-        (None, "start", Some(addr)) => {
+        (None, "start" | "prompt", Some(addr)) if ev == "start" || agent == "antigravity" => {
             format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
             )
         }
         _ => return None,
+    };
+    let text = if agent == "antigravity" {
+        format!(
+            "{text}\nFor Reason Network tools, pass session_id: {}. This identifies this conversation even when other chats use the same project.",
+            key.strip_prefix("antigravity:").unwrap_or(&key)
+        )
+    } else {
+        text
     };
     Some((format_for(agent, event, ev, &text), key, ids))
 }
@@ -120,6 +132,10 @@ async fn handle(
 /// Prompt-submit hooks in Cursor, Copilot and grok can't add context, grok drops what SessionStart prints, and
 /// opencode's status call shows nothing.
 fn takes_mail(agent: &str, event: &str) -> bool {
+    // Antigravity consumes injectSteps before invocation, and a continue reason at a natural Stop.
+    if agent == "antigravity" {
+        return matches!(event, "session-start" | "user-prompt-submit" | "stop");
+    }
     !matches!(
         (agent, event),
         ("cursor" | "copilot" | "grok", "user-prompt-submit") | ("grok", "session-start") | (_, "status" | "doing")
@@ -137,6 +153,8 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let specific = |name: &str| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
     let block = || json!({ "decision": "block", "reason": text });
     let out = match (agent, ev) {
+        ("antigravity", "start" | "prompt") => json!({"injectSteps": [{"userMessage": text}]}),
+        ("antigravity", "stop") => json!({"decision":"continue","reason":text}),
         ("opencode", _) if event == "poll" => return text.to_string(),
         ("codex" | "cmd", "start") => specific("SessionStart"),
         ("cmd", "tool") => specific("PostToolUse"),
@@ -147,7 +165,8 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
         ("gemini", "start") => specific("SessionStart"),
         ("gemini", "prompt") => specific("BeforeAgent"),
         ("gemini", "tool") => specific("AfterTool"),
-        ("codex" | "gemini" | "copilot" | "grok", "stop") => block(),
+        ("gemini", "stop") => json!({"decision": "deny", "reason": text}),
+        ("codex" | "copilot" | "grok", "stop") => block(),
         ("cursor", "stop") => json!({ "followup_message": text }),
         ("cursor", _) => json!({ "additional_context": text }),
         ("copilot", _) => json!({ "additionalContext": text }),

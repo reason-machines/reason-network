@@ -101,6 +101,18 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS send_keys (
+    key TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    receipt TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sent_receipts (
+    id TEXT PRIMARY KEY, sender_key TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+    stage TEXT NOT NULL, sent_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS send_keys_created_at ON send_keys(created_at);
+CREATE INDEX IF NOT EXISTS sent_receipts_sent_at ON sent_receipts(sent_at);
 CREATE TABLE IF NOT EXISTS sessions (
     name TEXT PRIMARY KEY,
     key TEXT NOT NULL,
@@ -127,6 +139,82 @@ const MESSAGE_COLS: &str =
 const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox";
 
 impl Store {
+    pub fn record_sent(&self, key: &str, message: &Message, state: &str) -> Result<()> {
+        let stage = match state {
+            "refused" => "rejected",
+            "held" => "held",
+            "queued" => "queued",
+            _ => "accepted",
+        };
+        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1", [crate::util::now_ms() - 7 * 86_400_000])?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",
+            params![message.id, key, message.from, message.to, stage, message.sent_at],
+        )?;
+        Ok(())
+    }
+    pub fn handoff(&self, ids: &[String], now: i64) -> Result<()> {
+        for id in ids {
+            self.db.execute(
+                "UPDATE sent_receipts SET stage='handed_to_agent',updated_at=?2 WHERE id=?1 AND stage <> 'replied'",
+                params![id, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn send_outcome(&self, id: &str, state: &str) -> Result<()> {
+        let stage = match state {
+            "refused" => "rejected",
+            "held" => "held",
+            "queued" => "queued",
+            _ => "accepted",
+        };
+        self.db.execute("UPDATE sent_receipts SET stage=?2,updated_at=?3 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')", params![id,stage,crate::util::now_ms()])?;
+        Ok(())
+    }
+
+    pub fn queue_again(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.db.execute("UPDATE sent_receipts SET stage='queued',updated_at=?2 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')", params![id,crate::util::now_ms()])?;
+        }
+        Ok(())
+    }
+    pub fn delivery_status(&self, key: &str, ids: &[String]) -> Result<Vec<serde_json::Value>> {
+        anyhow::ensure!(ids.len() <= 100, "request at most 100 delivery receipts");
+        let mut out = Vec::new();
+        for id in ids {
+            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2", params![id,key], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
+            out.push(found.unwrap_or_else(|| serde_json::json!({"id":id,"stage":"unknown"})));
+        }
+        Ok(out)
+    }
+    pub fn begin_send(&self, key: &str, fingerprint: &str, now: i64) -> Result<Option<crate::proto::SendResult>> {
+        self.db.execute("DELETE FROM send_keys WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO send_keys(key,fingerprint,created_at) VALUES(?1,?2,?3)",
+            params![key, fingerprint, now],
+        )?;
+        let (old, receipt): (String, Option<String>) =
+            self.db.query_row("SELECT fingerprint,receipt FROM send_keys WHERE key=?1", [key], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        anyhow::ensure!(old == fingerprint, "idempotency key already used for a different message");
+        receipt.map(|v| serde_json::from_str(&v).map_err(Into::into)).transpose()
+    }
+
+    pub fn finish_send(&self, key: &str, receipt: &crate::proto::SendResult) -> Result<()> {
+        self.db
+            .execute("UPDATE send_keys SET receipt=?2 WHERE key=?1", params![key, serde_json::to_string(receipt)?])?;
+        Ok(())
+    }
+    pub fn queue_health(&self, address: &str) -> Result<(u32, Option<i64>)> {
+        Ok(self.db.query_row(
+            "SELECT count(*), min(sent_at) FROM messages WHERE recipient=?1 AND read_at IS NULL AND held=0",
+            [address],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
     pub fn open(path: &Path, inbox: PathBuf) -> Result<Self> {
         let db = Connection::open(path)?;
@@ -191,6 +279,12 @@ impl Store {
     /// Stores a message; false if one with this id is already here (a retried delivery). Unless it is held, its files
     /// are saved in a new folder of their own first, and `m` then lists them by path.
     pub fn insert(&self, m: &mut Message, held: bool) -> Result<bool> {
+        if !held && let Some(reply) = &m.reply_to {
+            self.db.execute(
+                "UPDATE sent_receipts SET stage='replied',updated_at=?4 WHERE id=?1 AND recipient=?2 AND sender=?3",
+                params![reply, m.from, m.to, crate::util::now_ms()],
+            )?;
+        }
         if self.has(&m.id)? {
             return Ok(false);
         }
@@ -397,6 +491,10 @@ impl Store {
     pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
         let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
         if removed && taken {
+            self.db.execute(
+                "UPDATE sent_receipts SET stage='accepted',updated_at=?2 WHERE id=?1 AND stage='queued'",
+                params![id, crate::util::now_ms()],
+            )?;
             let _ = self.count(crate::util::now_ms(), Counted::Sent);
         }
         Ok(removed)

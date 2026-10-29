@@ -1,4 +1,5 @@
 mod agent;
+mod antigravity;
 mod bridge;
 mod claude;
 mod client;
@@ -311,6 +312,9 @@ enum Cmd {
     Mcp,
     /// Local JSON-lines transport for native agent adapters
     Bridge,
+    /// Run the App-managed Antigravity delivery sidecar
+    #[command(hide = true)]
+    AntigravitySidecar,
     /// The menu bar icon (macOS; the background service starts it)
     #[command(hide = true)]
     Tray,
@@ -328,6 +332,7 @@ async fn main() -> Result<()> {
             r
         }
         Some(Cmd::Mcp) => mcp::run().await,
+        Some(Cmd::AntigravitySidecar) => antigravity::run().await,
         Some(Cmd::Bridge) => bridge::run().await,
         // Blocks this (the main) thread with AppKit's event loop; its daemon calls run on the runtime's workers.
         Some(Cmd::Tray) => tray::run(),
@@ -460,6 +465,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             // Messages come from agent sessions: `--from`'s, this agent's, or from a plain terminal, `<you>/terminal`.
             // An agent shell Reason Network doesn't know (its tools aren't loaded) counts as a terminal.
             let send = |from: String| Request::Send {
+                idempotency_key: None,
                 purpose: purpose.clone(),
                 from,
                 to: to.clone(),
@@ -706,7 +712,13 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 println!("The daemon is not running.");
             }
         }
-        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Bridge | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
+        Cmd::Daemon { .. }
+        | Cmd::Mcp
+        | Cmd::Bridge
+        | Cmd::AntigravitySidecar
+        | Cmd::Hook { .. }
+        | Cmd::Tray
+        | Cmd::Endpoint => {
             unreachable!("handled in main")
         }
     }

@@ -2,7 +2,9 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod antigravity;
 mod ask;
+mod diagnostics;
 mod directory;
 mod mail;
 mod notify;
@@ -149,6 +151,7 @@ struct Inner {
     store: Store,
     live: HashMap<String, Live>,
     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
+    antigravity_conn: Option<u64>,
     next_conn: u64,
     team: Option<TeamState>,
     /// Messages handed to a push channel or a hook and not yet confirmed; hidden from inbox and hooks meanwhile.
@@ -245,6 +248,7 @@ impl Daemon {
                 store,
                 live: HashMap::new(),
                 conns: HashMap::new(),
+                antigravity_conn: None,
                 next_conn: 0,
                 team,
                 in_flight: HashMap::new(),
@@ -357,13 +361,16 @@ impl Daemon {
             }
             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
-            Request::Send { from, to, body, reply_to, wake, notify, files, purpose } => {
+            Request::Send { from, to, body, reply_to, wake, notify, files, purpose, idempotency_key } => {
                 let dims = crate::usage::Dimensions {
                     bucket: purpose.unwrap_or_else(|| "unknown".into()),
                     ..Default::default()
                 };
                 self.usage.count("purpose", dims, 1);
-                json!(self.send(from, &to, &body, reply_to, wake, notify, None, files).await?)
+                json!(
+                    self.send_idempotent(from, &to, &body, reply_to, wake, notify, None, files, idempotency_key)
+                        .await?
+                )
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
@@ -385,6 +392,12 @@ impl Daemon {
                 for id in &ids {
                     g.in_flight.remove(id);
                 }
+                if handed_to_agent {
+                    g.store.handoff(&changed, util::now_ms())?;
+                }
+                if let Some(l) = g.live.get_mut(&key) {
+                    l.retry = None;
+                }
                 Value::Null
             }
             Request::PushFailed { key, ids } => {
@@ -401,7 +414,24 @@ impl Daemon {
             Request::Proof { jws } => json!(self.attach_proof(&jws)?),
             Request::Invite { me, hours } => json!(self.invite(me, hours).await?),
             Request::Team => json!(self.team_info()?),
-            Request::Usage => json!(self.usage.snapshot()),
+            Request::Usage => {
+                let mut report = json!(self.usage.snapshot());
+                if report.is_object() {
+                    report["health"] = self.diagnostics()?;
+                }
+                report
+            }
+            Request::Diagnostics => self.diagnostics()?,
+            Request::DeliveryStatus { from, ids } => {
+                json!(self.inner.lock().unwrap().store.delivery_status(&from, &ids)?)
+            }
+            Request::AntigravityAttach => json!(self.attach_antigravity(conn)?),
+            Request::AntigravitySession { conversation_id } => {
+                let mut g = self.inner.lock().unwrap();
+                self.prune(&mut g);
+                let key = format!("antigravity:{conversation_id}");
+                json!(g.live.get(&key).filter(|l| l.last_hook.is_some()).map(|_| key))
+            }
             Request::Link { new } => json!(self.link(new).await?),
             Request::Remove { who } => json!(self.remove(&who)?),
             Request::Leave { force } => json!(self.leave(force).await?),

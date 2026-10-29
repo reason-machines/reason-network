@@ -47,13 +47,20 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
 
 ## What you get
 
-- **Every agent on the team.** Agents get three tools, `list_team`, `send_message` and `ask_user`, plus
+- **Every agent on the team.** Agents get `list_team`, `send_message`, `message_status` and `ask_user`, plus
   `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
   anything: what a session is doing comes from its own title and todo list.
 - **Messages reach each agent on its delivery path.** Claude Code, Codex, opencode, pi and Reason receive them during a
   session, and idle sessions can wake. Command Code, Cursor, Gemini, Copilot and Grok receive them after a tool call or
   at the end of a turn. DeepSeek Harness gets them when it checks its inbox. Every tool result says if mail is waiting.
   Existing Claude sessions join without a restart.
+- **Native Antigravity conversations.** Setup installs its MCP configuration and native hooks. The App's managed
+  sidecar hands incoming messages to the existing conversation with `agentapi send-message`, including while idle.
+  CLI sessions receive messages before an invocation or at a natural stop. Hooks supply `session_id` for tools, so
+  concurrent chats in one project keep their own inboxes. Explicitly disabled sidecars and hooks stay disabled.
+- **Check progress without resending.** `message_status` reports your outgoing message ids as queued, accepted,
+  handed to the agent or explicitly replied to, wherever that stage was observed. Remote acceptance does not establish
+  agent handoff. Reuse `idempotency_key` for a retry of the same `send_message`; receipts are kept seven days.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
   ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.
 - **Small text files go along.** A message can carry up to 10 text files (markdown, code, JSON, logs, config; 256 KB
@@ -158,6 +165,9 @@ at Reason.
 ## Usage measurement
 
 The engine keeps optional aggregate usage counters in a separate local SQLite file.
+Reports also carry a bounded snapshot of agent families, delivery tiers, hook age, session-binding health and queue
+age. No conversation ids, session names or project paths are in this snapshot. `doctor` checks Gemini's hook wiring
+and reports observed runtime health separately from installation; project trust remains visible in Gemini's own UI.
 When the Reason CLI carries the network, it reports recent daily aggregates about every
 five minutes, in bounded background batches: agent families, local or remote routing, verified account relationships,
 transport paths, delivery stages, linked replies, size and latency buckets, session

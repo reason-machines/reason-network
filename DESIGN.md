@@ -344,14 +344,20 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Reason | push | Its agent runs in Reason's cloud: the daemon lists live sessions (`reason session list --json`, when `reason = true`) and sends with `reason session send`. Replies go through the CLI: `reason-network send <to> --from <its address>`. |
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
-| Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
+| Gemini CLI | turn | `BeforeAgent` / `AfterTool` `additionalContext`; `AfterAgent` deny continues with mail. Idle waits for the next prompt. |
+| Antigravity | App: push; CLI: turn | Native `conversationId` hooks inject `userMessage` steps before an invocation, or continue a natural Stop with pending mail. The App-managed sidecar subscribes to daemon delivery events and invokes `agentapi send-message` for that existing conversation; acknowledgment follows command acceptance. `session_id` identifies concurrent chats independently of their shared project. |
 | Command Code | turn | `SessionStart` context; `PostToolUse` `additionalContext`; `Stop` `decision:block`. The MCP server follows the session registered by its hooks. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 
-MCP notifications are not a delivery path: no client passes them to the model (checked Oct 2026).
+MCP notifications are not a delivery path: native adapters hand messages to the agent's supported input mechanism.
+
+`message_status` reads content-free outgoing receipts for seven days. Destination acceptance, queued delivery,
+confirmed local agent handoff and explicit reply are separate observations; a remote handoff stays unobserved until
+there is evidence. Local `send_message` accepts a session-scoped idempotency key: a retry returns the original receipt,
+and conflicting content is refused. The hosted relay uses its durable request id for that key.
 
 Gotcha: Cursor, Copilot CLI and Devin load **Claude Code's** hooks from `~/.claude/settings.json`, so
 `reason-network hook` must detect which agent is actually calling it.
