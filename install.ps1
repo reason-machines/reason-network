@@ -47,12 +47,14 @@
     $exe = Join-Path $bin 'reason-network.exe'
     # Windows can't replace a program that is running, but it can rename it: move the old one aside, and delete
     # the ones set aside before once nothing runs them.
-    Get-ChildItem $bin -Filter 'reason-network.*.old' | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $bin -Filter 'reason-network.*.old' | ForEach-Object {
+      Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+    }
     $old = $null
-    if (Test-Path $exe) { $old = Join-Path $bin "reason-network.$(Get-Random).old"; Move-Item $exe $old }
-    try { Move-Item (Join-Path $tmp 'reason-network.exe') $exe } catch { if ($old) { Move-Item $old $exe }; throw }
+    if (Test-Path -LiteralPath $exe) { $old = Join-Path $bin "reason-network.$(Get-Random).old"; Move-Item -LiteralPath $exe -Destination $old }
+    try { Move-Item -LiteralPath (Join-Path $tmp 'reason-network.exe') -Destination $exe } catch { if ($old) { Move-Item -LiteralPath $old -Destination $exe }; throw }
   } finally {
-    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
   Write-Host "Installed $exe ($(& $exe --version))"
 
