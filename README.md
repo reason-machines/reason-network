@@ -59,7 +59,8 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   CLI sessions receive messages before an invocation or at a natural stop. Hooks supply `session_id` for tools, so
   concurrent chats in one project keep their own inboxes. Explicitly disabled sidecars and hooks stay disabled.
 - **Check progress without resending.** `message_status` reports your outgoing message ids as queued, accepted,
-  handed to the agent or explicitly replied to, wherever that stage was observed. Remote acceptance does not establish
+  handed to the agent or explicitly replied to, wherever that stage was observed; refusals and discarded queues are terminal.
+  Remote acceptance does not establish
   agent handoff. Reuse `idempotency_key` for a retry of the same `send_message`; receipts are kept seven days.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
   ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.

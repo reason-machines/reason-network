@@ -182,7 +182,7 @@ pub async fn run() -> Result<()> {
 #[tool_router]
 impl ReasonNetworkMcp {
     #[tool(
-        description = "Check your outgoing messages without resending: queued, accepted by the destination, handed_to_agent, or replied. Remote agent handoff may be unobserved; accepted does not mean read. Receipts are kept for seven days.",
+        description = "Check your outgoing messages without resending: queued, accepted, handed_to_agent, replied, rejected or expired. Remote agent handoff may be unobserved; accepted does not mean read. Receipts become unknown after seven days.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn message_status(
