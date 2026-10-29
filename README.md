@@ -136,6 +136,16 @@ python3 tests/e2e/hooks.py && python3 tests/e2e/codex_busy.py && python3 tests/e
 A `v*` tag builds the macOS, Linux and Windows archives and the install scripts; the Reason CLI pins the macOS and
 Linux ones.
 
+### Windows desktop directory
+
+Build with `cargo build --features desktop`, then run `target\debug\reason-network.exe desktop`.
+The opt-in window uses Windows native controls to show the local daemon's team, machines and live sessions.
+Search, filter, refresh and copy session addresses or your team link. It does not consume
+messages or register an agent. When the daemon is offline, run `reason-network who` to start it, then refresh.
+This Windows desktop build also opens the window when launched without arguments, and creates no console window.
+It reuses the existing `windows-sys` dependency, adding no crates or runtime installation requirements.
+Run `cargo test --features desktop --locked` to check the Windows build and directory filtering/address validation.
+
 ## Contributing
 
 Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).

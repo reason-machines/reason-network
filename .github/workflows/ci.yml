@@ -25,3 +25,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - if: runner.os == 'Windows'
+        run: cargo clippy --all-targets --features desktop --locked -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test --features desktop --locked

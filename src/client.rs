@@ -80,6 +80,15 @@ impl Link {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// A bounded local query for interactive views; timed-out requests leave no pending reply behind.
+    #[cfg(all(windows, feature = "desktop"))]
+    pub async fn call_within<T: DeserializeOwned>(self: &Arc<Self>, req: Request, limit: Duration) -> Result<T> {
+        let conn =
+            tokio::time::timeout(limit, self.connect()).await.map_err(|_| anyhow!("daemon connection timed out"))??;
+        let value = self.raw_within(&conn, &req, limit).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub async fn register(self: &Arc<Self>, reg: SessionReg) -> Result<Registered> {
         let r = self.call(Request::Register { session: reg.clone() }).await?;
         remember(&mut self.regs.lock().unwrap(), reg);

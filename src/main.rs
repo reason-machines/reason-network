@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, feature = "desktop"), windows_subsystem = "windows")]
+
 mod agent;
 mod bridge;
 mod claude;
@@ -6,6 +8,7 @@ mod codex;
 mod config;
 mod daemon;
 mod debuglog;
+mod desktop;
 mod doing;
 mod files;
 mod git;
@@ -311,6 +314,8 @@ enum Cmd {
     Mcp,
     /// Local JSON-lines transport for native agent adapters
     Bridge,
+    /// Open the Windows desktop directory (build with --features desktop)
+    Desktop,
     /// The menu bar icon (macOS; the background service starts it)
     #[command(hide = true)]
     Tray,
@@ -320,6 +325,8 @@ enum Cmd {
 async fn main() -> Result<()> {
     migrate::as_ours();
     let cmd = Cli::parse().cmd;
+    #[cfg(all(windows, feature = "desktop"))]
+    let cmd = cmd.or(Some(Cmd::Desktop));
     paths::migrate();
     match cmd {
         Some(Cmd::Daemon { service }) => {
@@ -329,6 +336,7 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Mcp) => mcp::run().await,
         Some(Cmd::Bridge) => bridge::run().await,
+        Some(Cmd::Desktop) => desktop::run(),
         // Blocks this (the main) thread with AppKit's event loop; its daemon calls run on the runtime's workers.
         Some(Cmd::Tray) => tray::run(),
         Some(Cmd::Endpoint) => {
@@ -706,7 +714,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 println!("The daemon is not running.");
             }
         }
-        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Bridge | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
+        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Bridge | Cmd::Desktop | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
             unreachable!("handled in main")
         }
     }
