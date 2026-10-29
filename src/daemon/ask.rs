@@ -569,6 +569,7 @@ mod tests {
             pid: None,
             tier: crate::proto::Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         let address = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
         d.answer_later("codex:1", "ship it?", &Answer::Approved(String::new()));

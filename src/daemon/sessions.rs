@@ -115,6 +115,7 @@ impl Daemon {
                 l.git = git;
             }
             l.reg.pid = reg.pid.or(l.reg.pid);
+            l.reg.claude_dir = reg.claude_dir.or(l.reg.claude_dir.take());
         } else {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
@@ -393,6 +394,7 @@ impl Daemon {
                 pid,
                 tier: Tier::Pull,
                 name,
+                claude_dir: None,
             };
             self.register_quiet(None, reg, git)?;
         }
@@ -710,6 +712,7 @@ mod tests {
             pid: None,
             tier: Tier::Push,
             name: None,
+            claude_dir: None,
         }
     }
 
@@ -722,6 +725,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: name.map(str::to_string),
+            claude_dir: None,
         }
     }
 
@@ -1644,6 +1648,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         let err = d.register_quiet(None, reg("codex:1", "/work/private/notes"), GitInfo::default()).unwrap_err();
         assert_eq!(err.to_string(), OFF_HERE);
@@ -1665,6 +1670,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         // Claude Code's `/clear`: its MCP server now registers the new conversation.
         assert_eq!(
@@ -1735,6 +1741,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
         // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.
