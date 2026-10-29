@@ -169,7 +169,7 @@ struct Inner {
 
 /// A session running on this machine.
 struct Live {
-    through_reason: bool,
+    through_reason: Option<bool>,
     reg: SessionReg,
     name: String,
     /// The client connection (`reason network mcp`) that owns it; `None` for sessions known only through hooks.
@@ -376,7 +376,7 @@ impl Daemon {
                 let mut g = self.inner.lock().unwrap();
                 let changed = g.store.mark_read(&ids, util::now_ms())?;
                 // Hosted relays acknowledge a handover to a server inbox, not agent consumption.
-                let handed_to_agent = g.live.get(&key).is_some_and(|l| !l.through_reason);
+                let handed_to_agent = g.live.get(&key).is_some_and(|l| l.through_reason == Some(false));
                 for id in &changed {
                     if handed_to_agent {
                         self.usage.stage(id, "delivered");
@@ -401,6 +401,7 @@ impl Daemon {
             Request::Proof { jws } => json!(self.attach_proof(&jws)?),
             Request::Invite { me, hours } => json!(self.invite(me, hours).await?),
             Request::Team => json!(self.team_info()?),
+            Request::Usage => json!(self.usage.snapshot()),
             Request::Link { new } => json!(self.link(new).await?),
             Request::Remove { who } => json!(self.remove(&who)?),
             Request::Leave { force } => json!(self.leave(force).await?),

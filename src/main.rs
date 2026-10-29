@@ -378,7 +378,7 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         cwd = terminal_cwd(cwd, here_off(), agent_shell())?;
     }
     let req = Request::Hook(HookCall {
-        through_reason: false,
+        through_reason: Some(false),
         agent: "cli".into(),
         event: event.into(),
         session_id: id.into(),
@@ -932,7 +932,6 @@ mod tests {
             has_proof: true,
         };
         let mut t = TeamInfo {
-            usage: None,
             id: String::new(),
             name: "vibes".into(),
             team_name: "vibes".into(),

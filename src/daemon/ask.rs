@@ -220,7 +220,7 @@ impl Daemon {
     /// This person's own session (`<person>/terminal`), registered the way the CLI registers it.
     async fn terminal(self: &Arc<Self>) -> String {
         let call = HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: "terminal".into(),

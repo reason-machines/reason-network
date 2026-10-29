@@ -437,7 +437,6 @@ mod tests {
     #[test]
     fn a_team_shows_its_relay_or_the_default() {
         let mut t = TeamInfo {
-            usage: None,
             id: "00112233445566778899aabbccddeeff".into(),
             name: "vibes".into(),
             team_name: "vibes".into(),

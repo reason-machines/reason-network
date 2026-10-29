@@ -58,7 +58,7 @@ pub struct SessionReg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookCall {
     #[serde(default)]
-    pub through_reason: bool,
+    pub through_reason: Option<bool>,
     pub agent: String,
     /// `start`, `prompt`, `tool`, `stop`, `end`, or `doing` (only reports what the session is doing).
     pub event: String,
@@ -206,6 +206,8 @@ pub enum Request {
         hours: u64,
     },
     Team,
+    /// Local aggregate counters, read only by clients that opt into usage reporting.
+    Usage,
     /// The team link, which anyone can use to join; `new` replaces it.
     Link {
         #[serde(default)]
@@ -392,8 +394,6 @@ pub struct MachineInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<crate::usage::Report>,
     /// The team's id, 32 hex digits (the Reason CLI and connector route by it).
     #[serde(default, rename = "team_id")]
     pub id: String,
@@ -523,7 +523,6 @@ mod tests {
     #[test]
     fn the_team_reply_names_the_team_by_id_and_name() {
         let t = TeamInfo {
-            usage: None,
             id: "00112233445566778899aabbccddeeff".into(),
             name: "vibes".into(),
             team_name: "vibes".into(),

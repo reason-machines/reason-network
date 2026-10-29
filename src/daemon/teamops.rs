@@ -259,7 +259,6 @@ impl Daemon {
         self.become_person(&person)?;
         self.restart_soon();
         Ok(TeamInfo {
-            usage: None,
             id: self.team_id().unwrap_or_default(),
             name: name.into(),
             team_name: name.into(),
@@ -268,7 +267,7 @@ impl Daemon {
             person,
             machine: self.machine.clone(),
             machines: Vec::new(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: Vec::new(),
             udp: None,
         })
@@ -378,7 +377,6 @@ impl Daemon {
             state.attest(&me, p);
         }
         let info = TeamInfo {
-            usage: None,
             id: state.id.clone(),
             name: state.whole_name(),
             team_name: state.whole_name(),
@@ -387,7 +385,7 @@ impl Daemon {
             person: person.clone(),
             machine: self.machine.clone(),
             machines: Vec::new(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: Vec::new(),
             udp: None,
         };
@@ -533,7 +531,6 @@ impl Daemon {
         };
         self.usage.count("reachable_peers", peers, 1);
         Ok(TeamInfo {
-            usage: self.usage.snapshot(),
             id: team.id.clone(),
             name: team.whole_name(),
             team_name: team.whole_name(),
@@ -542,7 +539,7 @@ impl Daemon {
             person: self.person.clone(),
             machine: self.machine.clone(),
             machines: self.machines(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: self.inner.lock().unwrap().store.counts(util::now_ms()).unwrap_or_default(),
             udp: self.net().map(|n| n.udp()),
         })

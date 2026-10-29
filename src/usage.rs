@@ -60,9 +60,19 @@ pub struct Report {
     pub days: Vec<Day>,
 }
 // IDs exist only in this bounded in-memory correlation map, never in SQLite/reports.
+struct Pending {
+    dims: Dimensions,
+    at: Instant,
+    accepted: bool,
+    delivered: bool,
+    is_reply: bool,
+    depth: usize,
+    reply_ms: Option<u64>,
+}
+
 enum Event {
     Count(&'static str, Dimensions, u64),
-    Start(String, Dimensions, Option<String>, Instant),
+    Start(String, Dimensions, Option<String>, Instant, bool),
     Stage(String, &'static str, Instant),
 }
 #[derive(Default)]
@@ -92,7 +102,8 @@ pub fn family(name: &str) -> String {
     };
     if matches!(
         result,
-        "claude-code"
+        "cmd"
+            | "claude-code"
             | "claude-desktop"
             | "codex"
             | "cursor"
@@ -170,7 +181,7 @@ impl Usage {
                 db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL); CREATE TABLE IF NOT EXISTS counters(day TEXT NOT NULL, metric TEXT NOT NULL, dimensions TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(day,metric,dimensions));")?;
                 db.execute("INSERT OR IGNORE INTO meta VALUES(1,?1)", [ulid::Ulid::generate().to_string()])?;
                 let generation: String = db.query_row("SELECT generation FROM meta WHERE id=1", [], |r| r.get(0))?;
-                let mut pending: HashMap<String,(Dimensions,Instant,bool,bool,bool,usize)> = HashMap::new();
+                let mut pending: HashMap<String,Pending> = HashMap::new();
                 let mut counts: BTreeMap<(String,String,Dimensions),u64> = BTreeMap::new();
                 let mut persisted = db.prepare("SELECT day,metric,dimensions,value FROM counters WHERE day >= date('now','-7 days')")?;
                 for row in persisted.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?.max(0) as u64)))? {
@@ -182,7 +193,7 @@ impl Usage {
                 let mut dirty = false;
                 let mut last_day = String::new();
                 loop {
-                    let event = rx.recv_timeout(Duration::from_secs(1));
+                    let event = rx.recv_timeout(Duration::from_secs(5));
                     let day: String = db.query_row("SELECT date('now')", [], |r| r.get(0))?;
                     let mut add = |metric:&str, dims:Dimensions, value:u64| {
                         let key=(day.clone(),metric.to_owned(),dims);
@@ -195,21 +206,22 @@ impl Usage {
                     if overflow > 0 { add("dropped", Dimensions::default(), overflow); }
                     match event {
                         Ok(Event::Count(metric,dims,n))=>add(metric,dims,n),
-                        Ok(Event::Start(id,dims,reply,at))=> {
-                            let depth = reply.as_ref().and_then(|id|pending.get(id)).map_or(if reply.is_some() { 0 } else { 1 }, |p|if p.5 == 0 {0} else {p.5.saturating_add(1)});
-                            if let Some(parent)=reply.as_ref().and_then(|id|pending.get(id)).filter(|p|p.2) {
-                                let mut reply_dims=dims.clone(); reply_dims.bucket=duration(at.saturating_duration_since(parent.1).as_millis() as u64).into();
-                                add("reply_ms",reply_dims,1);
+                        Ok(Event::Start(id,dims,reply,at,incoming))=> {
+                            let depth = reply.as_ref().and_then(|id|pending.get(id)).map_or(if reply.is_some() { 0 } else { 1 }, |p|if p.depth == 0 {0} else {p.depth.saturating_add(1)});
+                            let reply_ms = reply.as_ref().and_then(|id|pending.get(id)).filter(|p|p.accepted).map(|parent|at.saturating_duration_since(parent.at).as_millis() as u64);
+                            if incoming && let Some(ms) = reply_ms {
+                                let mut d=dims.clone(); d.bucket=duration(ms).into(); add("reply_ms",d,1);
                             }
-                            if pending.len() >= 2048 {pending.retain(|_,v|v.1.elapsed()<Duration::from_secs(60));}
-                            if pending.len()<2048 {pending.insert(id,(dims,at,false,false,reply.is_some(),depth));} else {add("dropped",Dimensions::default(),1);}
+                            if pending.len() >= 2048 {pending.retain(|_,v|v.at.elapsed()<Duration::from_secs(60));}
+                            if pending.len()<2048 {pending.insert(id,Pending {dims,at,accepted:false,delivered:false,is_reply:reply.is_some(),depth,reply_ms});} else {add("dropped",Dimensions::default(),1);}
                         },
-                        Ok(Event::Stage(id,stage,observed))=>if let Some((dims,at,accepted,delivered,is_reply,depth))=pending.get_mut(&id) {
+                        Ok(Event::Stage(id,stage,observed))=>if let Some(Pending {dims,at,accepted,delivered,is_reply,depth,reply_ms})=pending.get_mut(&id) {
                             let duplicate=match stage {"accepted"=>std::mem::replace(accepted,true),"delivered"=>std::mem::replace(delivered,true),_=>false};
                             if !duplicate {
                                 add(stage,dims.clone(),1);
                                 if stage == "accepted" {
                                     if *is_reply { add("reply",dims.clone(),1); }
+                                    if let Some(ms) = reply_ms { let mut d=dims.clone(); d.bucket=duration(*ms).into(); add("reply_ms",d,1); }
                                     let mut exchange = dims.clone(); exchange.bucket = if *depth == 0 { "unknown" } else { number(*depth) }.into();
                                     add("exchange_length",exchange,1);
                                 }
@@ -225,7 +237,7 @@ impl Usage {
                     if last_flush.elapsed() >= Duration::from_secs(5) || snapshot.lock().map(|s|s.is_none()).unwrap_or(false) {
                         let oldest:String=db.query_row("SELECT date('now','-7 days')",[],|r|r.get(0))?;
                         counts.retain(|(d,_,_),_| d>=&oldest && d<=&day);
-                        pending.retain(|_,v|v.1.elapsed()<Duration::from_secs(24*3600));
+                        pending.retain(|_,v|v.at.elapsed()<Duration::from_secs(24*3600));
                         let mut days:BTreeMap<String,Day>=BTreeMap::new();
                         days.entry(day.clone()).or_insert(Day{day:day.clone(),rows:Vec::new(),dropped:0});
                         for ((day,metric,dimensions),value) in &counts {
@@ -237,13 +249,14 @@ impl Usage {
                         let mut persist=||->anyhow::Result<()> {
                             let tx=db.transaction()?;
                             tx.execute("DELETE FROM counters WHERE day < date('now','-7 days')",[])?;
-                            for ((day,metric,dims),value) in &counts {tx.execute("INSERT INTO counters VALUES(?1,?2,?3,?4) ON CONFLICT(day,metric,dimensions) DO UPDATE SET value=excluded.value",params![day,metric,serde_json::to_string(dims)?,*value as i64])?;}
+                            for ((day,metric,dims),value) in &counts {tx.execute("INSERT INTO counters VALUES(?1,?2,?3,?4) ON CONFLICT(day,metric,dimensions) DO UPDATE SET value=excluded.value WHERE counters.value <> excluded.value",params![day,metric,serde_json::to_string(dims)?,*value as i64])?;}
                             tx.commit()?;Ok(())
                         };
                         if (dirty || day != last_day)
                             && persist().is_ok() { dirty = false; }
                         if !dirty
                         && let Ok(mut target)=snapshot.lock() {*target=Some(Report{version:1,generation:generation.clone(),engine_version:env!("CARGO_PKG_VERSION").into(),platform:match std::env::consts::OS {"macos"=>"macos","linux"=>"linux","windows"=>"windows",_=>"other"}.into(),days:days.into_values().collect()});}
+                        if dirty && let Ok(mut target) = snapshot.lock() { *target = None; }
                         last_day = day;
                         last_flush=Instant::now();
                     }
@@ -251,6 +264,8 @@ impl Usage {
                 Ok(())
             };
             let _=run();
+            // A stopped collector must not keep advertising an old snapshot as fresh.
+            if let Ok(mut target) = snapshot.lock() { *target = None; }
         }).is_err() {return Self::default();}
         Self { tx: Some(tx), report, dropped }
     }
@@ -264,8 +279,8 @@ impl Usage {
     pub fn count(&self, metric: &'static str, dims: Dimensions, value: u64) {
         self.event(Event::Count(metric, dims, value));
     }
-    pub fn start(&self, id: &str, dims: Dimensions, reply: Option<&str>) {
-        self.event(Event::Start(id.into(), dims, reply.map(str::to_owned), Instant::now()));
+    pub fn start(&self, id: &str, dims: Dimensions, reply: Option<&str>, incoming: bool) {
+        self.event(Event::Start(id.into(), dims, reply.map(str::to_owned), Instant::now(), incoming));
     }
     pub fn stage(&self, id: &str, stage: &'static str) {
         self.event(Event::Stage(id.into(), stage, Instant::now()));

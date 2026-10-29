@@ -159,7 +159,7 @@ at Reason.
 
 The engine keeps optional aggregate usage counters in a separate local SQLite file.
 When the Reason CLI carries the network, it reports recent daily aggregates about every
-five minutes: agent families, local or remote routing, verified account relationships,
+five minutes, in bounded background batches: agent families, local or remote routing, verified account relationships,
 transport paths, delivery stages, linked replies, size and latency buckets, session
 snapshots and optional sender-supplied purpose labels (the CLI send --purpose option). The engine does not upload these
 itself. Standalone engines without the CLI keep their counters locally.

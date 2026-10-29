@@ -124,7 +124,7 @@ impl Daemon {
             g.live.insert(
                 key.clone(),
                 Live {
-                    through_reason: false,
+                    through_reason: Some(conn.is_none() && reg.agent == "reason"),
                     reg,
                     name,
                     conn,
@@ -789,7 +789,7 @@ mod tests {
         d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
         join(&d, claude("b"));
         let doing = HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "doing".into(),
             session_id: "b".into(),
@@ -838,7 +838,7 @@ mod tests {
     async fn a_conversation_coming_back_through_its_hooks_gets_its_name_too() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str| HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "start".into(),
             session_id: id.into(),
@@ -870,7 +870,7 @@ mod tests {
         join(&d, named("hermes:p:1", "hermes", None));
         for event in ["prompt", "tool", "stop"] {
             d.hook(HookCall {
-                through_reason: false,
+                through_reason: Some(false),
                 agent: "hermes".into(),
                 event: event.into(),
                 session_id: "p:1".into(),
@@ -966,7 +966,7 @@ mod tests {
         settled(&mut d);
         let d = Arc::new(d);
         let cli = |id: &str, keep: bool| HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: id.into(),
@@ -1124,7 +1124,7 @@ mod tests {
     async fn a_run_only_its_hooks_ever_saw_keeps_no_name() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str, event: &str| HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1157,7 +1157,7 @@ mod tests {
 
     fn gemini(id: &str, event: &str) -> HookCall {
         HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "gemini".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1496,7 +1496,7 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // The terminal's commands go on as before.
         let call = HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: "terminal".into(),
@@ -1672,7 +1672,7 @@ mod tests {
         };
         let d = Arc::new(super::super::test_daemon(cfg));
         let call = |id: &str, event: &str, dirs: &[&str]| HookCall {
-            through_reason: false,
+            through_reason: Some(false),
             agent: "cursor".into(),
             event: event.into(),
             session_id: id.into(),

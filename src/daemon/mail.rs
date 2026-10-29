@@ -148,7 +148,11 @@ impl Daemon {
                 .ok_or_else(unregistered)?;
             let (from_addr, from_agent, from_repo) =
                 (self.addr(&sender.name), Some(sender.reg.agent.clone()), sender.git.repo.clone());
-            let sender_origin = if sender.through_reason { "hosted" } else { "local" };
+            let sender_origin = match sender.through_reason {
+                Some(true) => "hosted",
+                Some(false) => "local",
+                None => "unknown",
+            };
             let exclude = sender.reg.key.clone();
             // It talks to teammates: its name stays its own.
             self.reached(&mut g, &exclude);
@@ -230,7 +234,12 @@ impl Daemon {
                     target: target_agent.map(crate::usage::family).unwrap_or_else(|| "unknown".into()),
                     locality: if here { "local" } else { "remote" }.into(),
                     origin: sender_origin.into(),
-                    relationship: if here { "same" } else { "unknown" }.into(),
+                    relationship: if here && g.team.as_ref().is_some_and(|t| t.has_proof(&self.key.public())) {
+                        "same"
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
                     transport: if here { "local" } else { "unknown" }.into(),
                     ..Default::default()
                 };
@@ -247,7 +256,7 @@ impl Daemon {
                         dims.relationship = if ours.sub == theirs.sub { "same" } else { "different" }.into();
                     }
                 }
-                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref());
+                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref(), false);
                 self.usage.count("attempted", dims.clone(), 1);
                 let mut sized = dims.clone();
                 sized.bucket = crate::usage::size(body.len()).into();
@@ -287,6 +296,7 @@ impl Daemon {
                     self.usage.stage(&msg.id, "rejected");
                 } else if here {
                     self.usage.stage(&msg.id, "accepted");
+                    self.usage.count("received", dims.clone(), 1);
                 }
                 if state == "queued" {
                     self.usage.count("queued", dims, 1);
@@ -707,7 +717,7 @@ impl Daemon {
                     locality: "remote".into(),
                     ..Default::default()
                 };
-                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref());
+                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref(), true);
                 self.usage.count("received", dims, 1);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
@@ -768,7 +778,7 @@ impl Daemon {
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     let changed = g.store.mark_read(&ids, util::now_ms())?;
-                    if g.live.get(&key).is_some_and(|l| !l.through_reason) {
+                    if g.live.get(&key).is_some_and(|l| l.through_reason == Some(false)) {
                         for id in &changed {
                             self.usage.stage(id, "delivered");
                         }
