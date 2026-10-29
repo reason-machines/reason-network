@@ -510,7 +510,7 @@ async fn log_relay(endpoint: Endpoint) {
 }
 
 /// Says in the log when a connection to a teammate moves between a direct path and the relay, and the new one's rtt.
-async fn log_paths(conn: Connection) {
+async fn log_paths(conn: Connection, daemon: std::sync::Weak<Daemon>) {
     let peer = conn.remote_id().fmt_short().to_string();
     let kind = |relay: bool| if relay { "relay" } else { "direct" };
     let mut lists = conn.paths_stream();
@@ -522,6 +522,9 @@ async fn log_paths(conn: Connection) {
             && from != relay
         {
             log(&format!("{peer}: path {} -> {} (rtt {} ms)", kind(from), kind(relay), p.rtt().as_millis()));
+            if let Some(d) = daemon.upgrade() {
+                d.usage_transport("path_changed", relay, p.rtt().as_millis() as u64);
+            }
         }
         was = Some(relay);
     }
@@ -1053,7 +1056,8 @@ impl Net {
             links.insert(peer, Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now() });
         }
         log(&format!("connected to {} ({})", peer.fmt_short(), if outgoing { "out" } else { "in" }));
-        let paths = tokio::spawn(log_paths(conn.clone()));
+        daemon.usage_transport("reconnected", false, 0);
+        let paths = tokio::spawn(log_paths(conn.clone(), self.daemon.clone()));
 
         let writer = tokio::spawn(async move {
             while let Some(w) = rx.recv().await {

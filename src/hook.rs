@@ -86,6 +86,7 @@ async fn handle(
 
     let key = format!("{agent}:{session_id}");
     let req = Request::Hook(HookCall {
+        through_reason: false,
         agent: agent.to_string(),
         event: ev.to_string(),
         session_id,

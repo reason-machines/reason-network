@@ -116,9 +116,15 @@ impl Daemon {
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+            self.usage.count(
+                "registered",
+                crate::usage::Dimensions { source: crate::usage::family(&reg.agent), ..Default::default() },
+                1,
+            );
             g.live.insert(
                 key.clone(),
                 Live {
+                    through_reason: false,
                     reg,
                     name,
                     conn,
@@ -317,7 +323,8 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep } = h;
+        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
+            h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
@@ -398,6 +405,7 @@ impl Daemon {
             }
             return Ok(HookReply::default());
         }
+        l.through_reason = through_reason;
         l.last_hook = Some(now);
         l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
         if pid.is_some() {
@@ -781,6 +789,7 @@ mod tests {
         d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
         join(&d, claude("b"));
         let doing = HookCall {
+            through_reason: false,
             agent: "claude-code".into(),
             event: "doing".into(),
             session_id: "b".into(),
@@ -829,6 +838,7 @@ mod tests {
     async fn a_conversation_coming_back_through_its_hooks_gets_its_name_too() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str| HookCall {
+            through_reason: false,
             agent: "claude-code".into(),
             event: "start".into(),
             session_id: id.into(),
@@ -860,6 +870,7 @@ mod tests {
         join(&d, named("hermes:p:1", "hermes", None));
         for event in ["prompt", "tool", "stop"] {
             d.hook(HookCall {
+                through_reason: false,
                 agent: "hermes".into(),
                 event: event.into(),
                 session_id: "p:1".into(),
@@ -955,6 +966,7 @@ mod tests {
         settled(&mut d);
         let d = Arc::new(d);
         let cli = |id: &str, keep: bool| HookCall {
+            through_reason: false,
             agent: "cli".into(),
             event: "stop".into(),
             session_id: id.into(),
@@ -1112,6 +1124,7 @@ mod tests {
     async fn a_run_only_its_hooks_ever_saw_keeps_no_name() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str, event: &str| HookCall {
+            through_reason: false,
             agent: "claude-code".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1144,6 +1157,7 @@ mod tests {
 
     fn gemini(id: &str, event: &str) -> HookCall {
         HookCall {
+            through_reason: false,
             agent: "gemini".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1482,6 +1496,7 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // The terminal's commands go on as before.
         let call = HookCall {
+            through_reason: false,
             agent: "cli".into(),
             event: "stop".into(),
             session_id: "terminal".into(),
@@ -1657,6 +1672,7 @@ mod tests {
         };
         let d = Arc::new(super::super::test_daemon(cfg));
         let call = |id: &str, event: &str, dirs: &[&str]| HookCall {
+            through_reason: false,
             agent: "cursor".into(),
             event: event.into(),
             session_id: id.into(),

@@ -148,6 +148,7 @@ impl Daemon {
                 .ok_or_else(unregistered)?;
             let (from_addr, from_agent, from_repo) =
                 (self.addr(&sender.name), Some(sender.reg.agent.clone()), sender.git.repo.clone());
+            let sender_origin = if sender.through_reason { "hosted" } else { "local" };
             let exclude = sender.reg.key.clone();
             // It talks to teammates: its name stays its own.
             self.reached(&mut g, &exclude);
@@ -216,6 +217,47 @@ impl Daemon {
                 // The receipt names it as its answer will show here: a teammate's terminal with its machine.
                 let shown = t.shown_address();
                 let here = !matches!(t, Target::Remote { .. });
+                let target_agent = match &t {
+                    Target::Session { key: Some(key), .. } => g.live.get(key).map(|l| l.reg.agent.as_str()),
+                    Target::Session { key: None, .. } => None,
+                    Target::Remote { address, machine, .. } => remotes
+                        .get(machine)
+                        .and_then(|r| r.presence.sessions.iter().find(|s| &s.address == address))
+                        .map(|s| s.agent.as_str()),
+                };
+                let mut dims = crate::usage::Dimensions {
+                    source: crate::usage::family(from_agent.as_deref().unwrap_or("unknown")),
+                    target: target_agent.map(crate::usage::family).unwrap_or_else(|| "unknown".into()),
+                    locality: if here { "local" } else { "remote" }.into(),
+                    origin: sender_origin.into(),
+                    relationship: if here { "same" } else { "unknown" }.into(),
+                    transport: if here { "local" } else { "unknown" }.into(),
+                    ..Default::default()
+                };
+                if let Target::Remote { machine, .. } = &t {
+                    if let Some(link) = net.as_ref().and_then(|n| n.link_info(machine)) {
+                        dims.transport = if link.relay { "relay" } else { "direct" }.into();
+                        let mut latency = dims.clone();
+                        latency.bucket = crate::usage::duration(link.rtt_ms).into();
+                        self.usage.count("rtt_ms", latency, 1);
+                    }
+                    if let Some(team) = &g.team
+                        && let (Some(ours), Some(theirs)) = (team.proof(&self.key.public()), team.proof(machine))
+                    {
+                        dims.relationship = if ours.sub == theirs.sub { "same" } else { "different" }.into();
+                    }
+                }
+                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref());
+                self.usage.count("attempted", dims.clone(), 1);
+                let mut sized = dims.clone();
+                sized.bucket = crate::usage::size(body.len()).into();
+                self.usage.count("body_bytes", sized, 1);
+                let mut attached = dims.clone();
+                attached.bucket = crate::usage::number(files.len()).into();
+                self.usage.count("attachments", attached, 1);
+                let mut attachment_size = dims.clone();
+                attachment_size.bucket = crate::usage::size(files.iter().map(|f| f.content.len()).sum()).into();
+                self.usage.count("attachment_bytes", attachment_size, 1);
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
                         ("refused".into(), LOOP_NOTE.into())
@@ -241,6 +283,14 @@ impl Daemon {
                         }
                     }
                 };
+                if state == "refused" {
+                    self.usage.stage(&msg.id, "rejected");
+                } else if here {
+                    self.usage.stage(&msg.id, "accepted");
+                }
+                if state == "queued" {
+                    self.usage.count("queued", dims, 1);
+                }
                 // Counting never stops a message. One to another machine counts once that machine takes it.
                 if here && state != "refused" {
                     let _ = g.store.count(now, Counted::Sent);
@@ -451,6 +501,9 @@ impl Daemon {
     /// A session's MCP server had no inbox to push `ids` into: they are unread again, for the session to read when it
     /// checks, and nothing is pushed through it until it registers knowing one (or Claude Code lists one to post into).
     pub(super) fn push_failed(&self, key: &str, ids: &[String]) {
+        for id in ids {
+            self.usage.stage(id, "push_failed");
+        }
         let mut g = self.inner.lock().unwrap();
         for id in ids {
             g.in_flight.remove(id);
@@ -475,7 +528,10 @@ impl Daemon {
             }
             match res {
                 Ok(Ok(())) => {
-                    let _ = g.store.mark_read(&ids, util::now_ms());
+                    let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                    for id in &changed {
+                        this.usage.stage(id, "delivered");
+                    }
                 }
                 Ok(Err(e)) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
                 Err(e) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
@@ -530,7 +586,10 @@ impl Daemon {
             }
             match res {
                 Ok(()) => {
-                    let _ = g.store.mark_read(&ids, util::now_ms());
+                    let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                    for id in &changed {
+                        this.usage.stage(id, "delivered");
+                    }
                     if let Some(l) = g.live.get_mut(&key) {
                         l.retry = None;
                     }
@@ -643,6 +702,13 @@ impl Daemon {
             let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
             if g.store.insert(&mut msg, held)? && !held {
+                let dims = crate::usage::Dimensions {
+                    source: msg.from_agent.as_deref().map(crate::usage::family).unwrap_or_else(|| "unknown".into()),
+                    locality: "remote".into(),
+                    ..Default::default()
+                };
+                self.usage.start(&msg.id, dims.clone(), msg.reply_to.as_deref());
+                self.usage.count("received", dims, 1);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
             let (state, note) = match key {
@@ -701,7 +767,12 @@ impl Daemon {
                 let messages = g.pending(&address)?;
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-                    g.store.mark_read(&ids, util::now_ms())?;
+                    let changed = g.store.mark_read(&ids, util::now_ms())?;
+                    if g.live.get(&key).is_some_and(|l| !l.through_reason) {
+                        for id in &changed {
+                            self.usage.stage(id, "delivered");
+                        }
+                    }
                 }
                 messages
             };

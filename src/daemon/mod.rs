@@ -118,6 +118,7 @@ fn log(msg: &str) {
 }
 
 pub struct Daemon {
+    usage: crate::usage::Usage,
     person: String,
     machine: String,
     cfg: Config,
@@ -168,6 +169,7 @@ struct Inner {
 
 /// A session running on this machine.
 struct Live {
+    through_reason: bool,
     reg: SessionReg,
     name: String,
     /// The client connection (`reason network mcp`) that owns it; `None` for sessions known only through hooks.
@@ -211,8 +213,21 @@ pub fn load_key() -> Result<SecretKey> {
 }
 
 impl Daemon {
+    pub(crate) fn usage_transport(&self, metric: &'static str, relay: bool, rtt: u64) {
+        let mut dims = crate::usage::Dimensions { locality: "remote".into(), ..Default::default() };
+        if metric == "path_changed" {
+            dims.transport = if relay { "relay" } else { "direct" }.into();
+        }
+        self.usage.count(metric, dims.clone(), 1);
+        if rtt > 0 {
+            dims.bucket = crate::usage::duration(rtt).into();
+            self.usage.count("rtt_ms", dims, 1);
+        }
+    }
     fn open() -> Result<Self> {
-        Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)
+        let mut daemon = Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
+        daemon.usage = crate::usage::Usage::open(paths::home().join("usage.sqlite"));
+        Ok(daemon)
     }
 
     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
@@ -221,6 +236,7 @@ impl Daemon {
         // In a team, who we are is what the signed roster says, whatever the config file says.
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
         Ok(Daemon {
+            usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
             machine: member.map_or_else(util::hostname, |m| m.machine),
             key,
@@ -324,6 +340,16 @@ impl Daemon {
     }
 
     async fn handle(self: &Arc<Self>, conn: u64, req: Request) -> Result<Value> {
+        let operation = match &req {
+            Request::Who { .. } => Some("who"),
+            Request::Send { .. } => Some("send"),
+            Request::Inbox { .. } => Some("inbox"),
+            Request::Ask { .. } => Some("ask"),
+            _ => None,
+        };
+        if let Some(operation) = operation {
+            self.usage.count("tool", crate::usage::Dimensions { bucket: operation.into(), ..Default::default() }, 1);
+        }
         Ok(match req {
             Request::Register { session } => {
                 let git = self.git(&session.cwd).await;
@@ -331,7 +357,12 @@ impl Daemon {
             }
             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
-            Request::Send { from, to, body, reply_to, wake, notify, files } => {
+            Request::Send { from, to, body, reply_to, wake, notify, files, purpose } => {
+                let dims = crate::usage::Dimensions {
+                    bucket: purpose.unwrap_or_else(|| "unknown".into()),
+                    ..Default::default()
+                };
+                self.usage.count("purpose", dims, 1);
                 json!(self.send(from, &to, &body, reply_to, wake, notify, None, files).await?)
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
@@ -341,9 +372,16 @@ impl Daemon {
                 self.stop_waiting(&key).await;
                 Value::Null
             }
-            Request::Delivered { ids, .. } => {
+            Request::Delivered { key, ids } => {
                 let mut g = self.inner.lock().unwrap();
-                g.store.mark_read(&ids, util::now_ms())?;
+                let changed = g.store.mark_read(&ids, util::now_ms())?;
+                // Hosted relays acknowledge a handover to a server inbox, not agent consumption.
+                let handed_to_agent = g.live.get(&key).is_some_and(|l| !l.through_reason);
+                for id in &changed {
+                    if handed_to_agent {
+                        self.usage.stage(id, "delivered");
+                    }
+                }
                 for id in &ids {
                     g.in_flight.remove(id);
                 }

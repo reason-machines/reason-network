@@ -154,3 +154,27 @@ at Reason.
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=reason-machines/reason-network&type=date&legend=top-left" />
  </picture>
 </a>
+
+## Usage measurement
+
+The engine keeps optional aggregate usage counters in a separate local SQLite file.
+When the Reason CLI carries the network, it reports recent daily aggregates about every
+five minutes: agent families, local or remote routing, verified account relationships,
+transport paths, delivery stages, linked replies, size and latency buckets, session
+snapshots and optional sender-supplied purpose labels (the CLI send --purpose option). The engine does not upload these
+itself. Standalone engines without the CLI keep their counters locally.
+
+Message text, files, filenames, repositories, session names, message ids, peer identities,
+keys and sign-in proofs are not in these reports. The existing P2P encryption and wire
+protocol are unchanged. Set DO_NOT_TRACK=1 when running a Reason command to keep the
+aggregates local, including in its background relay; DO_NOT_TRACK=0 restores reporting.
+Reports are associated with the reporting Reason account and engine, so they are usage
+metadata, not anonymous data. Unknown classifications stay unknown.
+
+Collection uses a bounded, non-blocking queue and its own database worker. Analytics
+failures do not refuse or delay message delivery. Counts are best effort: queue overflow,
+bounded dimension capacity, missing reports, old engines, and a crash before persistence
+can leave gaps. Persisted cumulative snapshots survive restarts and retries; a replaced
+counter database gets a new generation. Collection-limit drops are reported. Acceptance
+is not agent consumption, and a reply is not proof of task completion. A hosted relay
+copying mail into a server inbox does not count as a handoff to that assistant.

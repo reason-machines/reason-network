@@ -24,6 +24,7 @@ mod setup;
 mod store;
 mod team;
 mod tray;
+mod usage;
 mod util;
 mod wizard;
 
@@ -140,6 +141,9 @@ enum Cmd {
     /// It comes from the agent session whose shell runs it, `--from <session>`, or from a plain terminal,
     /// `<you>/terminal` (read replies with `listen --as terminal`)
     Send {
+        /// Optional self-reported analytics category (review, delegate, status, question, handoff, other).
+        #[arg(long)]
+        purpose: Option<String>,
         to: String,
         /// The message; read from stdin when omitted or `-`
         message: Vec<String>,
@@ -374,6 +378,7 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         cwd = terminal_cwd(cwd, here_off(), agent_shell())?;
     }
     let req = Request::Hook(HookCall {
+        through_reason: false,
         agent: "cli".into(),
         event: event.into(),
         session_id: id.into(),
@@ -432,7 +437,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 print!("{}", shown(&render::directory(&d, false, render::Paint::terminal())));
             }
         }
-        Cmd::Send { to, message, reply_to, fyi, notify, from, files } => {
+        Cmd::Send { to, message, reply_to, fyi, notify, from, files, purpose } => {
             // An agent in a folder that is off sends nothing, as no session (nor its files).
             if agent_shell() && here_off() {
                 bail!(config::OFF_HERE);
@@ -455,6 +460,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             // Messages come from agent sessions: `--from`'s, this agent's, or from a plain terminal, `<you>/terminal`.
             // An agent shell Reason Network doesn't know (its tools aren't loaded) counts as a terminal.
             let send = |from: String| Request::Send {
+                purpose: purpose.clone(),
                 from,
                 to: to.clone(),
                 body: body.clone(),
@@ -926,6 +932,7 @@ mod tests {
             has_proof: true,
         };
         let mut t = TeamInfo {
+            usage: None,
             id: String::new(),
             name: "vibes".into(),
             team_name: "vibes".into(),

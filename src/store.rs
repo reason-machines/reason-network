@@ -385,20 +385,21 @@ impl Store {
     }
 
     /// Undelivered messages for a machine; older than a week are given up on.
-    pub fn outbox_for(&self, target: &str, now: i64) -> Result<Vec<Message>> {
-        self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+    pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
+        let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
+        Ok((rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect(), expired))
     }
 
     /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
     /// (once, however many answers come).
-    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<()> {
-        if self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1 && taken {
+    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
+        let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
+        if removed && taken {
             let _ = self.count(crate::util::now_ms(), Counted::Sent);
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
@@ -462,12 +463,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_read(&self, ids: &[String], now: i64) -> Result<()> {
+    pub fn mark_read(&self, ids: &[String], now: i64) -> Result<Vec<String>> {
         let mut st = self.db.prepare_cached("UPDATE messages SET read_at = ?2 WHERE id = ?1 AND read_at IS NULL")?;
+        let mut changed = Vec::new();
         for id in ids {
-            st.execute(params![id, now])?;
+            if st.execute(params![id, now])? > 0 {
+                changed.push(id.clone());
+            }
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// A renamed session keeps its unread mail.
@@ -731,7 +735,7 @@ mod tests {
         store.outbox_done("01TAKEN", true).unwrap();
         store.outbox_done("01TAKEN", true).unwrap();
         store.outbox_done("01REFUSED", false).unwrap();
-        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().is_empty());
+        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().0.is_empty());
         assert_eq!(totals(&store), (1, 0));
         // Received: held, it counts once approved. Dropped, then sent again after a lost answer, it counts once.
         store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
@@ -913,7 +917,7 @@ mod tests {
         let bodies = |ms: Vec<Message>| ms.into_iter().map(|m| m.body).collect::<Vec<_>>();
         assert_eq!(bodies(store.unread("lars/api").unwrap()), ["do X", "never mind X"]);
         assert_eq!(bodies(store.held().unwrap()), ["do X", "never mind X"]);
-        assert_eq!(bodies(store.outbox_for("peer", 1_000).unwrap()), ["do X", "never mind X"]);
+        assert_eq!(bodies(store.outbox_for("peer", 1_000).unwrap().0), ["do X", "never mind X"]);
     }
 
     fn temp_inbox() -> PathBuf {

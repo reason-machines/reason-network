@@ -192,6 +192,7 @@ impl ReasonNetworkMcp {
             Err(e) => return Ok(failure(e)),
         };
         let req = Request::Send {
+            purpose: None,
             from: key.clone(),
             to: a.to,
             body: a.message,
