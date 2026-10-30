@@ -136,6 +136,40 @@ impl Daemon {
         files: Vec<Attachment>,
         idempotency_key: Option<String>,
     ) -> Result<SendResult> {
+        // A key may name an earlier send, even if this attempt fails before looking up its receipt.
+        // Only a successful begin_send that inserted a fresh key can prove otherwise: neither a
+        // missing receipt for an existing key nor a failed lookup proves that it never reached a recipient.
+        let mut may_have_dispatched = idempotency_key.is_some();
+        self.send_inner(
+            from,
+            to,
+            body,
+            reply_to,
+            wake,
+            notify,
+            approval,
+            files,
+            idempotency_key,
+            &mut may_have_dispatched,
+        )
+        .await
+        .map_err(|cause| SendError { cause, not_dispatched: !may_have_dispatched }.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_inner(
+        self: &Arc<Self>,
+        from: String,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+        wake: bool,
+        notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
+        files: Vec<Attachment>,
+        idempotency_key: Option<String>,
+        may_have_dispatched: &mut bool,
+    ) -> Result<SendResult> {
         if idempotency_key.as_ref().is_some_and(|key| key.is_empty() || key.len() > 200) {
             bail!("idempotency key must be 1 to 200 bytes");
         }
@@ -186,10 +220,11 @@ impl Daemon {
                     blake3::hash(serde_json::to_string(&(to, body, &reply_to, wake, notify, &files))?.as_bytes())
                         .to_hex()
                         .to_string();
-                let (nonce, receipt) = g.store.begin_send(&key, &fingerprint, now)?;
+                let (nonce, receipt, fresh) = g.store.begin_send(&key, &fingerprint, now)?;
                 if let Some(receipt) = receipt {
                     return Ok(receipt);
                 }
+                *may_have_dispatched = !fresh;
                 send_nonce = nonce;
                 send_key = Some(key);
             }
@@ -221,6 +256,7 @@ impl Daemon {
                     approval: None,
                     files: Vec::new(),
                 };
+                *may_have_dispatched = true;
                 let (sent, note) = self.notify(&msg);
                 let state = if sent { "notified" } else { "not notified" };
                 res.recipients.push(Recipient { address: format!("{to}@{}", self.machine), state: state.into(), note });
@@ -250,6 +286,7 @@ impl Daemon {
                     Ulid::generate().to_string()
                 };
                 if let Some(old) = g.store.message(&id)? {
+                    *may_have_dispatched = true;
                     res.ids.push(id);
                     res.recipients.push(Recipient {
                         address: t.shown_address(),
@@ -326,6 +363,8 @@ impl Daemon {
                 let mut attachment_size = dims.clone();
                 attachment_size.bucket = crate::usage::size(files.iter().map(|f| f.content.len()).sum()).into();
                 self.usage.count("attachment_bytes", attachment_size, 1);
+                // Set before the first durable write: any later failure must not authorize a reroute.
+                *may_have_dispatched = true;
                 g.store.record_sent(&exclude, &msg, &shown, "queued")?;
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
@@ -1053,6 +1092,170 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+        }
+    }
+
+    fn disk_daemon() -> (Arc<Daemon>, rusqlite::Connection, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!("reason-network-send-{}", Ulid::generate()));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("network.db");
+        let store = crate::store::Store::open(&path, home.join("inbox")).unwrap();
+        let d = Arc::new(Daemon::with(crate::config::Config::default(), store, SecretKey::generate()).unwrap());
+        (d, rusqlite::Connection::open(path).unwrap(), home)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_send_refused_before_dispatch_has_a_typed_code() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let error = d.send("missing".into(), "alex/api", "hello", None, true, false, None, vec![]).await.unwrap_err();
+        let reply = serde_json::to_value(Reply::err(7, error)).unwrap();
+        assert_eq!(reply["error"], unregistered().to_string());
+        assert_eq!(reply["code"], "send_not_dispatched");
+        let error = d.send("missing".into(), "alex/api", "", None, true, false, None, vec![]).await.unwrap_err();
+        let reply = serde_json::to_value(Reply::err(8, error)).unwrap();
+        assert_eq!(reply["error"], "empty message");
+        assert_eq!(reply["code"], "send_not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_key_can_report_a_recipient_refusal_but_a_pending_key_or_failed_lookup_cannot() {
+        let (d, db, home) = disk_daemon();
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let send = |key: &str| {
+            d.send_idempotent(
+                "codex:1".into(),
+                "no-such-recipient",
+                "hello",
+                None,
+                true,
+                false,
+                None,
+                vec![],
+                Some(key.into()),
+            )
+        };
+        let fresh = Reply::err(7, send("job-1").await.unwrap_err());
+        assert!(fresh.error.as_deref().unwrap().starts_with("no session called 'no-such-recipient'"));
+        assert_eq!(fresh.code.as_deref(), Some("send_not_dispatched"));
+        // The failed resolution left a pending key. A retry cannot assume what happened on that attempt.
+        let pending = Reply::err(8, send("job-1").await.unwrap_err());
+        assert_eq!(pending.error, fresh.error);
+        assert_eq!(pending.code, None);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM send_keys WHERE receipt IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        // A different job is independently proven fresh.
+        assert_eq!(Reply::err(9, send("job-2").await.unwrap_err()).code.as_deref(), Some("send_not_dispatched"));
+        // Even an actual insertion is not enough if the following receipt read cannot complete.
+        db.execute_batch(
+            "CREATE TRIGGER corrupt_receipt AFTER INSERT ON send_keys
+             BEGIN UPDATE send_keys SET receipt='invalid JSON' WHERE key=NEW.key; END;",
+        )
+        .unwrap();
+        let failed_lookup = Reply::err(10, send("job-3").await.unwrap_err());
+        assert!(failed_lookup.error.unwrap().contains("expected value"));
+        assert_eq!(failed_lookup.code, None);
+        for table in ["messages", "outbox", "sent_receipts"] {
+            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        drop(db);
+        drop(d);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_receipt_failure_after_push_never_says_not_dispatched_and_retries_do_not_push_again() {
+        // Fail either finish_send: the first saves the queued result, the second the peer result.
+        for condition in ["1", "OLD.receipt IS NOT NULL"] {
+            let (d, db, home) = disk_daemon();
+            d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            d.inner.lock().unwrap().conns.insert(7, tx);
+            let to = d
+                .register(
+                    Some(7),
+                    SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex("claude-code:2") },
+                    crate::git::GitInfo::default(),
+                )
+                .unwrap()
+                .address;
+            db.execute_batch(&format!(
+                "CREATE TRIGGER fail_receipt BEFORE UPDATE OF receipt ON send_keys WHEN {condition}
+                 BEGIN SELECT RAISE(FAIL, 'receipt persistence failed'); END;"
+            ))
+            .unwrap();
+            let send = || {
+                d.send_idempotent("codex:1".into(), &to, "hello", None, true, false, None, vec![], Some("job-1".into()))
+            };
+            let reply = serde_json::to_value(Reply::err(7, send().await.unwrap_err())).unwrap();
+            assert!(reply["error"].as_str().unwrap().contains("receipt persistence failed"));
+            assert_eq!(reply.get("code"), None);
+            // The push happened, not merely an attempted database write.
+            let Event::Deliver { ids, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+            db.execute_batch("DROP TRIGGER fail_receipt;").unwrap();
+            let receipt = send().await.unwrap();
+            assert_eq!(receipt.ids, ids);
+            let cached = send().await.unwrap();
+            assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(receipt).unwrap());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+            drop(db);
+            drop(d);
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyed_retry_cannot_claim_no_dispatch_when_its_receipt_or_sender_is_unavailable() {
+        let (d, db, home) = disk_daemon();
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+        let send =
+            || d.send_idempotent("codex:1".into(), &to, "hello", None, true, false, None, vec![], Some("job-1".into()));
+        let receipt = send().await.unwrap();
+        db.execute_batch("UPDATE send_keys SET receipt='invalid JSON';").unwrap();
+        let reply = Reply::err(7, send().await.unwrap_err());
+        assert!(reply.error.unwrap().contains("expected value"));
+        assert_eq!(reply.code, None);
+        // SQLite lookup itself can fail too, with the earlier message still present.
+        db.execute_batch("ALTER TABLE send_keys RENAME TO saved_send_keys;").unwrap();
+        let reply = Reply::err(8, send().await.unwrap_err());
+        assert!(reply.error.unwrap().contains("no such table"));
+        assert_eq!(reply.code, None);
+        d.inner.lock().unwrap().live.remove("codex:1");
+        let reply = Reply::err(9, send().await.unwrap_err());
+        assert_eq!(reply.error.as_deref(), Some(unregistered().to_string().as_str()));
+        assert_eq!(reply.code, None);
+        let messages = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, receipt.ids[0]);
+        drop(db);
+        drop(d);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_send_stops_classifying_errors_before_its_first_durable_attempt() {
+        for table in ["sent_receipts", "messages"] {
+            let (d, db, home) = disk_daemon();
+            d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+            let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+            db.execute_batch(&format!(
+                "CREATE TRIGGER fail_write BEFORE INSERT ON {table}
+                 BEGIN SELECT RAISE(FAIL, 'durable write failed'); END;"
+            ))
+            .unwrap();
+            let error = d.send("codex:1".into(), &to, "hello", None, true, false, None, vec![]).await.unwrap_err();
+            let reply = Reply::err(7, error);
+            assert!(reply.error.unwrap().contains("durable write failed"));
+            assert_eq!(reply.code, None);
+            assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+            drop(db);
+            drop(d);
+            std::fs::remove_dir_all(home).unwrap();
         }
     }
 

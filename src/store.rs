@@ -190,14 +190,16 @@ impl Store {
         }
         Ok(out)
     }
+    /// Returns the nonce, saved receipt, and whether this call inserted the key.
+    /// No freshness claim escapes a failed fingerprint check or receipt lookup.
     pub fn begin_send(
         &self,
         key: &str,
         fingerprint: &str,
         now: i64,
-    ) -> Result<(String, Option<crate::proto::SendResult>)> {
+    ) -> Result<(String, Option<crate::proto::SendResult>, bool)> {
         self.prune_receipts(now)?;
-        self.db.execute(
+        let inserted = self.db.execute(
             "INSERT OR IGNORE INTO send_keys(key,fingerprint,created_at,nonce) VALUES(?1,?2,?3,?4)",
             params![key, fingerprint, now, ulid::Ulid::generate().to_string()],
         )?;
@@ -209,7 +211,7 @@ impl Store {
             old == fingerprint,
             "idempotency key already used for a different message; use a new key for a corrected or different message"
         );
-        Ok((nonce, receipt.map(|v| serde_json::from_str(&v)).transpose()?))
+        Ok((nonce, receipt.map(|v| serde_json::from_str(&v)).transpose()?, inserted == 1))
     }
 
     pub fn finish_send(&self, key: &str, receipt: &crate::proto::SendResult) -> Result<()> {
@@ -1080,12 +1082,24 @@ mod tests {
     fn an_expired_idempotency_key_gets_a_new_generation() {
         let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
         let now = crate::util::now_ms();
-        let (first, _) = store.begin_send("key", "original", now).unwrap();
+        let (first, receipt, fresh) = store.begin_send("key", "original", now).unwrap();
         assert!(!first.is_empty());
-        assert_eq!(store.begin_send("key", "original", now + 1000).unwrap().0, first);
+        assert!(fresh);
+        assert!(receipt.is_none());
+        let (pending, receipt, fresh) = store.begin_send("key", "original", now + 1000).unwrap();
+        assert_eq!(pending, first);
+        assert!(!fresh);
+        assert!(receipt.is_none());
+        let saved = crate::proto::SendResult { ids: vec!["message-id".into()], recipients: vec![] };
+        store.finish_send("key", &saved).unwrap();
+        let (cached, receipt, fresh) = store.begin_send("key", "original", now + 2000).unwrap();
+        assert_eq!(cached, first);
+        assert!(!fresh);
+        assert_eq!(serde_json::to_value(receipt.unwrap()).unwrap(), serde_json::to_value(saved).unwrap());
         assert!(store.begin_send("key", "different", now + 1000).is_err());
-        let (next, receipt) = store.begin_send("key", "different", now + 8 * 86_400_000).unwrap();
+        let (next, receipt, fresh) = store.begin_send("key", "different", now + 8 * 86_400_000).unwrap();
         assert_ne!(next, first);
+        assert!(fresh);
         assert!(receipt.is_none());
     }
 
