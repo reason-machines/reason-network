@@ -513,6 +513,7 @@ Or paste the invite line into any agent.
 | Key | Default | |
 |---|---|---|
 | `person` | `$USER` | your name (set by `init`/`join`) |
+| `machine` | host name | this computer's name, taken when it creates or joins a team (in one, the team's name for it stands: leave and join again to change it); `REASON_NETWORK_MACHINE` overrides it |
 | `share_paths` | `false` | show teammates full working directories |
 | `share_unmanaged` | `false` | show teammates Claude Code sessions that don't have Reason Network loaded |
 | `tray` | `true` | macOS: show the menu bar icon while the background service runs |

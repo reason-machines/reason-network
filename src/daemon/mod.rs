@@ -241,7 +241,7 @@ impl Daemon {
         Ok(Daemon {
             usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
-            machine: member.map_or_else(util::hostname, |m| m.machine),
+            machine: member.map_or_else(|| util::hostname(cfg.machine.as_deref()), |m| m.machine),
             key,
             cfg,
             inner: Mutex::new(Inner {

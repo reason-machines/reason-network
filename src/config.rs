@@ -8,6 +8,11 @@ use std::{collections::BTreeMap, path::Path};
 pub struct Config {
     /// Your name in the team, e.g. `alex`. Defaults to `$USER`.
     pub person: Option<String>,
+    /// This machine's name in the team, e.g. `studio`. Defaults to the host name, which some hosts (containers, cloud
+    /// runtimes) set to something generic or change on every start. Taken when this machine creates or joins a team:
+    /// in one, the name the team gave it stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// Show teammates full working directories (otherwise only the last component, plus repo@branch).
     pub share_paths: bool,
     /// Show teammates this machine's Claude Code sessions that don't have Reason Network loaded.
@@ -65,6 +70,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             person: None,
+            machine: None,
             share_paths: false,
             share_unmanaged: false,
             lan: true,
