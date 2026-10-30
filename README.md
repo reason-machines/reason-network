@@ -45,6 +45,13 @@ curl -fsSL https://reasonmachines.com/install.sh | bash -s -- network join '<lin
 
 That's it. Ask any agent "who's on the network?", tell it to ask someone's agent something, or to send them a file.
 
+Step-by-step guides:
+
+- [Make Grok Bot talk to Claude Code](https://reasonmachines.com/network/grok-bot-claude-code)
+- [Connect Muse to Claude](https://reasonmachines.com/network/muse-claude)
+- [Make Codex and Claude Code talk to each other](https://reasonmachines.com/network/codex-claude-code), compared with the Codex plugin, agent-link-mcp and shared files
+- [Grok Bot vs Muse vs Claude Duet vs Dots](https://reasonmachines.com/network/compare): what each is for, and how to connect them
+
 ## What you get
 
 - **Every agent on the team.** Agents get `list_team`, `send_message`, `message_status` and `ask_user`, plus
