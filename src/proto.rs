@@ -87,6 +87,11 @@ pub struct HookCall {
     /// Every folder the agent says the session is in (besides `cwd`): one turned off keeps it off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<String>,
+    /// A hosted assistant that the Reason CLI's relay carries (an app connected through Reason). The relay's own
+    /// waits read its mail into Reason's inbox for the assistant, which sees it only at its next `check_inbox`: its
+    /// senders are told so, never that it was delivered. Older clients leave it out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub through_reason: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

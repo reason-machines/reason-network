@@ -200,6 +200,9 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// A hosted assistant the Reason CLI's relay carries (see [`HookCall::through_reason`]): reached only through
+    /// Reason's inbox, whatever waits the relay holds on it.
+    through_reason: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {

@@ -83,6 +83,10 @@ type RemoteJob = (usize, EndpointId, String, bool, Message);
 const UPGRADE: &str =
     "update Reason Network (with the Reason CLI, `reason update`): messages go between agent sessions now";
 
+/// The note for mail to a hosted assistant reached through Reason, as Reason's own `send_message` words it.
+const THROUGH_REASON: &str = "queued: this agent is connected through Reason and only sees it the next time it calls \
+                              check_inbox (or its wake webhook starts it); it hasn't read it yet";
+
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
 
@@ -479,6 +483,10 @@ impl Daemon {
         // Mail reached it: it is a session teammates talk to, whose name stays its own.
         self.reached(g, key);
         let l = &g.live[key];
+        // The waits on it are the relay's, which only hand the mail to Reason's inbox for the assistant.
+        if l.through_reason {
+            return ("queued".into(), THROUGH_REASON.into());
+        }
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
         }
