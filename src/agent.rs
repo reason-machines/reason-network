@@ -89,7 +89,16 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
 
 /// Agents that run one MCP server process for many sessions, so the session must come from each call.
 pub fn multiplexed(agent: &str) -> bool {
-    matches!(agent, "codex" | "opencode" | "cursor" | "antigravity")
+    matches!(agent, "codex" | "opencode" | "cursor" | "antigravity" | "zcode")
+}
+
+/// ZCode shares a workspace MCP process; each call supplies its real session and working directory.
+pub fn zcode_context(meta: &serde_json::Map<String, Value>) -> Option<(String, String)> {
+    let context = meta.get("com.zcode/request-context").unwrap_or(&Value::Null);
+    let field = |name: &str| {
+        context.get(name).or_else(|| meta.get(name)).and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    };
+    Some((field("session_id")?.to_string(), field("workspace_path")?.to_string()))
 }
 
 /// The session id an agent exports to its MCP servers, if any. `REASON_NETWORK_SESSION` is set by our own pi extension.
@@ -446,6 +455,19 @@ fn open_inbox(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zcode_sessions_come_from_each_calls_context_not_a_shared_process() {
+        let a = serde_json::json!({"session_id":"one","workspace_path":"C:\\用户 空格"});
+        let b = serde_json::json!({"com.zcode/request-context":{"session_id":"two","workspace_path":"C:\\用户 空格"}});
+        assert_eq!(super::zcode_context(a.as_object().unwrap()), Some(("one".into(), r"C:\用户 空格".into())));
+        assert_eq!(super::zcode_context(b.as_object().unwrap()), Some(("two".into(), r"C:\用户 空格".into())));
+        assert!(
+            super::zcode_context(serde_json::json!({"session_id":"","workspace_path":"/"}).as_object().unwrap())
+                .is_none()
+        );
+        assert!(super::multiplexed("zcode"));
+    }
+
     use super::*;
 
     #[test]

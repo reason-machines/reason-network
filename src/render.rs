@@ -168,6 +168,7 @@ impl Layout {
         let tier = match s.tier {
             Tier::None => paint.on(DIM, "not on Reason Network"),
             Tier::Push => paint.on(GREEN, "push"),
+            Tier::Turn if s.agent == "zcode" => paint.on(CYAN, "after tool (no idle wake)"),
             Tier::Turn => paint.on(CYAN, "turn"),
             t => paint.on(DIM, t.as_str()),
         };
@@ -464,6 +465,16 @@ mod tests {
         // `port = 0` reaches the daemon as no port: random, not a missed fixed one.
         let zero: crate::config::Config = toml::from_str("port = 0\n").unwrap();
         assert_eq!(u(53211, zero.port(), false), "UDP port 53211 (random)");
+    }
+
+    #[test]
+    fn zcode_hooks_are_described_as_after_tool_delivery() {
+        let mut d = bobs("team", "bob", "repo", "branch", "work");
+        d.sessions[0].agent = "zcode".into();
+        d.sessions[0].tier = Tier::Turn;
+        let text = directory_for_agent(&d);
+        assert!(text.contains("after tool (no idle wake)"));
+        assert!(!text.contains("turn ends"));
     }
 
     /// A directory of one teammate's session, with these fields as its machine and presence gave them.

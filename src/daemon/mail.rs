@@ -409,6 +409,10 @@ impl Daemon {
                     note = format!("{note}; {}", self.notify(&msg).1);
                 }
                 res.recipients.push(Recipient { address: shown, state, note });
+                // A correlated ZCode reply confirms receipt; hook stdout alone cannot prove host acceptance.
+                if res.recipients.last().is_some_and(|r| r.state != "refused") {
+                    let _ = g.store.ack_zcode_reply(&msg, &res.recipients.last().expect("just added").address);
+                }
                 let _ = g.store.send_outcome(&msg.id, &res.recipients.last().expect("just added").state);
             }
             // The durable outbox now owns remote retries. A lost API response returns this same receipt.
@@ -527,6 +531,8 @@ impl Daemon {
             "queued: delivered within seconds once the session is idle"
         } else if l.reg.agent == "cli" {
             "queued: it gets it the next time it listens"
+        } else if l.reg.agent == "zcode" {
+            "queued: after its next successful tool while working, or when it checks its inbox; no end-of-turn or idle wake-up"
         } else {
             "queued: it sees it at its next tool call or when its turn ends"
         };
@@ -885,7 +891,9 @@ impl Daemon {
                 if g.live.get(&key).is_none_or(|l| l.stop_gen != stop) {
                     return Ok(Inbox { messages: Vec::new(), text: String::new() });
                 }
-                let messages = g.pending(&address)?;
+                // ZCode hooks only lease mail; an explicit inbox read must also recover leased messages immediately.
+                let messages =
+                    if agent.as_deref() == Some("zcode") { g.store.unread(&address)? } else { g.pending(&address)? };
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     let changed = g.store.mark_read(&ids, util::now_ms())?;

@@ -63,7 +63,10 @@ That's it. Ask any agent "who's on the network?", tell it to ask someone's agent
   Remote acceptance does not establish
   agent handoff. Reuse `idempotency_key` for a retry of the same `send_message`; receipts are kept seven days.
 - **ZCode Desktop too.** `setup` adds the MCP server to `~/.zcode/cli/config.json` (or `~/.agents/mcp.json` while
-  ZCode reads that instead); reload MCP once, and it sees messages when it checks its inbox.
+  ZCode reads that instead), plus SessionStart/PostToolUse hooks. Start a new session to load them; messages arrive
+  after successful tools while it works, with at most one automatic retry. Unconfirmed and oversized messages stay
+  available through `check_inbox`. No end-of-turn delivery, idle wake-up or Stop hook. Disabled or unsupported hooks
+  leave MCP installation/removal available; older clients without session metadata keep their process inbox.
 - **Small text files go along.** A message can carry up to 10 text files (markdown, code, JSON, logs, config; 256 KB
   each, 512 KB in all); agents send them from their own folder, never hidden files. The recipient's engine saves copies
   under `~/.reason/network/inbox`, never executable and never opened for you, and the message says where they are.

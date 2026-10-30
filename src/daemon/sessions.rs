@@ -330,6 +330,11 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
+        let limit = if h.agent == "zcode" { crate::hook::zcode::output_limit() } else { 0 };
+        self.hook_with_limit(h, limit).await
+    }
+
+    async fn hook_with_limit(self: &Arc<Self>, h: HookCall, limit: usize) -> Result<HookReply> {
         let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
             h;
         let (agent, event) = (agent.as_str(), event.as_str());
@@ -448,9 +453,27 @@ impl Daemon {
         } else {
             Vec::new()
         };
-        // Not marked read here: the hook confirms with `Delivered` once it has printed them. Until then they are in
-        // flight, so a hook asking at the same moment (opencode 2.x can run two plugin instances) doesn't get them too.
-        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        let (ids, text) = if agent == "zcode" {
+            let prefix: HashSet<String> = crate::hook::zcode::before_oversized(g.store.unread(&address)?, limit)
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            let mut eligible = Vec::new();
+            for message in msgs {
+                if prefix.contains(&message.id) && g.store.zcode_hook_available(&message.id)? {
+                    eligible.push(message);
+                }
+            }
+            let (ids, text) = crate::hook::zcode::batch(eligible, limit);
+            g.store.lease_zcode_hook(&ids)?;
+            (ids, text)
+        } else {
+            let ids = msgs.iter().map(|m| m.id.clone()).collect();
+            let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
+            (ids, text)
+        };
+        // ZCode has at most one automatic retry; unread mail stays available through the explicit inbox.
+        // Until then they are in flight, so simultaneous hooks don't get them too.
         for id in &ids {
             g.in_flight.insert(id.clone(), Instant::now());
         }
@@ -458,7 +481,6 @@ impl Daemon {
         if !ids.is_empty() {
             self.reached(g, &key);
         }
-        let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
         Ok(HookReply { address: Some(address), text, ids })
     }
 
@@ -700,6 +722,66 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 24 * 3_600_000;
+
+    #[tokio::test]
+    async fn zcode_mail_is_injected_at_most_twice_and_remains_recoverable() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = || HookCall { agent: "zcode".into(), ..gemini("bounded", "tool") };
+        let address = d.hook_with_limit(call(), 4096).await.unwrap().address.unwrap();
+        let name = address.split_once('/').unwrap().1;
+        mail(&d, "bounded-mail", name);
+        assert_eq!(d.hook_with_limit(call(), 4096).await.unwrap().ids, ["bounded-mail"]);
+        assert!(d.hook_with_limit(call(), 4096).await.unwrap().ids.is_empty());
+        for attempt in 1..5 {
+            d.inner
+                .lock()
+                .unwrap()
+                .in_flight
+                .insert("bounded-mail".into(), Instant::now() - std::time::Duration::from_secs(91));
+            let injected = d.hook_with_limit(call(), 4096).await.unwrap();
+            assert_eq!(injected.ids.len(), usize::from(attempt == 1));
+            assert_eq!(d.inner.lock().unwrap().store.unread_count(&address).unwrap(), 1);
+        }
+        assert_eq!(d.inbox("zcode:bounded".into(), 0, false).await.unwrap().messages.len(), 1);
+        assert!(d.hook_with_limit(call(), 4096).await.unwrap().text.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_zcode_mail_holds_later_messages_for_the_explicit_inbox() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = || HookCall { agent: "zcode".into(), ..gemini("large", "tool") };
+        let address = d.hook_with_limit(call(), 256).await.unwrap().address.unwrap();
+        let mut large = Message {
+            id: "large".into(),
+            from: "sven/web-codex".into(),
+            to: address.clone(),
+            body: "large body ".repeat(1000),
+            from_agent: None,
+            from_repo: None,
+            via: None,
+            reply_to: None,
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: vec![],
+        };
+        d.inner.lock().unwrap().store.insert(&mut large, false).unwrap();
+        mail(&d, "later", address.split_once('/').unwrap().1);
+        // The full body exceeds the configured cap, which still fits the recovery notice.
+        for n in 0..4 {
+            d.inner.lock().unwrap().in_flight.clear();
+            let r = d.hook_with_limit(call(), 256).await.unwrap();
+            if n < 2 {
+                assert_eq!(r.ids, ["large"]);
+                assert!(r.text.unwrap().contains("check_inbox"));
+            } else {
+                assert!(r.ids.is_empty());
+            }
+        }
+        let inbox = d.inbox("zcode:large".into(), 0, false).await.unwrap();
+        assert_eq!(inbox.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["large", "later"]);
+    }
 
     fn claude(id: &str) -> SessionReg {
         SessionReg {

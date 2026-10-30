@@ -231,7 +231,13 @@ impl ReasonNetworkMcp {
             Err(e) => return Ok(failure(e)),
         };
         let notify = a.notify.unwrap_or(false);
-        let files = match agent_files(&a.files.unwrap_or_default()) {
+        let paths = a.files.unwrap_or_default();
+        let files = match if self.agent(&ctx.peer, Some(&ctx.meta)) == "zcode" {
+            let cwd = agent::zcode_context(&ctx.meta).map_or_else(agent::cwd, |(_, cwd)| cwd);
+            agent_files_in(&paths, &cwd)
+        } else {
+            agent_files(&paths)
+        } {
             Ok(f) => f,
             Err(e) => return Ok(failure(e)),
         };
@@ -290,7 +296,9 @@ impl ReasonNetworkMcp {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
-        let req = Request::Inbox { key: key.clone(), wait_secs: a.wait_secs.unwrap_or(0), peek: true };
+        let wait = a.wait_secs.unwrap_or(0);
+        let wait = if self.agent(&ctx.peer, Some(&ctx.meta)) == "zcode" { wait.min(5) } else { wait };
+        let req = Request::Inbox { key: key.clone(), wait_secs: wait, peek: true };
         let got = tokio::select! {
             r = self.link.call::<Inbox>(req) => r,
             _ = ctx.ct.cancelled() => Ok(Inbox { messages: Vec::new(), text: String::new() }),
@@ -383,6 +391,20 @@ impl ReasonNetworkMcp {
             };
             return found.ok_or_else(|| anyhow::anyhow!("Antigravity conversation is not identified. Pass the session_id from this conversation's Reason Network hook; if absent, reload the configured hooks and start a new invocation."));
         }
+        if agent == "zcode" {
+            // Never guess between two conversations sharing a workspace or inherit another agent's session id.
+            if let Some((id, cwd)) = agent::zcode_context(&ctx.meta) {
+                return self.register_session(agent, Some(id), cwd).await;
+            }
+            // Older clients have no per-call metadata. Keep their process mailbox; never attach them to another chat.
+            if ctx.meta.contains_key("com.zcode/request-context")
+                || ctx.meta.contains_key("workspace_path")
+                || ctx.meta.contains_key("session_id")
+            {
+                anyhow::bail!("ZCode MCP call has incomplete session_id/workspace_path metadata");
+            }
+            return self.register_session(agent, None, agent::cwd()).await;
+        }
         self.session(agent, agent::meta_session_id(&ctx.meta)).await
     }
 
@@ -412,6 +434,13 @@ impl ReasonNetworkMcp {
             // Waited for once per gap: a next conversation that never starts doesn't slow every later call.
             self.hooks_linked.store(id.is_some(), Ordering::Relaxed);
         }
+        self.register_session(agent, id, agent::cwd()).await
+    }
+
+    async fn register_session(&self, agent: &'static str, id: Option<String>, cwd: String) -> Result<String> {
+        if crate::config::Config::load_strict().unwrap_or_default().off_in(&cwd) {
+            anyhow::bail!(OFF_HERE);
+        }
         let key = match &id {
             Some(id) => format!("{agent}:{id}"),
             None => format!("proc:{}", std::process::id()),
@@ -424,7 +453,7 @@ impl ReasonNetworkMcp {
         let reg = SessionReg {
             key: key.clone(),
             agent: agent.to_string(),
-            cwd: agent::cwd(),
+            cwd,
             agent_session_id: id,
             // Claude Code's own process, as its registry names it: the daemon's scan of the registry matches it. None
             // when that isn't known: any other process (a parent's) would get this session ended as that one moves on.
