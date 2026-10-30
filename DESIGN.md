@@ -308,8 +308,10 @@ Agent kind comes from MCP `clientInfo.name` plus env (`CLAUDECODE`, `CODEX_*`, `
 `CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`, `GROK_SESSION_ID`, `REASON_NETWORK_AGENT=cmd`).
 
 **Passive discovery.** Claude Code writes every live session to `~/.claude/sessions/<pid>.json` (name, cwd,
-busy/idle). The daemon reads these, so Claude sessions show up with live busy/idle status even without our
-MCP server loaded. Our MCP server reads the conversation it serves from there too, from the entry of the Claude Code
+busy/idle), or to `$CLAUDE_CONFIG_DIR/sessions/` in another profile. The daemon reads these, so Claude sessions show up
+with live busy/idle status even without our MCP server loaded. It doesn't have a session's environment, so our MCP
+server and hooks note each `CLAUDE_CONFIG_DIR` they run under (`claude-dirs` in the state directory), and the daemon
+reads every profile noted there as well as `~/.claude`. Our MCP server reads the conversation it serves from there too, from the entry of the Claude Code
 process it runs under: the nearest of its ancestors, else `CLAUDE_PID`, whose entry names the conversation it was
 started in (`CLAUDE_CODE_SESSION_ID`), followed from then on. After `/clear` the same process is in a new conversation,
 which the server then serves, and the one before ends: the daemon's scan ends it as soon as the registry names the new

@@ -243,6 +243,35 @@ pub fn claude_sessions() -> PathBuf {
     claude_dir().join("sessions")
 }
 
+/// Every Claude Code directory on this machine: ours, `~/.claude`, and each `CLAUDE_CONFIG_DIR` a session ran under.
+/// The daemon (and a CLI run from another shell) doesn't have the session's environment, so it reads them all.
+pub fn claude_dirs() -> Vec<PathBuf> {
+    let recorded = std::fs::read_to_string(claude_dirs_file()).unwrap_or_default();
+    let mut dirs = vec![claude_dir(), user_home().join(".claude")];
+    dirs.extend(recorded.lines().filter(|l| !l.is_empty()).map(PathBuf::from).filter(|d| d.is_dir()));
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs
+}
+
+/// Notes the `CLAUDE_CONFIG_DIR` we run under, so the daemon finds this profile's sessions too.
+pub fn remember_claude_dir() {
+    let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) else { return };
+    let dir = std::fs::canonicalize(&dir).or_else(|_| std::path::absolute(&dir));
+    let Some(dir) = dir.ok().and_then(|d| d.to_str().map(str::to_string)) else { return };
+    let file = claude_dirs_file();
+    let recorded = std::fs::read_to_string(&file).unwrap_or_default();
+    if dir.contains('\n') || recorded.lines().any(|l| l == dir) || ensure_home().is_err() {
+        return;
+    }
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(file).and_then(|mut f| writeln!(f, "{dir}"));
+}
+
+fn claude_dirs_file() -> PathBuf {
+    home().join("claude-dirs")
+}
+
 /// Only for you: mode 0700 (on Windows, the profile folder already is).
 pub fn ensure_home() -> std::io::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
