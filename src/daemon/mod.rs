@@ -79,6 +79,7 @@ pub async fn run(service: bool) -> Result<()> {
     if crate::managed() {
         tokio::spawn(daemon.clone().relay_loop());
     }
+    tokio::spawn(daemon.clone().notices_loop());
     tokio::spawn(crate::migrate::run(log));
     tokio::spawn(daemon.clone().relays_loop());
     if update::allowed(daemon.cfg.auto_update) {
@@ -168,6 +169,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Some mail kept from before notices doesn't say which machine it came from yet (see `find_sources`).
+    sourceless: bool,
 }
 
 /// A session running on this machine.
@@ -238,7 +241,7 @@ impl Daemon {
             store.get("team")?.and_then(|s| serde_json::from_str(&s).ok()).map(TeamState::without_odd_names);
         // In a team, who we are is what the signed roster says, whatever the config file says.
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
-        Ok(Daemon {
+        let daemon = Daemon {
             usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
             machine: member.map_or_else(util::hostname, |m| m.machine),
@@ -258,6 +261,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                sourceless: false,
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -269,7 +273,11 @@ impl Daemon {
             started: util::now_ms(),
             plain_until: Mutex::new(None),
             capped: Default::default(),
-        })
+        };
+        if let Err(e) = daemon.find_sources(&mut daemon.inner.lock().unwrap()) {
+            log(&format!("finding where mail from before notices came from: {e:#}"));
+        }
+        Ok(daemon)
     }
 
     fn addr(&self, name: &str) -> String {
@@ -491,10 +499,18 @@ impl Daemon {
 
 /// A daemon on an in-memory store, outside any team, with `cfg`.
 #[cfg(test)]
-fn test_daemon(cfg: Config) -> Daemon {
+pub(crate) fn test_daemon(cfg: Config) -> Daemon {
     let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
     let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
     Daemon::with(cfg, store, SecretKey::generate()).unwrap()
+}
+
+#[cfg(test)]
+impl Daemon {
+    /// Its store and its person, for tests outside the daemon.
+    pub(crate) fn with_store<R>(&self, f: impl FnOnce(&Store, &str) -> R) -> R {
+        f(&self.inner.lock().unwrap().store, &self.person)
+    }
 }
 
 #[cfg(test)]

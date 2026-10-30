@@ -1133,17 +1133,22 @@ impl Net {
                 };
                 let _ = tx.send(Wire::Ack { id, state, note });
             }
-            Wire::Ack { id, state, note } => {
-                // "retry": the other side is busy; keep it in the outbox for the next flush.
-                if state != "retry" {
-                    daemon.outbox_done(&id, state != "refused");
-                }
-                if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
-                    let _ = waiter.send((state, note));
-                }
-            }
+            Wire::Ack { id, state, note } => self.acked(&daemon, id, state, note),
         }
         Ok(())
+    }
+
+    /// The receiving machine's answer for a message. The sender saw it if it reached `send_msg` still waiting for it
+    /// (see `Daemon::outbox_done`).
+    fn acked(&self, daemon: &Daemon, id: String, state: String, note: String) {
+        let waiter = self.acks.lock().unwrap().remove(&id);
+        // Handed over before anything waits on the daemon: `send_msg` may give up in the meantime, and then didn't see
+        // it, waiter or not.
+        let seen = waiter.is_some_and(|w| w.send((state.clone(), note)).is_ok());
+        // "retry": the other side is busy; keep it in the outbox for the next flush.
+        if state != "retry" {
+            daemon.outbox_done(&id, state != "refused", seen);
+        }
     }
 }
 
@@ -1475,6 +1480,72 @@ mod tests {
             }
             Some(sock)
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_its_sender_waited_for_makes_no_notice_but_one_after_it_gave_up_does() {
+        let daemon = Arc::new(crate::daemon::test_daemon(Default::default()));
+        let relay = "https://relay.example.com";
+        let net = Net::start(
+            &daemon,
+            bind(SecretKey::generate(), Some(relay), false, None).await.unwrap(),
+            Some(relay),
+            HashMap::new(),
+        );
+        daemon.with_store(|store, person| {
+            let api = crate::store::Remembered {
+                name: "api".into(),
+                key: "codex:api".into(),
+                agent: "codex".into(),
+                cwd: "~".into(),
+                repo: None,
+                branch: None,
+                doing: None,
+                tier: crate::proto::Tier::Pull,
+                last_seen: 0,
+                attached: true,
+                mailbox: false,
+            };
+            store.upsert_session(&api, person).unwrap();
+            for id in ["01SEEN", "01LATE", "01GAVEUP"] {
+                let m = Message {
+                    id: id.into(),
+                    from: format!("{person}/api"),
+                    from_agent: None,
+                    from_repo: None,
+                    to: "sven/web".into(),
+                    via: None,
+                    reply_to: None,
+                    body: "hi".into(),
+                    wake: true,
+                    notify: false,
+                    sent_at: 0,
+                    approval: None,
+                    files: Vec::new(),
+                };
+                store.outbox_add("sven-box", &m, Some("codex:api")).unwrap();
+            }
+        });
+        let refused = |id: &str| net.acked(&daemon, id.into(), "refused".into(), "no".into());
+        // Answered within ACK_TIMEOUT: `send_msg` still waits for it (its waiter is in `acks`), and passes the refusal
+        // on to the sender, which so knows.
+        let (waiter, verdict) = oneshot::channel();
+        net.acks.lock().unwrap().insert("01SEEN".into(), waiter);
+        refused("01SEEN");
+        assert_eq!(verdict.await.unwrap().0, "refused");
+        // Answered after it: `send_msg` has given up and taken its waiter out, so nobody told the sender.
+        refused("01LATE");
+        // Answered as it gave up: its waiter was still in `acks`, but nothing was left to hand the refusal to.
+        let (waiter, gave_up) = oneshot::channel();
+        net.acks.lock().unwrap().insert("01GAVEUP".into(), waiter);
+        drop(gave_up);
+        refused("01GAVEUP");
+        let told = daemon.with_store(|store, _| {
+            assert!(store.outbox_for("sven-box", 0).unwrap().0.is_empty());
+            store.take_notices().into_iter().map(|m| m.reply_to).collect::<Vec<_>>()
+        });
+        assert_eq!(told, [Some("01LATE".to_string()), Some("01GAVEUP".to_string())]);
+        net.shutdown().await;
     }
 
     #[test]

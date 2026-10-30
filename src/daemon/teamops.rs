@@ -130,7 +130,16 @@ impl Daemon {
 
     pub fn save_presence(&self, id: &EndpointId, rem: &Remote) {
         if let Ok(s) = serde_json::to_string(rem) {
-            let _ = self.inner.lock().unwrap().store.set(&format!("presence:{id}"), &s);
+            let mut g = self.inner.lock().unwrap();
+            let _ = g.store.set(&format!("presence:{id}"), &s);
+            // A look, under the lock, on every presence through the unread mail from before notices (by its own index,
+            // not all mail), and the team's presences once: only while some of it is unknown, which it stops being once
+            // read or dropped.
+            if g.sourceless
+                && let Err(e) = self.find_sources(&mut g)
+            {
+                log(&format!("finding where mail from before notices came from: {e:#}"));
+            }
         }
     }
 
@@ -143,8 +152,8 @@ impl Daemon {
         messages
     }
 
-    pub fn outbox_done(&self, id: &str, taken: bool) {
-        if self.inner.lock().unwrap().store.outbox_done(id, taken).unwrap_or(false) {
+    pub fn outbox_done(&self, id: &str, taken: bool, seen: bool) {
+        if self.inner.lock().unwrap().store.outbox_done(id, taken, seen).unwrap_or(false) {
             self.usage.stage(id, if taken { "accepted" } else { "rejected" });
         }
     }

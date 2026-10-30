@@ -1,15 +1,17 @@
 //! SQLite: messages, and the sessions this machine has seen: live ones, ones gone for less than a day, and the
 //! person's own mailboxes (`terminal`, `listen --as` names). Files that came with messages are saved in the inbox folder, one
-//! folder per message, and go with their message.
+//! folder per message, and go with their message. Mail dropped unread tells its sender (see [`notice`]).
 
 use crate::{
     files,
     proto::{Attachment, DayCount, Message, Tier},
+    render, util,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     collections::HashSet,
     path::{Path, PathBuf},
 };
@@ -17,7 +19,12 @@ use std::{
 pub struct Store {
     db: Connection,
     inbox: PathBuf,
+    /// Notices stored for senders here since the daemon last took them, for it to deliver.
+    notices: RefCell<Vec<Message>>,
 }
+
+/// The agent a notice that mail was dropped comes from: Reason Network itself. A message from it never gets a notice.
+pub const NOTICE_AGENT: &str = "reason-network";
 
 /// What the `files` column keeps of a message's files: their folder in the inbox folder, named by an id made here
 /// (never the sender's message id, which a teammate could pick to name another's folder, in another case, or a device
@@ -294,7 +301,27 @@ impl Store {
             // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
             db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
-        Ok(Store { db, inbox })
+        // Added with notices: the teammate's machine a message came from, which its notice goes back to, or empty for
+        // one sent here. Mail kept from before has none (see `sourceless`).
+        if !db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'source'")?.exists([])? {
+            db.execute("ALTER TABLE messages ADD COLUMN source TEXT", [])?;
+        }
+        // Added with them too: the key of the session here that sent a message, or put it in the outbox, so a notice
+        // goes to that conversation and not to a later one under its name. None for others, and for mail from before.
+        for table in ["messages", "outbox"] {
+            if !db
+                .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'sender_key'"))?
+                .exists([])?
+            {
+                db.execute(&format!("ALTER TABLE {table} ADD COLUMN sender_key TEXT"), [])?;
+            }
+        }
+        // What `sourceless` looks through, rather than all mail ever read.
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS messages_sourceless ON messages (id) WHERE source IS NULL AND read_at IS NULL",
+            [],
+        )?;
+        Ok(Store { db, inbox, notices: RefCell::default() })
     }
 
     /// A folder named in the `files` column: only one of the ids made here (a ULID), so always just inside the inbox.
@@ -314,6 +341,20 @@ impl Store {
     /// Stores a message; false if one with this id is already here (a retried delivery). Unless it is held, its files
     /// are saved in a new folder of their own first, and `m` then lists them by path.
     pub fn insert(&self, m: &mut Message, held: bool) -> Result<bool> {
+        self.insert_with(m, held, None, None)
+    }
+
+    /// The same, for a message from a teammate's machine (`source`, its endpoint id; `None`: sent here).
+    pub fn insert_from(&self, m: &mut Message, held: bool, source: Option<&str>) -> Result<bool> {
+        self.insert_with(m, held, source, None)
+    }
+
+    /// The same, for a message a session here sent (`key`, its key).
+    pub fn insert_sent(&self, m: &mut Message, key: &str) -> Result<bool> {
+        self.insert_with(m, false, None, Some(key))
+    }
+
+    fn insert_with(&self, m: &mut Message, held: bool, source: Option<&str>, key: Option<&str>) -> Result<bool> {
         if self.has(&m.id)? {
             return Ok(false);
         }
@@ -330,7 +371,7 @@ impl Store {
         }
         let n = self.db.execute(
             &format!(
-                "INSERT OR IGNORE INTO messages ({MESSAGE_COLS}, held) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                "INSERT OR IGNORE INTO messages ({MESSAGE_COLS}, held, source, sender_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             ),
             params![
                 m.id,
@@ -345,7 +386,9 @@ impl Store {
                 m.sent_at,
                 m.approval.as_ref().map(|a| serde_json::to_string(a).expect("approvals serialize")),
                 kept.as_ref().map(|k| serde_json::to_string(k).expect("files serialize")),
-                held
+                held,
+                source.unwrap_or_default(),
+                key
             ],
         );
         if n.as_ref().is_ok_and(|n| *n == 1) && !held {
@@ -372,6 +415,10 @@ impl Store {
     }
 
     fn observe_reply(&self, message: &Message) -> Result<()> {
+        // A notice names the message it is about as the one it answers, but the mail was dropped, not replied to.
+        if message.from_agent.as_deref() == Some(NOTICE_AGENT) {
+            return Ok(());
+        }
         if let Some(reply) = &message.reply_to {
             self.db.execute("UPDATE sent_receipts SET stage='replied',updated_at=?4 WHERE id=?1 AND recipient=?2 AND sender=?3 AND stage <> 'replied'", params![reply,message.from,message.to,crate::util::now_ms()])?;
         }
@@ -446,8 +493,7 @@ impl Store {
             let fresh = came.is_some_and(|t| t > now - files::KEEP_UNREAD_MS);
             if held {
                 if !fresh {
-                    self.discard_receipt(&id, "expired", now)?;
-                    self.db.execute("DELETE FROM messages WHERE id = ?1", [&id])?;
+                    self.drop_unread(&[id], "expired")?;
                 }
             } else if (read_at.is_none() && fresh) || read_at.is_some_and(|t| t > now - files::KEEP_MS) {
                 if let Some(k) = &kept {
@@ -475,10 +521,7 @@ impl Store {
         let (mut done, mut unsaved) = (Vec::new(), Vec::new());
         for mut m in picked {
             if !release {
-                let transaction = self.db.unchecked_transaction()?;
-                self.discard_receipt(&m.id, "rejected", crate::util::now_ms())?;
-                self.db.execute("DELETE FROM messages WHERE id = ?1", [&m.id])?;
-                transaction.commit()?;
+                self.drop_unread(std::slice::from_ref(&m.id), "rejected")?;
                 done.push(m);
                 continue;
             }
@@ -515,25 +558,35 @@ impl Store {
         Ok((done, unsaved))
     }
 
-    pub fn outbox_add(&self, target: &str, m: &Message) -> Result<()> {
+    /// Queues a message for a teammate's machine; `key`: the session here that sent it, if one did.
+    pub fn outbox_add(&self, target: &str, m: &Message, key: Option<&str>) -> Result<()> {
         self.db.execute(
-            "INSERT OR REPLACE INTO outbox (id, target, msg, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![m.id, target, serde_json::to_string(m)?, m.sent_at],
+            "INSERT OR REPLACE INTO outbox (id, target, msg, created_at, sender_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![m.id, target, serde_json::to_string(m)?, m.sent_at, key],
         )?;
         Ok(())
     }
 
     /// Undelivered messages for a machine; older than a week are given up on.
     pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
-        let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+        let mut st = self.db.prepare_cached("SELECT id FROM outbox WHERE created_at < ?1")?;
+        let old: Vec<String> = st.query_map([now - 7 * 86_400_000], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut expired = 0;
+        for id in old {
+            expired += usize::from(self.drop_outbox(&id, None)?);
+        }
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
         Ok((rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect(), expired))
     }
 
     /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
-    /// (once, however many answers come).
-    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
+    /// (once, however many answers come). One it refused that its sender didn't see refused (`seen`, in the reply to
+    /// sending it) gets a notice. True if it was still in the outbox.
+    pub fn outbox_done(&self, id: &str, taken: bool, seen: bool) -> Result<bool> {
+        if !taken && !seen {
+            return self.drop_outbox(id, Some("rejected"));
+        }
         let transaction = self.db.unchecked_transaction()?;
         let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
         if removed {
@@ -547,6 +600,116 @@ impl Store {
         }
         transaction.commit()?;
         Ok(removed)
+    }
+
+    /// Deletes messages that were never read, and tells their senders: all or none. A receipt for one, kept here if it
+    /// was sent here, says `stage`.
+    fn drop_unread(&self, ids: &[String], stage: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        let mut told = Vec::new();
+        for id in ids {
+            told.extend(self.drop_unread_in(id, stage)?);
+        }
+        tx.commit()?;
+        self.notices.borrow_mut().extend(told);
+        Ok(())
+    }
+
+    /// The same for one, in the caller's transaction: returns the notice stored here, to take once that commits.
+    fn drop_unread_in(&self, id: &str, stage: &str) -> Result<Option<Message>> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .db
+            .query_row("SELECT source, sender_key FROM messages WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let mut told = None;
+        // (Mail from before notices whose machine wasn't found, see `sourceless`, goes without one.)
+        if let (Some((Some(source), key)), Some(m)) = (row, self.message(id)?) {
+            // Mail here is for this machine's person.
+            let person = m.to.split_once('/').map_or(m.to.as_str(), |(p, _)| p);
+            let source = Some(source.as_str()).filter(|s| !s.is_empty());
+            told = self.tell(&m, source, key.as_deref(), person)?;
+        }
+        self.discard_receipt(id, stage, util::now_ms())?;
+        self.db.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+        Ok(told)
+    }
+
+    /// Gives up on a message in the outbox, and tells its sender here: both or neither. Its receipt says `stage`, if
+    /// given. True if it was still there.
+    fn drop_outbox(&self, id: &str, stage: Option<&str>) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let row: Option<(String, Option<String>)> = self
+            .db
+            .query_row("SELECT msg, sender_key FROM outbox WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let mut told = None;
+        if let Some((m, key)) = row
+            && let Ok(m) = serde_json::from_str::<Message>(&m)
+        {
+            let person = m.from.split_once('/').map_or(m.from.as_str(), |(p, _)| p);
+            told = self.tell(&m, None, key.as_deref(), person)?;
+        }
+        let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
+        if removed && let Some(stage) = stage {
+            self.discard_receipt(id, stage, util::now_ms())?;
+        }
+        tx.commit()?;
+        self.notices.borrow_mut().extend(told);
+        Ok(removed)
+    }
+
+    /// Keeps the notice that `m` was dropped on `person`'s machine: in the outbox for the teammate's machine it came
+    /// from (`source`), or, sent here, in its sender's inbox, if the session under its name is still the one that sent
+    /// it (`key`) and could come back. Returns that one.
+    fn tell(&self, m: &Message, source: Option<&str>, key: Option<&str>, person: &str) -> Result<Option<Message>> {
+        let Some(mut n) = notice(m, &format!("{person}/terminal"), util::now_ms()) else { return Ok(None) };
+        if let Some(machine) = source {
+            // That machine knows its terminal without its own name on it. It goes to whichever session has the name
+            // there when it arrives: which conversation sent the mail isn't said between machines, and saying it
+            // would change what they send each other.
+            n.to = render::without_machine(&n.to).to_string();
+            self.outbox_add(machine, &n, None)?;
+            return Ok(None);
+        }
+        // A sender here has an address without a machine on it. A later conversation under the name isn't told:
+        // the mail and its first line were another's. Nor one known only by its process (see `Remembered::kept`): a
+        // later process given the same id would pass for it.
+        let here = n.to.split_once('/').filter(|(p, name)| *p == person && !name.contains('@')).map(|(_, name)| name);
+        if let (Some(name), Some(key)) = (here, key)
+            && self.session_by_name(name)?.is_some_and(|s| s.key == key && s.kept())
+            && self.insert(&mut n, false)?
+        {
+            return Ok(Some(n));
+        }
+        Ok(None)
+    }
+
+    /// Unread and held mail kept from before notices, which doesn't say which machine it came from: ids and senders.
+    /// Through an index of just those, as it is looked for on every presence while there are some.
+    pub fn sourceless(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self.db.prepare_cached(
+            "SELECT id, sender FROM messages INDEXED BY messages_sourceless
+             WHERE source IS NULL AND read_at IS NULL ORDER BY rowid",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Where messages came from, found later (see `insert_from`): ids, sources, and for those sent here the key of the
+    /// session that did (see `insert_sent`). In one go.
+    pub fn set_sources(&self, found: &[(String, String, Option<String>)]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for (id, source, key) in found {
+            self.db
+                .execute("UPDATE messages SET source = ?2, sender_key = ?3 WHERE id = ?1", params![id, source, key])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The notices stored for senders here since the last call.
+    pub fn take_notices(&self) -> Vec<Message> {
+        self.notices.take()
     }
 
     /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
@@ -701,13 +864,17 @@ impl Store {
         };
         let name = r.name.as_str();
         let to = format!("{person}/{name}");
-        let mut cols = self.db.prepare_cached(&format!("SELECT files {unread} AND files IS NOT NULL"))?;
-        let cols: Vec<String> = cols.query_map([&to], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        self.db.execute(&format!("UPDATE sent_receipts SET stage='expired',updated_at=?2 WHERE id IN (SELECT id {unread}) AND stage NOT IN ('handed_to_agent','replied')"),params![to,crate::util::now_ms()])?;
-        self.db.execute(&format!("DELETE {unread}"), [&to])?;
+        let mut st = self.db.prepare_cached(&format!("SELECT id, files {unread}"))?;
+        let rows: Vec<(String, Option<String>)> =
+            st.query_map([&to], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut told = Vec::new();
+        for (id, _) in &rows {
+            told.extend(self.drop_unread_in(id, "expired")?);
+        }
         self.db.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
         transaction.commit()?;
-        for kept in cols.iter().filter_map(|c| serde_json::from_str::<Kept>(c).ok()) {
+        self.notices.borrow_mut().extend(told);
+        for kept in rows.iter().filter_map(|(_, c)| serde_json::from_str::<Kept>(c.as_deref()?).ok()) {
             if let Some(dir) = self.dir(&kept) {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -770,6 +937,40 @@ impl Store {
         };
         message(r).map(|m| Message { files, ..m })
     }
+}
+
+/// The notice to `m`'s sender, from `from`, that it was dropped unread: who it was for, when it was sent, and its first
+/// line, to tell which it was. An ordinary message, which an engine from before notices shows like any other. None for
+/// a notice: a dropped one never makes another.
+pub fn notice(m: &Message, from: &str, now: i64) -> Option<Message> {
+    // Only to stop a loop of notices. Anyone can put this in a message (a teammate's machine passes its agent on as
+    // it says), so nothing may be granted or trusted on it.
+    if m.from_agent.as_deref() == Some(NOTICE_AGENT) {
+        return None;
+    }
+    // Its first line with something on it; none, for a message of blank lines.
+    let first = m.body.lines().map(|l| util::one_line(l, 100)).find(|l| !l.is_empty());
+    let quoted = first.map_or_else(String::new, |f| format!(": \"{f}\""));
+    Some(Message {
+        id: ulid::Ulid::generate().to_string(),
+        from: from.to_string(),
+        from_agent: Some(NOTICE_AGENT.into()),
+        from_repo: None,
+        // As it shows here, a teammate's terminal with its machine, until it is known where the notice goes.
+        to: m.from.clone(),
+        via: None,
+        reply_to: Some(m.id.clone()),
+        body: format!(
+            "Not delivered: your message to {} (sent {}) was dropped unread{quoted}",
+            render::without_machine(&m.to),
+            util::utc(m.sent_at)
+        ),
+        wake: m.wake,
+        notify: false,
+        sent_at: now,
+        approval: None,
+        files: Vec::new(),
+    })
 }
 
 fn message(r: &Row) -> rusqlite::Result<Message> {
@@ -910,11 +1111,11 @@ mod tests {
         // Sent: once the other machine takes it (answered twice, after a lost answer), not when it refuses it or it
         // expires in the outbox.
         for id in ["01TAKEN", "01REFUSED", "01EXPIRED"] {
-            store.outbox_add("peer", &with_files(id, "sven/api")).unwrap();
+            store.outbox_add("peer", &with_files(id, "sven/api"), None).unwrap();
         }
-        store.outbox_done("01TAKEN", true).unwrap();
-        store.outbox_done("01TAKEN", true).unwrap();
-        store.outbox_done("01REFUSED", false).unwrap();
+        store.outbox_done("01TAKEN", true, true).unwrap();
+        store.outbox_done("01TAKEN", true, false).unwrap();
+        store.outbox_done("01REFUSED", false, true).unwrap();
         assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().0.is_empty());
         assert_eq!(totals(&store), (1, 0));
         // Received: held, it counts once approved. Dropped, then sent again after a lost answer, it counts once.
@@ -1056,13 +1257,13 @@ mod tests {
         let mut outgoing = message("refused", "bob/terminal");
         outgoing.sent_at = crate::util::now_ms();
         store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
-        store.outbox_add("peer", &outgoing).unwrap();
-        store.outbox_done("refused", false).unwrap();
+        store.outbox_add("peer", &outgoing, None).unwrap();
+        store.outbox_done("refused", false, true).unwrap();
         assert_eq!(store.delivery_status("sender", &["refused".into()]).unwrap()[0]["stage"], "rejected");
         outgoing.id = "accepted".into();
         store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
-        store.outbox_add("peer", &outgoing).unwrap();
-        store.outbox_done("accepted", true).unwrap();
+        store.outbox_add("peer", &outgoing, None).unwrap();
+        store.outbox_done("accepted", true, true).unwrap();
         let stage = || store.delivery_status("sender", &["accepted".into()]).unwrap()[0]["stage"].clone();
         let mut reply = message("wrong-machine", &outgoing.from);
         reply.from = "bob/terminal@desktop".into();
@@ -1076,6 +1277,19 @@ mod tests {
         store.settle_held(&[reply.id], true).unwrap();
         assert_eq!(stage(), "replied");
         assert_eq!(store.delivery_status("other-session", &["accepted".into()]).unwrap()[0]["stage"], "unknown");
+    }
+
+    #[test]
+    fn a_notice_for_a_message_is_not_taken_for_its_reply() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let mut outgoing = message("01SENT", "bob/terminal");
+        outgoing.sent_at = crate::util::now_ms();
+        store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+        // Held on bob's machine and turned down there: the notice comes back from that machine's terminal.
+        let mut n = notice(&outgoing, "bob/terminal", crate::util::now_ms()).unwrap();
+        n.from = "bob/terminal@laptop".into();
+        store.insert(&mut n, false).unwrap();
+        assert_eq!(store.delivery_status("sender", &["01SENT".into()]).unwrap()[0]["stage"], "queued");
     }
 
     #[test]
@@ -1140,6 +1354,203 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_says_who_a_dropped_message_was_for_when_it_was_sent_and_its_first_line() {
+        let m = Message {
+            from: "sven/terminal@desktop".into(),
+            body: "  please   rebase\non main".into(),
+            sent_at: 1_793_243_096_000,
+            wake: true,
+            ..message("01DROPPED", "lars/api")
+        };
+        let n = notice(&m, "lars/terminal", 5).unwrap();
+        assert_eq!(
+            n.body,
+            "Not delivered: your message to lars/api (sent 2026-10-29 03:04 UTC) was dropped unread: \"please rebase\""
+        );
+        // To the sender as it shows here, from Reason Network, as an answer to the message it names.
+        assert_eq!((n.from.as_str(), n.to.as_str()), ("lars/terminal", "sven/terminal@desktop"));
+        assert_eq!((n.from_agent.as_deref(), n.reply_to.as_deref()), (Some(NOTICE_AGENT), Some("01DROPPED")));
+        assert!(n.wake && !n.notify && n.files.is_empty() && n.approval.is_none() && n.sent_at == 5);
+        assert!(ulid::Ulid::from_string(&n.id).is_ok());
+        // A first line with nothing on it isn't quoted, but the first that has something; a blank message has none.
+        let body = |body: &str| notice(&Message { body: body.into(), ..m.clone() }, "lars/terminal", 5).unwrap().body;
+        assert!(body("\n \t\n  the plan\nmore").ends_with("dropped unread: \"the plan\""), "{}", body("\nthe plan"));
+        assert!(body(" \n").ends_with("(sent 2026-10-29 03:04 UTC) was dropped unread"), "{}", body(" \n"));
+        // An FYI makes an FYI notice; a notice makes none.
+        assert!(!notice(&Message { wake: false, ..m }, "lars/terminal", 5).unwrap().wake);
+        assert!(notice(&n, "sven/terminal", 6).is_none());
+    }
+
+    #[test]
+    fn mail_dropped_unread_tells_its_sender_once_wherever_it_is() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = |name: &str| Remembered {
+            name: name.into(),
+            key: format!("codex:{name}"),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        for name in ["gone", "api"] {
+            store.upsert_session(&session(name), "lars").unwrap();
+        }
+        let notices = |store: &Store, target: &str| -> Vec<String> {
+            store.outbox_for(target, 0).unwrap().0.into_iter().filter_map(|m| m.reply_to).collect()
+        };
+        // From a teammate's machine: the notice waits in the outbox for that machine.
+        store.insert_from(&mut message("01REMOTE", "lars/gone"), false, Some("peer")).unwrap();
+        // From a session here: it goes to that session's inbox, for the daemon to deliver.
+        store
+            .insert_sent(&mut Message { from: "lars/api".into(), ..message("01LOCAL", "lars/gone") }, "codex:api")
+            .unwrap();
+        // From before notices, its machine named later (see `sourceless`): back to it, as that machine knows its
+        // terminal. One whose machine wasn't found goes without a notice.
+        for id in ["01OLD", "01LOST"] {
+            let m = Message { from: "sven/terminal@desktop".into(), ..message(id, "lars/gone") };
+            store.insert(&mut m.clone(), false).unwrap();
+            store.db.execute("UPDATE messages SET source = NULL WHERE id = ?1", [id]).unwrap();
+        }
+        let old: Vec<String> =
+            store.sourceless().unwrap().into_iter().map(|(id, from)| format!("{id} {from}")).collect();
+        assert_eq!(old, ["01OLD sven/terminal@desktop", "01LOST sven/terminal@desktop"]);
+        store.set_sources(&[("01OLD".into(), "peer".into(), None)]).unwrap();
+        store.forget_session(&session("gone"), "lars").unwrap();
+        assert_eq!(notices(&store, "peer"), ["01REMOTE", "01OLD"]);
+        assert!(
+            store.outbox_for("peer", 0).unwrap().0.iter().all(|n| n.to == "sven/claude" || n.to == "sven/terminal")
+        );
+        let here: Vec<Message> = store.take_notices();
+        assert_eq!(here.iter().map(|m| m.reply_to.as_deref()).collect::<Vec<_>>(), [Some("01LOCAL")]);
+        assert_eq!(store.unread("lars/api").unwrap()[0].id, here[0].id);
+        assert!(store.take_notices().is_empty());
+        // Held and turned down: the same.
+        store.insert_from(&mut message("01HELD", "lars/api"), true, Some("peer")).unwrap();
+        store.settle_held(&["01HELD".into()], false).unwrap();
+        assert_eq!(notices(&store, "peer"), ["01REMOTE", "01OLD", "01HELD"]);
+        // Sent from here: refused once it was queued, or expired, the sender gets a notice; refused in the reply to
+        // sending it, it already knows.
+        for id in ["01REFUSED", "01SEEN", "01EXPIRED"] {
+            let m = Message { from: "lars/api".into(), ..message(id, "sven/web") };
+            store.outbox_add("sven-box", &m, Some("codex:api")).unwrap();
+        }
+        store.outbox_done("01REFUSED", false, false).unwrap();
+        store.outbox_done("01SEEN", false, true).unwrap();
+        assert!(store.outbox_for("sven-box", 8 * 86_400_000).unwrap().0.is_empty());
+        let told: Vec<Option<String>> = store.take_notices().into_iter().map(|m| m.reply_to).collect();
+        assert_eq!(told, [Some("01REFUSED".into()), Some("01EXPIRED".into())]);
+        // A notice dropped in turn makes no other: neither expired in the outbox nor forgotten unread.
+        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().0.is_empty());
+        store.forget_session(&session("api"), "lars").unwrap();
+        assert!(store.take_notices().is_empty());
+        assert!(
+            store.outbox_for("peer", 0).unwrap().0.is_empty() && store.outbox_for("sven-box", 0).unwrap().0.is_empty()
+        );
+    }
+
+    #[test]
+    fn a_drop_whose_notice_cant_be_kept_keeps_its_message_and_changes_nothing() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = Remembered {
+            name: "api".into(),
+            key: "codex:api".into(),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&session, "lars").unwrap();
+        let rows = |table: &str| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut st = store.db.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+            let n = st.column_count();
+            let rows = st.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let noticed = |id: &str| -> (bool, bool) {
+            let here = store.db.prepare("SELECT 1 FROM messages WHERE reply_to = ?1").unwrap().exists([id]).unwrap();
+            let mut st = store.db.prepare("SELECT msg FROM outbox").unwrap();
+            let msgs = st.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            let queued = msgs
+                .map(|m| serde_json::from_str::<Message>(&m.unwrap()).unwrap())
+                .any(|m| m.reply_to.as_deref() == Some(id));
+            (here, queued)
+        };
+        // Mail from a teammate's machine (its notice goes to the outbox), mail from a session here (to its inbox), and
+        // mail sent from here (from the outbox, its notice to the sender's inbox); with others left alone beside them.
+        store.insert_from(&mut message("01REMOTE", "lars/gone"), false, Some("peer")).unwrap();
+        store
+            .insert_sent(&mut Message { from: "lars/api".into(), ..message("01LOCAL", "lars/gone") }, "codex:api")
+            .unwrap();
+        store
+            .outbox_add(
+                "sven-box",
+                &Message { from: "lars/api".into(), ..message("01SENT", "sven/web") },
+                Some("codex:api"),
+            )
+            .unwrap();
+        store.insert_from(&mut message("01OTHER", "lars/gone"), false, Some("peer")).unwrap();
+        store
+            .outbox_add(
+                "sven-box",
+                &Message { from: "lars/api".into(), ..message("01QUEUED", "sven/web") },
+                Some("codex:api"),
+            )
+            .unwrap();
+        type Drop = fn(&Store, &str) -> Result<()>;
+        let cases: [(&str, Drop, &str); 3] = [
+            ("01REMOTE", |s, id| s.drop_unread(&[id.into()], "expired"), "outbox"),
+            ("01LOCAL", |s, id| s.drop_unread(&[id.into()], "expired"), "messages"),
+            ("01SENT", |s, id| s.drop_outbox(id, None).map(|_| ()), "messages"),
+        ];
+        for (id, drop, noticed_in) in cases {
+            // The notice is written, then fails: only the drop writes to that table, and only its notice. Only the
+            // drop's transaction can take that row back (FAIL keeps what the statement did).
+            store
+                .db
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER fail AFTER INSERT ON {noticed_in} BEGIN SELECT RAISE(FAIL, 'injected'); END"
+                ))
+                .unwrap();
+            let before = (rows("messages"), rows("outbox"));
+            let err = drop(&store, id).unwrap_err();
+            assert!(err.to_string().contains("injected"), "{id}: {err}");
+            assert_eq!((rows("messages"), rows("outbox")), before, "{id}");
+            let (unread, queued) = (
+                store.db.prepare("SELECT 1 FROM messages WHERE id = ?1 AND read_at IS NULL").unwrap().exists([id]),
+                store.db.prepare("SELECT 1 FROM outbox WHERE id = ?1").unwrap().exists([id]),
+            );
+            assert!(if id == "01SENT" { queued.unwrap() } else { unread.unwrap() }, "{id} is gone");
+            assert_eq!(noticed(id), (false, false), "{id}");
+            assert!(store.take_notices().is_empty(), "{id}");
+            // Without the failure, the same drop goes through: the message goes, and its notice is kept.
+            store.db.execute_batch("DROP TRIGGER fail").unwrap();
+            drop(&store, id).unwrap();
+            assert!(
+                !store.has(id).unwrap()
+                    && !store.db.prepare("SELECT 1 FROM outbox WHERE id = ?1").unwrap().exists([id]).unwrap()
+            );
+            assert_eq!(noticed(id), (noticed_in == "messages", noticed_in == "outbox"), "{id}");
+            let told: Vec<Option<String>> = store.take_notices().into_iter().map(|m| m.reply_to).collect();
+            assert_eq!(told, if noticed_in == "messages" { vec![Some(id.to_string())] } else { vec![] }, "{id}");
+        }
+        assert!(store.has("01OTHER").unwrap());
+        assert_eq!(
+            store.outbox_for("sven-box", 0).unwrap().0.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["01QUEUED"]
+        );
+    }
+
+    #[test]
     fn a_store_from_before_keeps_the_persons_mailboxes_but_not_the_clis_ask_sessions() {
         let dir = std::env::temp_dir().join(format!("reason-network-mailbox-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1181,7 +1592,7 @@ mod tests {
         for (id, body) in [("01M5Z", "do X"), ("01M5A", "never mind X")] {
             store.insert(&mut msg(id, body), false).unwrap();
             store.insert(&mut msg(&format!("{id}H"), body), true).unwrap();
-            store.outbox_add("peer", &msg(id, body)).unwrap();
+            store.outbox_add("peer", &msg(id, body), None).unwrap();
         }
         let bodies = |ms: Vec<Message>| ms.into_iter().map(|m| m.body).collect::<Vec<_>>();
         assert_eq!(bodies(store.unread("lars/api").unwrap()), ["do X", "never mind X"]);
@@ -1393,5 +1804,93 @@ mod tests {
         assert!(store.held().unwrap().is_empty());
         assert_eq!(store.files_kept().unwrap(), 0);
         std::fs::remove_dir_all(&inbox).unwrap();
+    }
+
+    fn conversation(name: &str, key: &str) -> Remembered {
+        Remembered {
+            name: name.into(),
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        }
+    }
+
+    #[test]
+    fn a_notice_goes_to_the_conversation_that_sent_the_mail_not_a_later_one_under_its_name() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        for (name, key) in [("api", "codex:old"), ("web", "codex:web"), ("gone", "codex:gone")] {
+            store.upsert_session(&conversation(name, key), "lars").unwrap();
+        }
+        // lars/api and lars/web each queue mail for a teammate, and leave mail here for a session that goes.
+        for (name, key) in [("api", "codex:old"), ("web", "codex:web")] {
+            let from = format!("lars/{name}");
+            let out = Message { from: from.clone(), ..message(&format!("01OUT-{name}"), "sven/web") };
+            store.outbox_add("sven-box", &out, Some(key)).unwrap();
+            store.insert_sent(&mut Message { from, ..message(&format!("01IN-{name}"), "lars/gone") }, key).unwrap();
+        }
+        // Queued before sessions' keys were kept: which conversation sent it isn't known.
+        let before = Message { from: "lars/web".into(), ..message("01OUT-BEFORE", "sven/web") };
+        store.outbox_add("sven-box", &before, None).unwrap();
+        // api's conversation is forgotten, and a new one takes the name.
+        store.forget_session(&conversation("api", "codex:old"), "lars").unwrap();
+        store.upsert_session(&conversation("api", "codex:new"), "lars").unwrap();
+        // The outbox gives up a week on, and the session the mail here was for is forgotten: only web is told.
+        assert!(store.outbox_for("sven-box", util::now_ms() + 8 * 86_400_000).unwrap().0.is_empty());
+        store.forget_session(&conversation("gone", "codex:gone"), "lars").unwrap();
+        let told: Vec<(String, Option<String>)> =
+            store.take_notices().into_iter().map(|m| (m.to, m.reply_to)).collect();
+        let web = |id: &str| ("lars/web".to_string(), Some(id.to_string()));
+        assert_eq!(told, [web("01OUT-web"), web("01IN-web")]);
+        assert!(store.unread("lars/api").unwrap().is_empty());
+        assert_eq!(store.unread("lars/web").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_session_known_only_by_its_process_is_not_told_as_a_later_one_could_have_its_id() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        // An MCP client with no session id of its own (Zed's) is known by its process, and leaves mail for a session
+        // that goes.
+        for (name, key) in [("api", "proc:111"), ("gone", "codex:gone")] {
+            store.upsert_session(&conversation(name, key), "lars").unwrap();
+        }
+        let mut m = Message { from: "lars/api".into(), ..message("01PROC", "lars/gone") };
+        store.insert_sent(&mut m, "proc:111").unwrap();
+        // Its key could come back on another process (and nothing says it hasn't): its notice isn't kept under the
+        // name, for whichever process takes it next to read.
+        store.forget_session(&conversation("gone", "codex:gone"), "lars").unwrap();
+        assert!(store.take_notices().is_empty());
+        store.upsert_session(&conversation("api", "proc:222"), "lars").unwrap();
+        assert!(store.unread("lars/api").unwrap().is_empty());
+    }
+
+    #[test]
+    fn held_mail_that_expires_unapproved_tells_its_sender() {
+        let inbox = temp_inbox();
+        let store = Store::open(Path::new(":memory:"), inbox.clone()).unwrap();
+        store.insert_from(&mut with_files("01HELD", "lars/api"), true, Some("peer")).unwrap();
+        let now = util::now_ms();
+        store.sweep_files(now).unwrap();
+        assert_eq!(store.held().unwrap().len(), 1);
+        assert!(store.outbox_for("peer", 0).unwrap().0.is_empty());
+        // A week on, unapproved, it goes with its files: its sender's machine gets the notice.
+        store.sweep_files(now + files::KEEP_UNREAD_MS + 1).unwrap();
+        assert!(store.held().unwrap().is_empty() && !store.has("01HELD").unwrap());
+        let told = store.outbox_for("peer", 0).unwrap().0;
+        assert_eq!(
+            told.iter().map(|m| (m.to.as_str(), m.reply_to.as_deref())).collect::<Vec<_>>(),
+            [("sven/claude", Some("01HELD"))]
+        );
+        assert!(
+            told[0].body.starts_with("Not delivered: your message to lars/api ")
+                && told[0].body.ends_with(": \"see the files\"")
+        );
+        let _ = std::fs::remove_dir_all(&inbox);
     }
 }

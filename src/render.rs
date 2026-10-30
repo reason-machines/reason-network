@@ -296,7 +296,9 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
     let Some(last) = msgs.last() else { return out };
     // Every message comes from an agent session (`person/session`).
     let person = last.from.split_once('/').map_or(last.from.as_str(), |(p, _)| p);
-    let who = if from_terminal(&last.from) {
+    let who = if last.from_agent.as_deref() == Some(crate::store::NOTICE_AGENT) {
+        format!("From Reason Network on {person}'s machine.")
+    } else if from_terminal(&last.from) {
         format!("From {person}, typed in a terminal.")
     } else {
         format!("From {person}'s agent.")
