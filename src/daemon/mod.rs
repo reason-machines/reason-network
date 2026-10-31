@@ -437,6 +437,7 @@ impl Daemon {
             Request::Leave { force } => json!(self.leave(force).await?),
             Request::SetRelay { url } => json!(self.set_relay(url).await?),
             Request::Held => json!(self.inner.lock().unwrap().store.held()?),
+            Request::Transcript { after, limit } => self.inner.lock().unwrap().store.transcript(after, limit)?,
             Request::Settle { ids, release } => json!(self.settle(&ids, release)?),
             Request::Shutdown => {
                 self.restart_soon();

@@ -44,6 +44,10 @@ const COUNTS_TO: &str = "+1 day";
 /// doesn't push out the real ones.
 const COUNTS_KEPT: i64 = 8;
 const RECEIPT_KEEP_MS: i64 = 7 * 86_400_000;
+/// The transcript keeps a week, as Reason does, and at most this many characters of a body.
+const TRANSCRIPT_KEEP_MS: i64 = 7 * 86_400_000;
+const TRANSCRIPT_BODY_CHARS: usize = 60_000;
+const TRANSCRIPT_PAGE_MAX: u32 = 500;
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
@@ -128,6 +132,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     mailbox INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
+CREATE TABLE IF NOT EXISTS transcript (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    sender_agent TEXT,
+    sender_repo TEXT,
+    recipient TEXT NOT NULL,
+    reply_to TEXT,
+    body TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    UNIQUE (id, direction)
+);
 CREATE TABLE IF NOT EXISTS counts (
     day TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0,
@@ -154,6 +171,50 @@ impl Store {
         )?;
         Ok(())
     }
+    /// A message one of this computer's sessions sent, for the transcript.
+    pub fn record_out(&self, message: &Message) -> Result<()> {
+        self.note(message, "out")
+    }
+
+    /// Keeps a message in the transcript, once per direction (a message between two sessions here is both). It never
+    /// stops a message: callers ignore its errors.
+    fn note(&self, m: &Message, direction: &str) -> Result<()> {
+        self.db.execute("DELETE FROM transcript WHERE sent_at < ?1", [crate::util::now_ms() - TRANSCRIPT_KEEP_MS])?;
+        let body: String = m.body.chars().take(TRANSCRIPT_BODY_CHARS).collect();
+        self.db.execute(
+            "INSERT OR IGNORE INTO transcript (id, direction, sender, sender_agent, sender_repo, recipient, reply_to, body, sent_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![m.id, direction, m.from, m.from_agent, m.from_repo, m.to, m.reply_to, body, m.sent_at],
+        )?;
+        Ok(())
+    }
+
+    /// The transcript after the cursor `after`, oldest first, and the cursor to ask from next.
+    pub fn transcript(&self, after: i64, limit: u32) -> Result<serde_json::Value> {
+        let mut st = self.db.prepare_cached(
+            "SELECT seq, id, direction, sender, sender_agent, sender_repo, recipient, reply_to, body, sent_at
+             FROM transcript WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+        )?;
+        let entries: Vec<serde_json::Value> = st
+            .query_map(params![after, limit.clamp(1, TRANSCRIPT_PAGE_MAX)], |r| {
+                Ok(serde_json::json!({
+                    "seq": r.get::<_, i64>(0)?,
+                    "id": r.get::<_, String>(1)?,
+                    "direction": r.get::<_, String>(2)?,
+                    "from": r.get::<_, String>(3)?,
+                    "from_agent": r.get::<_, Option<String>>(4)?,
+                    "from_repo": r.get::<_, Option<String>>(5)?,
+                    "to": r.get::<_, String>(6)?,
+                    "reply_to": r.get::<_, Option<String>>(7)?,
+                    "body": r.get::<_, String>(8)?,
+                    "sent_at": r.get::<_, i64>(9)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let next = entries.last().and_then(|e| e["seq"].as_i64()).unwrap_or(after);
+        Ok(serde_json::json!({ "entries": entries, "next": next }))
+    }
+
     pub fn handoff(&self, ids: &[String], now: i64) -> Result<()> {
         for id in ids {
             self.db.execute(
@@ -350,6 +411,7 @@ impl Store {
         );
         if n.as_ref().is_ok_and(|n| *n == 1) && !held {
             let _ = self.observe_reply(m);
+            let _ = self.note(m, "in");
         }
         match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
@@ -510,6 +572,7 @@ impl Store {
             }
             let _ = self.count(crate::util::now_ms(), Counted::Received);
             let _ = self.observe_reply(&m);
+            let _ = self.note(&m, "in");
             done.push(m);
         }
         Ok((done, unsaved))
@@ -1030,6 +1093,73 @@ mod tests {
         let names: Vec<String> = store.sessions().unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["auth"]);
         assert_eq!(store.unread_count("lars/auth").unwrap(), 2);
+    }
+
+    fn transcript_ids(store: &Store) -> Vec<(String, String)> {
+        let page = store.transcript(0, 500).unwrap();
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["id"].as_str().unwrap().into(), e["direction"].as_str().unwrap().into()))
+            .collect()
+    }
+
+    #[test]
+    fn the_transcript_keeps_what_came_and_went_once_and_only_once_approved() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        let mut came = message("01IN", "lars/api");
+        came.sent_at = now;
+        store.insert(&mut came, false).unwrap();
+        store.insert(&mut came, false).unwrap();
+        let (mut kept, mut dropped) = (message("01KEPT", "lars/api"), message("01DROP", "lars/api"));
+        kept.sent_at = now;
+        dropped.sent_at = now;
+        store.insert(&mut kept, true).unwrap();
+        store.insert(&mut dropped, true).unwrap();
+        assert_eq!(transcript_ids(&store), [("01IN".into(), "in".into())]);
+        store.settle_held(&["01DROP".into()], false).unwrap();
+        store.settle_held(&["01KEPT".into()], true).unwrap();
+        let mut went = message("01OUT", "bob/terminal");
+        went.sent_at = now;
+        store.record_out(&went).unwrap();
+        store.record_out(&went).unwrap();
+        // Between two sessions here a message is both sent and received.
+        store.insert(&mut went, false).unwrap();
+        assert_eq!(
+            transcript_ids(&store),
+            [
+                ("01IN".into(), "in".into()),
+                ("01KEPT".into(), "in".into()),
+                ("01OUT".into(), "out".into()),
+                ("01OUT".into(), "in".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_transcript_pages_by_cursor_cuts_long_bodies_and_forgets_after_a_week() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        let mut old = message("01OLD", "lars/api");
+        old.sent_at = now - TRANSCRIPT_KEEP_MS - 1;
+        store.record_out(&old).unwrap();
+        for id in ["01A", "01B", "01C"] {
+            let mut m = message(id, "lars/api");
+            m.sent_at = now;
+            m.body = "é".repeat(TRANSCRIPT_BODY_CHARS + 5);
+            store.record_out(&m).unwrap();
+        }
+        let first = store.transcript(0, 2).unwrap();
+        let entries = first["entries"].as_array().unwrap();
+        assert_eq!(entries.iter().map(|e| e["id"].as_str().unwrap()).collect::<Vec<_>>(), ["01A", "01B"]);
+        assert_eq!(entries[0]["body"].as_str().unwrap().chars().count(), TRANSCRIPT_BODY_CHARS);
+        let rest = store.transcript(first["next"].as_i64().unwrap(), 2).unwrap();
+        assert_eq!(rest["entries"].as_array().unwrap().len(), 1);
+        let end = store.transcript(rest["next"].as_i64().unwrap(), 2).unwrap();
+        assert!(end["entries"].as_array().unwrap().is_empty());
+        assert_eq!(end["next"], rest["next"]);
     }
 
     fn message(id: &str, to: &str) -> Message {

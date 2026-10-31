@@ -249,11 +249,23 @@ pub enum Request {
         ids: Vec<String>,
         release: bool,
     },
+    /// What this computer's sessions sent and received, after the cursor `after`: for the Reason CLI to show a person
+    /// their own agents' conversations, when they turned that on.
+    Transcript {
+        #[serde(default)]
+        after: i64,
+        #[serde(default = "transcript_limit")]
+        limit: u32,
+    },
     Shutdown,
 }
 
 fn day() -> u64 {
     24
+}
+
+fn transcript_limit() -> u32 {
+    200
 }
 
 fn yes() -> bool {
