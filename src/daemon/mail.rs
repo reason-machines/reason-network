@@ -408,6 +408,9 @@ impl Daemon {
                 if notify && here && state != "refused" {
                     note = format!("{note}; {}", self.notify(&msg).1);
                 }
+                if state != "refused" {
+                    let _ = g.store.record_out(&msg);
+                }
                 res.recipients.push(Recipient { address: shown, state, note });
                 let _ = g.store.send_outcome(&msg.id, &res.recipients.last().expect("just added").state);
             }
