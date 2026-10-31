@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS transcript (
     sent_at INTEGER NOT NULL,
     UNIQUE (id, direction)
 );
+-- The week's end is found by this, not a scan, on every message kept.
+CREATE INDEX IF NOT EXISTS transcript_sent_at ON transcript (sent_at);
 CREATE TABLE IF NOT EXISTS counts (
     day TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0,
