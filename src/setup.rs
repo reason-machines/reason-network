@@ -1246,8 +1246,12 @@ fn contains(text: &str, needle: &str) -> bool {
 }
 
 fn same_path(text: &str, path: &Path) -> bool {
-    let path = path.display().to_string();
-    if cfg!(windows) { text.to_lowercase() == path.to_lowercase() } else { text == path }
+    same_text(text, &path.display().to_string())
+}
+
+/// Whether two strings are the same, ignoring case on Windows, for text that holds a path (a command line).
+fn same_text(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.to_lowercase() == b.to_lowercase() } else { a == b }
 }
 
 fn has(path: PathBuf, needle: &str) -> bool {
