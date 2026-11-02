@@ -45,7 +45,7 @@ fn servers(v: &mut Value, native: bool) -> Result<&mut Map<String, Value>> {
 }
 
 fn apply_in(home: &Path, exe: &Path, remove: bool, dry: bool) -> Result<Report> {
-    let mut r = Report { agent: "ZCode Desktop", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "ZCode Desktop", ..Default::default() };
     let [native, fallback] = files(home);
     // Our own entry doesn't count: ZCode should go on reading `.agents` when ours is all its own file has.
     let to_fallback = !remove
@@ -73,7 +73,7 @@ fn apply_in(home: &Path, exe: &Path, remove: bool, dry: bool) -> Result<Report> 
                 json!({ "type": "stdio", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "zcode" } }),
             );
         }
-        r.lines.push(changed(&path, write_json(&path, &v, dry)?));
+        r.write_json(&path, &v, dry)?;
     }
     if r.lines.is_empty() {
         r.lines.push("no MCP server to remove".into());
@@ -179,7 +179,7 @@ mod tests {
         let h = scratch();
         let [(native, _), _] = files(&h);
         let exe = Path::new("/opt/reason-network");
-        let stale = |exe: &Path| apply_in(&h, exe, false, true).unwrap().lines.iter().any(|l| pending(l));
+        let stale = |exe: &Path| apply_in(&h, exe, false, true).unwrap().would_change(exe);
         assert!(stale(exe), "nothing set up yet");
         assert!(!native.exists());
         apply_in(&h, exe, false, false).unwrap();
@@ -187,6 +187,43 @@ mod tests {
         // The same agent, wired to a binary that is not the one running now.
         assert!(stale(Path::new("/elsewhere/reason-network")));
         assert_eq!(read(&native)["mcp"]["servers"][AGENT_NAME]["command"], "/opt/reason-network");
+        std::fs::remove_dir_all(h).unwrap();
+    }
+
+    thread_local!(static SCRATCH: std::cell::RefCell<PathBuf> = const { std::cell::RefCell::new(PathBuf::new()) });
+
+    /// ZCode Desktop as `doctor` sees an agent, with its files in the scratch home.
+    const IN_SCRATCH: Agent = Agent {
+        id: "zcode",
+        name: "ZCode Desktop",
+        hint: "",
+        installed: || true,
+        wired: |exe| SCRATCH.with(|h| wired_in(&h.borrow(), exe)),
+        apply: |exe, remove, dry| SCRATCH.with(|h| apply_in(&h.borrow(), exe, remove, dry)).map(Some),
+    };
+
+    #[test]
+    fn doctor_says_when_a_wired_up_agent_is_out_of_date() {
+        let h = scratch();
+        SCRATCH.with(|s| *s.borrow_mut() = h.clone());
+        let [(native, _), _] = files(&h);
+        let exe = Path::new("/opt/reason-network");
+        let line = || agent_lines(&[IN_SCRATCH], exe).remove(0);
+        assert_eq!(line(), format!("- ZCode Desktop: installed, not on Reason Network (`{CLI} setup`)"));
+        apply_in(&h, exe, false, false).unwrap();
+        assert_eq!(line(), "✓ ZCode Desktop: wired up");
+        // Another tool saves the file its own way: nothing for setup to do.
+        let ours = read(&native);
+        std::fs::write(&native, ours.to_string()).unwrap();
+        assert_eq!(line(), "✓ ZCode Desktop: wired up");
+        // An earlier version wrote less: it says so, and writes nothing.
+        let mut earlier = ours;
+        earlier["mcp"]["servers"][AGENT_NAME].as_object_mut().unwrap().remove("env");
+        put(&native, &earlier.to_string());
+        assert!(line().starts_with("! ZCode Desktop: wired up, but out of date (`"), "{}", line());
+        assert_eq!(read(&native), earlier);
+        apply_in(&h, exe, false, false).unwrap();
+        assert_eq!(line(), "✓ ZCode Desktop: wired up");
         std::fs::remove_dir_all(h).unwrap();
     }
 

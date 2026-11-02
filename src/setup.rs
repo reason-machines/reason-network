@@ -39,10 +39,15 @@ fn service_label(base: &str) -> String {
 }
 
 /// What happened to one agent.
+#[derive(Default)]
 struct Report {
     agent: &'static str,
     lines: Vec<String>,
     notes: Vec<String>,
+    /// What a dry run found it would write: each file, with its new text.
+    writes: Vec<(PathBuf, String)>,
+    /// Whether a dry run found a change that is no file's (a server added through the agent's own command).
+    other: bool,
 }
 
 pub fn exe() -> Result<PathBuf> {
@@ -146,14 +151,6 @@ fn write_file(path: &Path, content: &str, dry: bool) -> Result<bool> {
     Ok(true)
 }
 
-fn write_json(path: &Path, v: &Value, dry: bool) -> Result<bool> {
-    // Removing Reason Network from a config that never existed leaves an empty shell: don't create a file for that.
-    if !path.exists() && hollow(v) {
-        return Ok(false);
-    }
-    write_file(path, &(serde_json::to_string_pretty(v)? + "\n"), dry)
-}
-
 /// Only empty objects and arrays.
 fn hollow(v: &Value) -> bool {
     match v {
@@ -231,7 +228,7 @@ fn drop_legacy_file(path: &Path, exe: &Path, dry: bool, r: &mut Report) -> Resul
         if !dry {
             std::fs::remove_file(path)?;
         }
-        r.lines.push(format!("removed {}", crate::util::tilde(&path.display().to_string())));
+        r.did(format!("removed {}", crate::util::tilde(&path.display().to_string())));
     }
     Ok(())
 }
@@ -241,16 +238,83 @@ fn changed(path: &Path, did: bool) -> String {
     if did { format!("updated {p}") } else { format!("{p} unchanged") }
 }
 
-/// Whether a line of a dry run says setup would change something, rather than that it found things as it wants them.
-fn pending(line: &str) -> bool {
-    !(line.ends_with(" unchanged") || line.contains("already set") || line.starts_with("kept "))
+impl Report {
+    /// Writes `content` to `path` as `write_file` does, and says whether it changed. A dry run keeps what it would
+    /// write, for `doctor`.
+    fn write(&mut self, path: &Path, content: &str, dry: bool) -> Result<bool> {
+        let did = write_file(path, content, dry)?;
+        if did && dry {
+            self.writes.push((path.to_path_buf(), content.to_string()));
+        }
+        self.lines.push(changed(path, did));
+        Ok(did)
+    }
+
+    fn write_json(&mut self, path: &Path, v: &Value, dry: bool) -> Result<bool> {
+        // Removing Reason Network from a config that never existed leaves an empty shell: don't create a file for that.
+        if !path.exists() && hollow(v) {
+            self.lines.push(changed(path, false));
+            return Ok(false);
+        }
+        self.write(path, &(serde_json::to_string_pretty(v)? + "\n"), dry)
+    }
+
+    /// A change that is no file's.
+    fn did(&mut self, line: String) {
+        self.lines.push(line);
+        self.other = true;
+    }
+
+    /// Whether the dry run that made this found something setup would change, which is more than another tool's
+    /// formatting of what setup wrote (see `differs`).
+    fn would_change(&self, exe: &Path) -> bool {
+        self.other || self.writes.iter().any(|(path, new)| differs(path, new, exe))
+    }
+}
+
+/// Whether the file at `path` says something other than `new`. A config another tool rewrote says the same (its own
+/// formatting, a `660` it made `660.0`), as does a path in another case on Windows. `REASON_NETWORK_HOME` is the
+/// home `setup` was run with: `doctor` may be run with another, and isn't asking for it to change.
+fn differs(path: &Path, new: &str, exe: &Path) -> bool {
+    let Ok(old) = std::fs::read_to_string(path) else { return true };
+    let parse = |text: &str| -> Option<Value> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => serde_json::from_str(text).ok(),
+            Some("toml") => toml::from_str(text).ok(),
+            _ => None,
+        }
+    };
+    match (parse(&old), parse(new)) {
+        (Some(mut old), Some(mut new)) => {
+            let exe = exe.display().to_string();
+            [&mut old, &mut new].into_iter().for_each(|v| settle(v, &exe));
+            old != new
+        }
+        // Code and YAML are compared as written, but for line ends.
+        _ => !same_text(&old.replace("\r\n", "\n"), &new.replace("\r\n", "\n")),
+    }
+}
+
+/// `v` as agents read it: numbers are numbers, a string with our path in it is the same in any case on Windows, and
+/// there is no `REASON_NETWORK_HOME`.
+fn settle(v: &mut Value, exe: &str) {
+    match v {
+        Value::Object(o) => {
+            o.remove("REASON_NETWORK_HOME");
+            o.values_mut().for_each(|v| settle(v, exe));
+        }
+        Value::Array(a) => a.iter_mut().for_each(|v| settle(v, exe)),
+        Value::Number(n) => *v = json!(n.as_f64()),
+        Value::String(s) if cfg!(windows) && contains(s, exe) => *s = s.to_lowercase(),
+        _ => {}
+    }
 }
 
 // ---- Claude Code ----
 
 fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let Some(bin) = agent::find_bin("claude") else { return Ok(None) };
-    let mut r = Report { agent: "Claude Code", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Claude Code", ..Default::default() };
     // A settings file it can't read is left alone: the rest of the setup still goes ahead.
     if let Err(e) = claude_allow_ask(remove, dry, &mut r) {
         r.notes.push(format!("couldn't allow ask_user in Claude Code's settings ({e:#}): it asks once to allow it"));
@@ -272,7 +336,7 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let legacy = Command::new(&bin).args(["mcp", "get", LEGACY_NAME]).stdin(std::process::Stdio::null()).output()?;
     if legacy.status.success() && ours(&String::from_utf8_lossy(&legacy.stdout), exe) {
         drop(LEGACY_NAME)?;
-        r.lines.push(format!("removed the {LEGACY_NAME} MCP server"));
+        r.did(format!("removed the {LEGACY_NAME} MCP server"));
     }
     let (existing, current) = get(AGENT_NAME)?;
     if remove || (existing && !current) {
@@ -302,7 +366,7 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
                 return Err(anyhow!("claude mcp add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
             }
         }
-        r.lines.push(format!("added the {AGENT_NAME} MCP server (user scope)"));
+        r.did(format!("added the {AGENT_NAME} MCP server (user scope)"));
     }
     Ok(Some(r))
 }
@@ -329,7 +393,7 @@ fn claude_allow_ask(remove: bool, dry: bool, r: &mut Report) -> Result<()> {
     if perms.is_empty() {
         obj(&mut v)?.remove("permissions");
     }
-    r.lines.push(changed(&path, write_json(&path, &v, dry)?));
+    r.write_json(&path, &v, dry)?;
     Ok(())
 }
 
@@ -340,7 +404,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if agent::find_bin("codex").is_none() && !dir.exists() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Codex", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Codex", ..Default::default() };
 
     let cfg_path = dir.join("config.toml");
     let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
@@ -378,7 +442,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         t["default_tools_approval_mode"] = toml_edit::value("approve");
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
-    r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
+    r.write(&cfg_path, &doc.to_string(), dry)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut v = read_json(&hooks_path)?;
@@ -397,8 +461,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         ("SessionEnd", group("session-end", false, 3)),
     ];
     merge_hook_groups(obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?, "codex", groups, remove);
-    let did = write_json(&hooks_path, &v, dry)?;
-    r.lines.push(changed(&hooks_path, did));
+    let did = r.write_json(&hooks_path, &v, dry)?;
     if did && !remove {
         r.notes.push("Codex asks once to trust Reason Network's hooks: choose \"Trust all and continue\".".into());
     }
@@ -418,7 +481,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if agent::find_bin("grok").is_none() && !dir.exists() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Grok CLI", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Grok CLI", ..Default::default() };
 
     let cfg_path = dir.join("config.toml");
     let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
@@ -447,7 +510,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
     grok_allow(&mut doc, remove);
-    r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
+    r.write(&cfg_path, &doc.to_string(), dry)?;
 
     let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
     let mut v = read_json(&hooks_path)?;
@@ -475,8 +538,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             r.lines.push(format!("removed {}", crate::util::tilde(&hooks_path.display().to_string())));
         }
     } else {
-        let did = write_json(&hooks_path, &v, dry)?;
-        r.lines.push(changed(&hooks_path, did));
+        r.write_json(&hooks_path, &v, dry)?;
     }
     Ok(Some(r))
 }
@@ -514,7 +576,7 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dir.exists() && agent::find_bin("cursor-agent").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Cursor", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Cursor", ..Default::default() };
     let mcp_path = dir.join("mcp.json");
     let mut v = read_json(&mcp_path)?;
     let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
@@ -527,7 +589,7 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             json!({ "type": "stdio", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "cursor" } }),
         );
     }
-    r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
+    r.write_json(&mcp_path, &v, dry)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut v = read_json(&hooks_path)?;
@@ -543,7 +605,7 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     ];
     ours[2].1["matcher"] = json!("*");
     merge_hook_groups(hooks, "cursor", ours, remove);
-    r.lines.push(changed(&hooks_path, write_json(&hooks_path, &v, dry)?));
+    r.write_json(&hooks_path, &v, dry)?;
     Ok(Some(r))
 }
 
@@ -554,7 +616,7 @@ fn gemini(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dir.exists() && agent::find_bin("gemini").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Gemini CLI", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Gemini CLI", ..Default::default() };
     let path = dir.join("settings.json");
     let mut v = read_json(&path)?;
     let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
@@ -576,8 +638,7 @@ fn gemini(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         ("SessionEnd", group("session-end", 5000)),
     ];
     merge_hook_groups(obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?, "gemini", groups, remove);
-    let did = write_json(&path, &v, dry)?;
-    r.lines.push(changed(&path, did));
+    let did = r.write_json(&path, &v, dry)?;
     if did && !remove {
         r.notes.push("Gemini CLI only runs Reason Network in trusted folders (`/permissions trust`).".into());
     }
@@ -591,7 +652,7 @@ fn copilot(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dir.exists() && agent::find_bin("copilot").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Copilot CLI", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Copilot CLI", ..Default::default() };
     let mcp_path = dir.join("mcp-config.json");
     let mut v = read_json(&mcp_path)?;
     let servers = obj(obj(&mut v)?.entry("mcpServers").or_insert_with(|| json!({})))?;
@@ -604,7 +665,7 @@ fn copilot(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             json!({ "type": "local", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "copilot" }, "tools": ["*"], "timeout": 660000 }),
         );
     }
-    r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
+    r.write_json(&mcp_path, &v, dry)?;
 
     drop_legacy_file(&dir.join("hooks").join(format!("{LEGACY_NAME}.json")), exe, dry, &mut r)?;
     let hooks_path = dir.join("hooks").join(format!("{AGENT_NAME}.json"));
@@ -625,7 +686,7 @@ fn copilot(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             "agentStop": entry("stop"),
             "sessionEnd": entry("session-end"),
         }});
-        r.lines.push(changed(&hooks_path, write_json(&hooks_path, &v, dry)?));
+        r.write_json(&hooks_path, &v, dry)?;
     }
     Ok(Some(r))
 }
@@ -635,7 +696,7 @@ fn command_code(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dir.exists() && command_code_bin().is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Command Code", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Command Code", ..Default::default() };
 
     let mcp_path = dir.join("mcp.json");
     let mut v = read_json(&mcp_path)?;
@@ -649,7 +710,7 @@ fn command_code(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             json!({ "transport": "stdio", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "cmd" } }),
         );
     }
-    r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
+    r.write_json(&mcp_path, &v, dry)?;
 
     let settings_path = dir.join("settings.json");
     let mut v = read_json(&settings_path)?;
@@ -661,7 +722,7 @@ fn command_code(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         ("Stop", group("stop")),
     ];
     merge_hook_groups(hooks, "cmd", groups, remove);
-    r.lines.push(changed(&settings_path, write_json(&settings_path, &v, dry)?));
+    r.write_json(&settings_path, &v, dry)?;
     Ok(Some(r))
 }
 
@@ -672,7 +733,7 @@ fn opencode(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dir.exists() && agent::find_bin("opencode").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "opencode", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "opencode", ..Default::default() };
     let path = dir.join("opencode.json");
     if dir.join("opencode.jsonc").exists() && !path.exists() {
         r.notes.push(format!(
@@ -691,7 +752,7 @@ fn opencode(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
                 json!({ "type": "local", "command": [exe.display().to_string(), "mcp"], "environment": { "REASON_NETWORK_AGENT": "opencode" }, "enabled": true }),
             );
         }
-        r.lines.push(changed(&path, write_json(&path, &v, dry)?));
+        r.write_json(&path, &v, dry)?;
     }
     drop_legacy_file(&dir.join("plugins").join(format!("{LEGACY_NAME}.ts")), exe, dry, &mut r)?;
     let plugin = dir.join("plugins").join(format!("{AGENT_NAME}.ts"));
@@ -705,7 +766,7 @@ fn opencode(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     } else {
         let code = include_str!("opencode-plugin.ts")
             .replace("__ENGINE_EXE__", &exe.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
-        r.lines.push(changed(&plugin, write_file(&plugin, &code, dry)?));
+        r.write(&plugin, &code, dry)?;
     }
     Ok(Some(r))
 }
@@ -718,7 +779,7 @@ fn pi(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !pi_home().exists() && agent::find_bin("pi").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "pi", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "pi", ..Default::default() };
     drop_legacy_file(&pi_home().join("extensions").join(format!("{LEGACY_NAME}.ts")), exe, dry, &mut r)?;
     let ext = pi_home().join("extensions").join(format!("{AGENT_NAME}.ts"));
     if remove {
@@ -731,7 +792,7 @@ fn pi(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     } else {
         let code = include_str!("pi-extension.ts")
             .replace("__ENGINE_EXE__", &exe.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
-        r.lines.push(changed(&ext, write_file(&ext, &code, dry)?));
+        r.write(&ext, &code, dry)?;
     }
     Ok(Some(r))
 }
@@ -846,7 +907,7 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if !dsh_home().exists() && agent::find_bin("dsh").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "DeepSeek Harness", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "DeepSeek Harness", ..Default::default() };
     let path = dsh_patch();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -855,7 +916,7 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     };
     match dsh_patch_text(&text, &dsh_block(exe), remove) {
         Ok(Some(new)) => {
-            r.lines.push(changed(&path, write_file(&path, &new, dry)?));
+            r.write(&path, &new, dry)?;
             if !remove {
                 r.notes.push(
                     "DeepSeek Harness reads Reason Network messages when it checks its inbox; start a new dsh session to load the MCP server."
@@ -878,7 +939,7 @@ fn reason(_exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if agent::find_bin("reason").is_none() {
         return Ok(None);
     }
-    let mut r = Report { agent: "Reason", lines: Vec::new(), notes: Vec::new() };
+    let mut r = Report { agent: "Reason", ..Default::default() };
     let mut cfg = Config::load_strict()?;
     if cfg.reason != remove {
         r.lines.push("already set".into());
@@ -887,7 +948,7 @@ fn reason(_exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             cfg.reason = !remove;
             cfg.save()?;
         }
-        r.lines.push(if remove { "stopped listing Reason sessions" } else { "lists your live Reason sessions" }.into());
+        r.did(if remove { "stopped listing Reason sessions" } else { "lists your live Reason sessions" }.into());
     }
     Ok(Some(r))
 }
@@ -1531,13 +1592,41 @@ pub async fn quietly() -> Result<Vec<&'static str>> {
     Ok(apply(&exe, &ids, &[], Some(true), false).await.agents)
 }
 
-/// Whether setting the agent up again would change something, by a dry run, which writes nothing. One whose setup
-/// can't run (a config it can't read) isn't called out of date: `setup` says why it skips it.
-fn out_of_date(id: &str, exe: &Path) -> bool {
-    AGENTS
+/// Whether setting the agent up again would change something, found by a dry run, which writes nothing. One whose
+/// setup can't run (a config it can't read) isn't called out of date: `setup` says why it skips it.
+fn out_of_date(a: &Agent, exe: &Path) -> bool {
+    let report = match a.id {
+        // `wired` has asked Claude Code about the server, which starts it and takes a second: its settings are left.
+        "claude" => {
+            let mut r = Report { agent: a.name, ..Default::default() };
+            claude_allow_ask(false, true, &mut r).map(|()| Some(r))
+        }
+        // `wired` compares its plugin with what setup writes; the dry run would also run `hermes --version`.
+        "hermes" => return false,
+        _ => (a.apply)(exe, false, true),
+    };
+    matches!(report, Ok(Some(r)) if r.would_change(exe))
+}
+
+/// What `doctor` says of each of the agents on this machine.
+fn agent_lines(agents: &[Agent], exe: &Path) -> Vec<String> {
+    agents
         .iter()
-        .find(|a| a.id == id)
-        .is_some_and(|a| matches!((a.apply)(exe, false, true), Ok(Some(r)) if r.lines.iter().any(|l| pending(l))))
+        .filter(|a| (a.installed)())
+        .map(|a| {
+            let name = a.name;
+            if !(a.wired)(exe) {
+                format!("- {name}: installed, not on Reason Network (`{CLI} setup`)")
+            } else if out_of_date(a, exe) {
+                // An update doesn't redo what setup wrote, so a release that writes more reaches an agent only this way.
+                format!(
+                    "! {name}: wired up, but out of date (`{CLI} setup`; `{CLI} setup --dry-run` shows what it would change)"
+                )
+            } else {
+                format!("✓ {name}: wired up")
+            }
+        })
+        .collect()
 }
 
 /// Read-only checks, one line each.
@@ -1593,18 +1682,8 @@ pub async fn doctor() -> Result<()> {
         if svc { "✓" } else { "-" },
         if svc { "installed".into() } else { format!("not installed (`{CLI} setup`)") }
     );
-    for f in detect(&exe) {
-        if !f.wired {
-            println!("- {}: installed, not on Reason Network (`{CLI} setup`)", f.name);
-        } else if out_of_date(f.id, &exe) {
-            // An update doesn't redo what setup wrote, so a release that writes more reaches an agent only through this.
-            println!(
-                "! {}: wired up, but out of date (`{CLI} setup`; `{CLI} setup --dry-run` shows what it would change)",
-                f.name
-            );
-        } else {
-            println!("✓ {}: wired up", f.name);
-        }
+    for line in agent_lines(&AGENTS, &exe) {
+        println!("{line}");
     }
     gemini::doctor(&exe, &link).await;
     Ok(())
@@ -1629,28 +1708,72 @@ mod tests {
         assert_eq!(doc.to_string(), "");
     }
 
-    #[test]
-    fn a_dry_run_line_is_pending_unless_it_found_things_as_wanted() {
-        let path = Path::new("/x/settings.json");
-        assert!(pending(&changed(path, true)));
-        assert!(!pending(&changed(path, false)));
-        for line in [
-            "added the reason-network MCP server (user scope)",
-            "removed the tincan MCP server",
-            "installed the plugin at ~/.hermes/plugins/reason-network",
-            "lists your live Reason sessions",
-        ] {
-            assert!(pending(line), "{line}");
-        }
-        for line in [
-            "reason-network MCP server already set",
-            "already set",
-            "kept the existing plugin at ~/.hermes/plugins/reason-network (customized or managed by Hermes)",
-        ] {
-            assert!(!pending(line), "{line}");
-        }
+    /// A file in a folder of its own.
+    fn file(name: &str, text: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("reason-setup-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), text).unwrap();
+        dir.join(name)
     }
 
+    fn codex_config(exe: &Path, home: &str) -> String {
+        format!(
+            "[mcp_servers.reason-network]\ncommand = '{}'\nargs = [\"mcp\"]\nenv = {{ REASON_NETWORK_AGENT = \"codex\", REASON_NETWORK_HOME = \"{home}\" }}\ntool_timeout_sec = 660\n\n[mcp_servers.other]\ncommand = \"/bin/echo\"\n",
+            exe.display()
+        )
+    }
+
+    #[test]
+    fn a_config_another_tool_rewrote_is_not_out_of_date() {
+        let exe =
+            Path::new(if cfg!(windows) { r"D:\Program Files\rn\reason-network.exe" } else { "/opt/rn/reason-network" });
+        let ours = codex_config(exe, "/home/a/.rn");
+        // What the Codex CLI makes of it when it adds another server: the inline table is a table, `660` is `660.0`.
+        let rewritten = format!(
+            "[mcp_servers.reason-network]\ncommand = '{}'\nargs = [\"mcp\"]\ntool_timeout_sec = 660.0\n\n[mcp_servers.reason-network.env]\nREASON_NETWORK_AGENT = \"codex\"\nREASON_NETWORK_HOME = \"/home/b/.rn\"\n\n[mcp_servers.other]\ncommand = \"/bin/echo\"\n",
+            exe.display()
+        );
+        let path = file("config.toml", &rewritten);
+        assert!(!differs(&path, &ours, exe));
+        // A different setting, or a different binary, is.
+        assert!(differs(&path, &ours.replace("[\"mcp\"]", "[\"mcp\", \"--x\"]"), exe));
+        assert!(differs(&path, &codex_config(Path::new("/elsewhere/reason-network"), "/home/a/.rn"), exe));
+        // The same in JSON, as another tool would save it: no trailing newline, another order.
+        let server = json!({ "command": exe.display().to_string(), "args": ["mcp"], "timeout": 660000 });
+        let new = serde_json::to_string_pretty(&json!({ "mcpServers": { AGENT_NAME: server } })).unwrap() + "\n";
+        let saved = format!(
+            r#"{{"mcpServers":{{"reason-network":{{"timeout":660000.0,"args":["mcp"],"command":{}}}}}}}"#,
+            json!(exe.display().to_string())
+        );
+        let path = file("mcp.json", &saved);
+        assert!(!differs(&path, &new, exe));
+        assert!(differs(&path, &new.replace("660000", "1"), exe));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_path_in_another_case_is_the_same_file_on_windows_only() {
+        let (written, asked) = if cfg!(windows) {
+            (Path::new(r"D:\program files\rn\reason-network.exe"), Path::new(r"D:\Program Files\rn\reason-network.exe"))
+        } else {
+            (Path::new("/opt/rn/reason-network"), Path::new("/opt/RN/reason-network"))
+        };
+        let hook = |exe: &Path| json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": shell_cmd(exe, "hook codex stop") }] }] } });
+        let path = file("hooks.json", &hook(written).to_string());
+        let new = serde_json::to_string_pretty(&hook(asked)).unwrap() + "\n";
+        assert_eq!(differs(&path, &new, asked), !cfg!(windows));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn code_is_compared_as_written_but_for_line_ends() {
+        let exe = Path::new("/opt/rn/reason-network");
+        let path = file("plugin.ts", "const exe = \"/opt/rn/reason-network\";\r\nrun(exe);\r\n");
+        assert!(!differs(&path, "const exe = \"/opt/rn/reason-network\";\nrun(exe);\n", exe));
+        assert!(differs(&path, "const exe = \"/opt/rn/reason-network\";\nrun(exe, 1);\n", exe));
+        assert!(differs(&path.with_file_name("gone.ts"), "x", exe), "no file yet");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
     #[test]
     fn hook_groups_merge_and_remove() {
         let mut hooks = serde_json::from_value::<Map<String, Value>>(json!({

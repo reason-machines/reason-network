@@ -164,7 +164,7 @@ fn apply_in(root: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let shown = crate::util::tilde(&dir.display().to_string());
     if populated && !owned {
         lines.push(format!("kept the existing plugin at {shown} (customized or managed by Hermes)"));
-        return Ok(Some(Report { agent: "Hermes", lines, notes: Vec::new() }));
+        return Ok(Some(Report { agent: "Hermes", lines, ..Default::default() }));
     }
     if remove {
         if owned {
@@ -208,7 +208,7 @@ fn apply_in(root: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             "wake is off until configured; use the native plugin instead of a duplicate MCP entry".into(),
         ]
     };
-    Ok(Some(Report { agent: "Hermes", lines, notes }))
+    Ok(Some(Report { agent: "Hermes", lines, notes, ..Default::default() }))
 }
 
 use std::collections::BTreeMap;
