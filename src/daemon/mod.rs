@@ -132,8 +132,8 @@ pub struct Daemon {
     /// Woken on every new message, for `Inbox` long-polls.
     arrived: Notify,
     git_cache: Mutex<HashMap<String, (Instant, GitInfo)>>,
-    /// Folders a git lookup is running in: one at a time each, however long git takes there.
-    git_busy: Mutex<HashSet<String>>,
+    /// Folders a git lookup is running in, each with when it is done: one at a time each, however long git takes there.
+    git_busy: Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>,
     /// Folders where git didn't answer in time, said once in the log.
     git_slow: Mutex<HashSet<String>>,
     git_lookup: fn(&str) -> Result<GitInfo, git::TimedOut>,
@@ -498,23 +498,34 @@ impl Daemon {
     }
 
     /// Repo and branch for each of `cwds`, looked up side by side. A folder still being looked up at `deadline` goes as
-    /// last known, or without; its lookup carries on and is used next time.
+    /// last known, or without; its lookup carries on, and a later caller waits on it rather than starting another.
     async fn gits(self: &Arc<Self>, cwds: Vec<String>, deadline: Instant) -> HashMap<String, GitInfo> {
-        let mut lookups = Vec::new();
+        let mut waits = Vec::new();
         for cwd in cwds.iter().collect::<HashSet<_>>() {
             let fresh = self.git_cache.lock().unwrap().get(cwd).is_some_and(|(at, _)| at.elapsed() < GIT_TTL);
-            if fresh || !self.git_busy.lock().unwrap().insert(cwd.clone()) {
+            if fresh {
                 continue;
             }
+            let mut busy = self.git_busy.lock().unwrap();
+            if let Some(done) = busy.get(cwd) {
+                waits.push(done.clone());
+                continue;
+            }
+            let (tx, done) = tokio::sync::watch::channel(false);
+            busy.insert(cwd.clone(), done.clone());
+            waits.push(done);
             let (this, cwd) = (self.clone(), cwd.clone());
-            lookups.push(tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
+                // Not busy any more however the lookup ends, a panic included; waiters wake when `tx` goes.
+                let _idle = GitIdle(&this, &cwd);
                 let found = (this.git_lookup)(&cwd);
                 this.git_found(&cwd, found);
-            }));
+                let _ = tx.send(true);
+            });
         }
         let _ = tokio::time::timeout_at(deadline.into(), async {
-            for l in lookups {
-                let _ = l.await;
+            for mut done in waits {
+                let _ = done.wait_for(|d| *d).await;
             }
         })
         .await;
@@ -543,7 +554,6 @@ impl Daemon {
             }
         };
         cache.insert(cwd.to_string(), (Instant::now(), info));
-        self.git_busy.lock().unwrap().remove(cwd);
     }
 
     /// `f` on a blocking thread, unless one started by an earlier call (marked by `busy`) is still running; `None` if
@@ -560,11 +570,26 @@ impl Daemon {
         }
         let this = self.clone();
         let task = tokio::task::spawn_blocking(move || {
-            let out = f();
-            busy(&this).store(false, Ordering::Release);
-            out
+            let _idle = Idle(busy(&this));
+            f()
         });
         tokio::time::timeout_at(deadline.into(), task).await.ok()?.ok()
+    }
+}
+
+struct GitIdle<'a>(&'a Daemon, &'a str);
+
+impl Drop for GitIdle<'_> {
+    fn drop(&mut self) {
+        self.0.git_busy.lock().unwrap().remove(self.1);
+    }
+}
+
+struct Idle<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Idle<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

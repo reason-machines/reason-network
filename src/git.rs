@@ -49,18 +49,22 @@ pub fn lookup_within(cwd: &str, timeout: Duration) -> Result<GitInfo, TimedOut> 
 }
 
 /// Runs `cmd` without stdin or stderr: whether it succeeded and its stdout, `None` if it couldn't start, `TimedOut`
-/// (killed and reaped) if it ran past `timeout`.
+/// if it, or anything it started that holds its stdout, ran past `timeout`. On Unix it runs in a process group of its
+/// own, killed whole at the timeout.
 fn output_within(mut cmd: Command, timeout: Duration) -> Result<Option<(bool, Vec<u8>)>, TimedOut> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let Ok(mut child) = cmd.spawn() else { return Ok(None) };
     let mut stdout = child.stdout.take();
     // Read on the side, so output larger than the pipe holds can't stall the child.
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         if let Some(s) = stdout.as_mut() {
             let _ = s.read_to_end(&mut out);
         }
-        out
+        let _ = tx.send(out);
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -68,15 +72,24 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Result<Option<(bool, Ve
             Ok(Some(st)) => break Some(st),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Ok(None) => break None,
-            Err(_) => return Ok(None),
+            Err(_) => break None,
         }
     };
-    let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(TimedOut);
-    };
-    Ok(Some((status.success(), reader.join().unwrap_or_default())))
+    let out = status.and_then(|_| rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok());
+    match (status, out) {
+        (Some(st), Some(out)) => Ok(Some((st.success(), out))),
+        _ => {
+            // Its whole group, so nothing it started keeps the pipe (and the reader) open.
+            // SAFETY: signals the process group it leads, which exists until it is reaped below.
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(TimedOut)
+        }
+    }
 }
 
 /// `git@github.com:acme/api.git`, `https://github.com/acme/api`, `ssh://git@host:22/acme/api.git` -> `acme/api`.
@@ -103,6 +116,18 @@ mod tests {
         cmd.args(["-c", "sleep 30"]);
         assert!(output_within(cmd, Duration::from_millis(200)).is_err());
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // Nor does something it left running that holds its stdout; and that goes with it.
+        let pidfile = std::env::temp_dir().join(format!("reason-network-git-{}", std::process::id()));
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("sleep 30 & echo $! > {}; printf done", pidfile.display())]);
+        assert!(output_within(cmd, Duration::from_millis(300)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let _ = std::fs::remove_file(&pidfile);
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: signal 0 only asks whether the process exists.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the sleep it left running was killed");
         // One that reads stdin gets end of input rather than waiting on the daemon's.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "cat; echo done"]);

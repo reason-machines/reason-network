@@ -515,6 +515,14 @@ mod tests {
         use std::time::{Duration, Instant};
         static OPEN: AtomicBool = AtomicBool::new(false);
         static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+        // Opened however the test ends, so a failed assertion doesn't leave the lookup (and the runtime) waiting.
+        struct Gate;
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                OPEN.store(true, Ordering::SeqCst);
+            }
+        }
+        let gate = Gate;
         let mut d = super::super::test_daemon(crate::config::Config::default());
         // git that doesn't come back, as under a privacy prompt nobody sees, until the gate opens.
         d.git_lookup = |_| {
@@ -548,13 +556,44 @@ mod tests {
         }
         // The second `who` waited on the lookup the first started rather than starting another.
         assert_eq!(LOOKUPS.load(Ordering::SeqCst), 1);
-        OPEN.store(true, Ordering::SeqCst);
-        while d.git_busy.lock().unwrap().contains("/stuck/api") {
+        drop(gate);
+        let until = Instant::now() + Duration::from_secs(10);
+        while d.git_busy.lock().unwrap().contains_key("/stuck/api") {
+            assert!(Instant::now() < until, "the lookup finished once the gate opened");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let dir = d.who(None, None, false).await.unwrap();
         let row = dir.sessions.iter().find(|s| s.cwd == "/stuck/api").unwrap();
         assert_eq!(row.repo.as_deref(), Some("acme/api"));
+    }
+
+    #[tokio::test]
+    async fn a_caller_waits_on_a_lookup_already_running_rather_than_going_without() {
+        use std::time::{Duration, Instant};
+        let mut d = super::super::test_daemon(crate::config::Config::default());
+        d.git_lookup = |_| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(GitInfo { root: Some("/repo".into()), repo: Some("acme/api".into()), branch: None })
+        };
+        let d = Arc::new(d);
+        let cwds = || vec!["/repo/sub".to_string()];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (a, b) = tokio::join!(d.gits(cwds(), deadline), d.gits(cwds(), deadline));
+        assert_eq!(a["/repo/sub"].repo.as_deref(), Some("acme/api"));
+        assert_eq!(b["/repo/sub"].repo.as_deref(), Some("acme/api"));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_panics_leaves_its_folder_free_for_the_next() {
+        use std::time::{Duration, Instant};
+        let mut d = super::super::test_daemon(crate::config::Config::default());
+        d.git_lookup = |_| panic!("lookup failed");
+        let d = Arc::new(d);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(d.gits(vec!["/x".into()], deadline).await["/x"].repo, None);
+        assert!(d.git_busy.lock().unwrap().is_empty());
+        assert_eq!(d.bounded(|d| &d.doing_busy, deadline, || -> u8 { panic!("read failed") }).await, None);
+        assert_eq!(d.bounded(|d| &d.doing_busy, deadline, || 7).await, Some(7));
     }
 
     #[tokio::test]
