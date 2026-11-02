@@ -38,6 +38,9 @@ use tokio::{
 };
 
 const GIT_TTL: Duration = Duration::from_secs(30);
+/// How long `who` (and presence, and registering) waits on this machine's folders (git, transcripts, Claude Code's
+/// registry) before answering with what it has: well inside the CLI's 15s.
+const LOCAL_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_WAIT: u64 = 600;
 
 /// Runs the daemon. Only one runs per state folder (`REASON_NETWORK_HOME`): a second one exits, or with `service` waits its turn.
@@ -129,6 +132,14 @@ pub struct Daemon {
     /// Woken on every new message, for `Inbox` long-polls.
     arrived: Notify,
     git_cache: Mutex<HashMap<String, (Instant, GitInfo)>>,
+    /// Folders a git lookup is running in: one at a time each, however long git takes there.
+    git_busy: Mutex<HashSet<String>>,
+    /// Folders where git didn't answer in time, said once in the log.
+    git_slow: Mutex<HashSet<String>>,
+    git_lookup: fn(&str) -> Result<GitInfo, git::TimedOut>,
+    /// Set while a look at what sessions are doing runs, so a stuck one isn't joined by another on every `who`.
+    doing_busy: std::sync::atomic::AtomicBool,
+    claude_busy: std::sync::atomic::AtomicBool,
     net: RwLock<Option<Arc<Net>>>,
     /// Held while the network starts, stops or is swapped, and while an invite is made: one at a time, so two networks
     /// never run on this machine's key, and an invite isn't made on one that is going away.
@@ -261,6 +272,11 @@ impl Daemon {
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
+            git_busy: Default::default(),
+            git_slow: Default::default(),
+            git_lookup: |cwd| git::lookup_within(cwd, git::COMMAND_TIMEOUT),
+            doing_busy: Default::default(),
+            claude_busy: Default::default(),
             net: RwLock::new(None),
             net_lock: tokio::sync::Mutex::new(()),
             rate: Mutex::new(HashMap::new()),
@@ -476,16 +492,79 @@ impl Daemon {
         });
     }
 
-    async fn git(&self, cwd: &str) -> GitInfo {
-        if let Some((at, info)) = self.git_cache.lock().unwrap().get(cwd)
-            && at.elapsed() < GIT_TTL
-        {
-            return info.clone();
+    async fn git(self: &Arc<Self>, cwd: &str) -> GitInfo {
+        let mut gits = self.gits(vec![cwd.to_string()], Instant::now() + LOCAL_DEADLINE).await;
+        gits.remove(cwd).unwrap_or_default()
+    }
+
+    /// Repo and branch for each of `cwds`, looked up side by side. A folder still being looked up at `deadline` goes as
+    /// last known, or without; its lookup carries on and is used next time.
+    async fn gits(self: &Arc<Self>, cwds: Vec<String>, deadline: Instant) -> HashMap<String, GitInfo> {
+        let mut lookups = Vec::new();
+        for cwd in cwds.iter().collect::<HashSet<_>>() {
+            let fresh = self.git_cache.lock().unwrap().get(cwd).is_some_and(|(at, _)| at.elapsed() < GIT_TTL);
+            if fresh || !self.git_busy.lock().unwrap().insert(cwd.clone()) {
+                continue;
+            }
+            let (this, cwd) = (self.clone(), cwd.clone());
+            lookups.push(tokio::task::spawn_blocking(move || {
+                let found = (this.git_lookup)(&cwd);
+                this.git_found(&cwd, found);
+            }));
         }
-        let dir = cwd.to_string();
-        let info = tokio::task::spawn_blocking(move || git::lookup(&dir)).await.unwrap_or_default();
-        self.git_cache.lock().unwrap().insert(cwd.to_string(), (Instant::now(), info.clone()));
-        info
+        let _ = tokio::time::timeout_at(deadline.into(), async {
+            for l in lookups {
+                let _ = l.await;
+            }
+        })
+        .await;
+        let cache = self.git_cache.lock().unwrap();
+        cwds.into_iter()
+            .map(|cwd| {
+                let info = cache.get(&cwd).map(|(_, i)| i.clone()).unwrap_or_default();
+                (cwd, info)
+            })
+            .collect()
+    }
+
+    fn git_found(&self, cwd: &str, found: Result<GitInfo, git::TimedOut>) {
+        let mut cache = self.git_cache.lock().unwrap();
+        let info = match found {
+            Ok(info) => info,
+            Err(git::TimedOut) => {
+                if self.git_slow.lock().unwrap().insert(cwd.to_string()) {
+                    log(&format!(
+                        "git didn't answer within {}s in {cwd} (a folder macOS guards, not downloaded, or on a slow \
+                         disk?): its sessions show without repo and branch",
+                        git::COMMAND_TIMEOUT.as_secs()
+                    ));
+                }
+                cache.get(cwd).map(|(_, i)| i.clone()).unwrap_or_default()
+            }
+        };
+        cache.insert(cwd.to_string(), (Instant::now(), info));
+        self.git_busy.lock().unwrap().remove(cwd);
+    }
+
+    /// `f` on a blocking thread, unless one started by an earlier call (marked by `busy`) is still running; `None` if
+    /// it doesn't finish by `deadline`.
+    async fn bounded<T: Send + 'static>(
+        self: &Arc<Self>,
+        busy: fn(&Daemon) -> &std::sync::atomic::AtomicBool,
+        deadline: Instant,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        use std::sync::atomic::Ordering;
+        if busy(self).swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let this = self.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let out = f();
+            busy(&this).store(false, Ordering::Release);
+            out
+        });
+        tokio::time::timeout_at(deadline.into(), task).await.ok()?.ok()
     }
 }
 

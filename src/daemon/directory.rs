@@ -64,14 +64,13 @@ enum Place {
 impl Daemon {
     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
-        let claude = self.shared(tokio::task::spawn_blocking(claude::scan).await?);
+        // Answers within the deadline with what it has: a folder can block whatever reads it (see `git::COMMAND_TIMEOUT`).
+        let deadline = std::time::Instant::now() + super::LOCAL_DEADLINE;
+        let claude = self.bounded(|d| &d.claude_busy, deadline, claude::scan).await.unwrap_or_default();
+        let claude = self.shared(claude);
         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
-        let mut gits: HashMap<String, GitInfo> = HashMap::new();
-        for cwd in cwds {
-            let info = self.git(&cwd).await;
-            gits.insert(cwd, info);
-        }
+        let gits = self.gits(cwds, deadline).await;
 
         // With Claude Code on Reason Network, every open Claude session is on it: sessions started before Reason Network was set
         // up have no Reason Network tools, but take messages through their own socket and reply with the CLI.
@@ -111,10 +110,14 @@ impl Daemon {
             });
             live.chain(unmanaged).collect()
         };
-        let doings: HashMap<String, String> = tokio::task::spawn_blocking(move || {
-            sources.into_iter().filter_map(|(k, s)| Some((k, doing::of(&s)?))).collect()
-        })
-        .await?;
+        let doings: HashMap<String, String> = self
+            .bounded(
+                |d| &d.doing_busy,
+                deadline,
+                move || sources.into_iter().filter_map(|(k, s)| Some((k, doing::of(&s)?))).collect(),
+            )
+            .await
+            .unwrap_or_default();
 
         let mut g = self.inner.lock().unwrap();
         self.prune(&mut g);
@@ -505,6 +508,54 @@ fn claude_match(c: &ClaudeSession, reg: &SessionReg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn who_answers_while_git_hangs_in_a_folder_and_looks_there_only_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        static OPEN: AtomicBool = AtomicBool::new(false);
+        static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+        let mut d = super::super::test_daemon(crate::config::Config::default());
+        // git that doesn't come back, as under a privacy prompt nobody sees, until the gate opens.
+        d.git_lookup = |_| {
+            LOOKUPS.fetch_add(1, Ordering::SeqCst);
+            while !OPEN.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(GitInfo { root: Some("/stuck/api".into()), repo: Some("acme/api".into()), branch: Some("main".into()) })
+        };
+        let d = Arc::new(d);
+        let reg = SessionReg {
+            key: "codex:1".into(),
+            agent: "codex".into(),
+            cwd: "/stuck/api".into(),
+            agent_session_id: None,
+            pid: Some(std::process::id()),
+            tier: Tier::Pull,
+            name: None,
+        };
+        d.register(Some(1), reg, GitInfo::default()).unwrap();
+        for _ in 0..2 {
+            let started = Instant::now();
+            let dir = d.who(None, None, false).await.unwrap();
+            assert!(
+                started.elapsed() < super::super::LOCAL_DEADLINE + Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+            let row = dir.sessions.iter().find(|s| s.cwd == "/stuck/api").expect("the session is listed");
+            assert_eq!(row.repo, None);
+        }
+        // The second `who` waited on the lookup the first started rather than starting another.
+        assert_eq!(LOOKUPS.load(Ordering::SeqCst), 1);
+        OPEN.store(true, Ordering::SeqCst);
+        while d.git_busy.lock().unwrap().contains("/stuck/api") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let dir = d.who(None, None, false).await.unwrap();
+        let row = dir.sessions.iter().find(|s| s.cwd == "/stuck/api").unwrap();
+        assert_eq!(row.repo.as_deref(), Some("acme/api"));
+    }
 
     #[tokio::test]
     async fn after_clear_the_registry_ends_the_cleared_conversation_before_any_tool_call() {

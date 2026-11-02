@@ -1,4 +1,13 @@
-use std::process::{Command, Stdio};
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+/// How long one git command may take. Under a macOS LaunchAgent, git in a folder behind a privacy prompt nobody sees,
+/// an iCloud file not downloaded yet or a hung mount can block for good: past this the folder goes without repo and
+/// branch rather than holding up whoever asked.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Default)]
 pub struct GitInfo {
@@ -8,26 +17,66 @@ pub struct GitInfo {
     pub branch: Option<String>,
 }
 
+/// git didn't answer in time.
+#[derive(Debug)]
+pub struct TimedOut;
+
 pub fn lookup(cwd: &str) -> GitInfo {
-    let run = |args: &[&str]| {
+    lookup_within(cwd, COMMAND_TIMEOUT).unwrap_or_default()
+}
+
+/// The checkout `cwd` is in, each git command given `timeout`.
+pub fn lookup_within(cwd: &str, timeout: Duration) -> Result<GitInfo, TimedOut> {
+    let run = |args: &[&str]| -> Result<Option<String>, TimedOut> {
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(cwd).args(args).stderr(Stdio::null());
+        cmd.arg("-C").arg(cwd).args(args);
         // CREATE_NO_WINDOW: `reason-network mcp` started by an agent without a console would flash one per lookup.
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-        let out = cmd.output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (out.status.success() && !s.is_empty()).then_some(s)
+        let Some((ok, out)) = output_within(cmd, timeout)? else { return Ok(None) };
+        let s = String::from_utf8_lossy(&out).trim().to_string();
+        Ok((ok && !s.is_empty()).then_some(s))
     };
-    let Some(root) = run(&["rev-parse", "--show-toplevel"]) else {
-        return GitInfo::default();
+    let Some(root) = run(&["rev-parse", "--show-toplevel"])? else {
+        return Ok(GitInfo::default());
     };
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"]);
-    let repo = run(&["config", "--get", "remote.origin.url"])
+    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let repo = run(&["config", "--get", "remote.origin.url"])?
         .as_deref()
         .and_then(repo_slug)
         .or_else(|| root.rsplit('/').next().map(str::to_string));
-    GitInfo { root: Some(root), repo, branch }
+    Ok(GitInfo { root: Some(root), repo, branch })
+}
+
+/// Runs `cmd` without stdin or stderr: whether it succeeded and its stdout, `None` if it couldn't start, `TimedOut`
+/// (killed and reaped) if it ran past `timeout`.
+fn output_within(mut cmd: Command, timeout: Duration) -> Result<Option<(bool, Vec<u8>)>, TimedOut> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else { return Ok(None) };
+    let mut stdout = child.stdout.take();
+    // Read on the side, so output larger than the pipe holds can't stall the child.
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut out);
+        }
+        out
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => break None,
+            Err(_) => return Ok(None),
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TimedOut);
+    };
+    Ok(Some((status.success(), reader.join().unwrap_or_default())))
 }
 
 /// `git@github.com:acme/api.git`, `https://github.com/acme/api`, `ssh://git@host:22/acme/api.git` -> `acme/api`.
@@ -44,7 +93,23 @@ pub fn repo_slug(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::repo_slug;
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_hangs_is_killed_at_the_timeout() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        assert!(output_within(cmd, Duration::from_millis(200)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // One that reads stdin gets end of input rather than waiting on the daemon's.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "cat; echo done"]);
+        let (ok, out) = output_within(cmd, Duration::from_secs(5)).unwrap().unwrap();
+        assert!(ok);
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "done");
+    }
 
     #[test]
     fn slugs() {
