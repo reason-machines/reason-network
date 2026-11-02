@@ -351,6 +351,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
+| App connected through Reason | pull | The Reason CLI's relay registers it with hooks marked `through_reason` and holds `check_inbox` waits on it, which only hand the mail to Reason's inbox for the app: it sees it at its next `check_inbox` there (or when its wake webhook starts it). Senders get `queued` saying so, never `delivered`, whatever waits are open. |
 
 MCP notifications are not a delivery path: native adapters hand messages to the agent's supported input mechanism.
 

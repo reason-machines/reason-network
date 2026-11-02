@@ -103,6 +103,7 @@ async fn handle(
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
+        through_reason: false,
         keep: false,
     });
     let reply: HookReply = link.call(req).await.ok()?;
