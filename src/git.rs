@@ -120,7 +120,7 @@ mod tests {
         let pidfile = std::env::temp_dir().join(format!("reason-network-git-{}", std::process::id()));
         let started = Instant::now();
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", &format!("sleep 30 & echo $! > {}; printf done", pidfile.display())]);
+        cmd.args(["-c", "sleep 30 & echo $! > \"$1\"; printf done", "sh"]).arg(&pidfile);
         assert!(output_within(cmd, Duration::from_millis(300)).is_err());
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         let pid: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
