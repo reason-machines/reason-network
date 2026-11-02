@@ -175,6 +175,22 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_finds_a_setup_out_of_date_and_writes_nothing() {
+        let h = scratch();
+        let [(native, _), _] = files(&h);
+        let exe = Path::new("/opt/reason-network");
+        let stale = |exe: &Path| apply_in(&h, exe, false, true).unwrap().lines.iter().any(|l| pending(l));
+        assert!(stale(exe), "nothing set up yet");
+        assert!(!native.exists());
+        apply_in(&h, exe, false, false).unwrap();
+        assert!(!stale(exe), "set up as it would be again");
+        // The same agent, wired to a binary that is not the one running now.
+        assert!(stale(Path::new("/elsewhere/reason-network")));
+        assert_eq!(read(&native)["mcp"]["servers"][AGENT_NAME]["command"], "/opt/reason-network");
+        std::fs::remove_dir_all(h).unwrap();
+    }
+
+    #[test]
     fn wired_only_where_zcode_reads() {
         let h = scratch();
         let [(native, _), (fallback, _)] = files(&h);

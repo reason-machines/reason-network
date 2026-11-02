@@ -241,6 +241,11 @@ fn changed(path: &Path, did: bool) -> String {
     if did { format!("updated {p}") } else { format!("{p} unchanged") }
 }
 
+/// Whether a line of a dry run says setup would change something, rather than that it found things as it wants them.
+fn pending(line: &str) -> bool {
+    !(line.ends_with(" unchanged") || line.contains("already set") || line.starts_with("kept "))
+}
+
 // ---- Claude Code ----
 
 fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
@@ -1526,6 +1531,15 @@ pub async fn quietly() -> Result<Vec<&'static str>> {
     Ok(apply(&exe, &ids, &[], Some(true), false).await.agents)
 }
 
+/// Whether setting the agent up again would change something, by a dry run, which writes nothing. One whose setup
+/// can't run (a config it can't read) isn't called out of date: `setup` says why it skips it.
+fn out_of_date(id: &str, exe: &Path) -> bool {
+    AGENTS
+        .iter()
+        .find(|a| a.id == id)
+        .is_some_and(|a| matches!((a.apply)(exe, false, true), Ok(Some(r)) if r.lines.iter().any(|l| pending(l))))
+}
+
 /// Read-only checks, one line each.
 pub async fn doctor() -> Result<()> {
     let exe = exe()?;
@@ -1580,10 +1594,16 @@ pub async fn doctor() -> Result<()> {
         if svc { "installed".into() } else { format!("not installed (`{CLI} setup`)") }
     );
     for f in detect(&exe) {
-        if f.wired {
-            println!("✓ {}: wired up", f.name);
-        } else {
+        if !f.wired {
             println!("- {}: installed, not on Reason Network (`{CLI} setup`)", f.name);
+        } else if out_of_date(f.id, &exe) {
+            // An update doesn't redo what setup wrote, so a release that writes more reaches an agent only through this.
+            println!(
+                "! {}: wired up, but out of date (`{CLI} setup`; `{CLI} setup --dry-run` shows what it would change)",
+                f.name
+            );
+        } else {
+            println!("✓ {}: wired up", f.name);
         }
     }
     gemini::doctor(&exe, &link).await;
@@ -1607,6 +1627,28 @@ mod tests {
         assert!(doc.to_string().contains("MCPTool(reason-network__*)"));
         grok_allow(&mut doc, true);
         assert_eq!(doc.to_string(), "");
+    }
+
+    #[test]
+    fn a_dry_run_line_is_pending_unless_it_found_things_as_wanted() {
+        let path = Path::new("/x/settings.json");
+        assert!(pending(&changed(path, true)));
+        assert!(!pending(&changed(path, false)));
+        for line in [
+            "added the reason-network MCP server (user scope)",
+            "removed the tincan MCP server",
+            "installed the plugin at ~/.hermes/plugins/reason-network",
+            "lists your live Reason sessions",
+        ] {
+            assert!(pending(line), "{line}");
+        }
+        for line in [
+            "reason-network MCP server already set",
+            "already set",
+            "kept the existing plugin at ~/.hermes/plugins/reason-network (customized or managed by Hermes)",
+        ] {
+            assert!(!pending(line), "{line}");
+        }
     }
 
     #[test]
