@@ -74,13 +74,14 @@ pub fn repo_slug(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup_with, repo_slug};
-    use std::time::{Duration, Instant};
+    use super::repo_slug;
 
     #[cfg(unix)]
     #[test]
     fn a_git_that_hangs_gives_up_at_the_budget() {
+        use super::lookup_with;
         use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
         let git = std::env::temp_dir().join(format!("rn-hanging-git-{}", std::process::id()));
         std::fs::write(&git, "#!/bin/sh\nexec sleep 600\n").unwrap();
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
