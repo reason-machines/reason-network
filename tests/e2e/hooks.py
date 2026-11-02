@@ -136,6 +136,8 @@ try:
     gem_stop = json.loads(out)
 except ValueError:
     gem_stop = {}
+if not isinstance(gem_stop, dict):
+    gem_stop = {}
 # AfterAgent continues with a deny, the mail as its reason.
 check("gemini stop → decision deny with the message", gem_stop.get("decision") == "deny" and "run the tests" in str(gem_stop.get("reason")), out)
 
@@ -445,7 +447,7 @@ def handed_off(out, secs=0):
     m = re.search(r"message id (\S+)", out)
     deadline = time.time() + secs
     while True:
-        db = sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db"), timeout=10)
+        db = sqlite3.connect(f"file:{os.path.join(env['REASON_NETWORK_HOME'], 'network.db')}?mode=ro", uri=True, timeout=10)
         row = m and db.execute("SELECT stage FROM sent_receipts WHERE id = ?", (m.group(1),)).fetchone()
         db.close()
         if (row and row[0] == "handed_to_agent") or time.time() >= deadline:
@@ -495,18 +497,20 @@ def push_case(name, when):
         time.sleep(3)
     time.sleep(2)
     got = "".join(frames)
+    # Read before check_inbox: reading unread mail through the tool hands it to the agent too.
+    before = {body: handed_off(out, 5 if body in got else 0) for body, out in sent.items()}
     rpc(p, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "check_inbox", "arguments": {}}})
     unread = json.dumps(reply(p, 4))
     for body, out in sent.items():
         # Told it was delivered, it is in the inbox. Told the adapter took it, or that it was queued, it is in the inbox
-        # or unread: never lost. And its receipt says handed to the agent only once the inbox has it: never claimed.
+        # or unread: never lost. And its receipt says handed to the agent only once the inbox or check_inbox has it.
         told = ("delivered" if "delivered into the session" in out else "handoff pending" if PENDING in out
                 else "queued" if "queued" in out else "unknown")
-        handed = handed_off(out, 5 if body in got else 0)
+        handed = handed_off(out)
         check(f"push, inbox listed {when}: '{body}' reached the session as the sender was told ({told})",
               told != "unknown" and ((body in got) if told == "delivered" else (body in unread) != (body in got))
-              and handed == (body in got),
-              f"send said: {out}\nhanded to agent: {handed}\ninbox got: {got[-400:]}\nunread: {unread[-400:]}")
+              and before[body] == (body in got) and handed == ((body in got) or (body in unread)),
+              f"send said: {out}\nhanded to agent: {before[body]}, after check_inbox: {handed}\ninbox got: {got[-400:]}\nunread: {unread[-400:]}")
     # Once Claude Code has listed it, the inbox is used, and the handoff is confirmed.
     body = f"push {name} last"
     out = run("send", to, body)
