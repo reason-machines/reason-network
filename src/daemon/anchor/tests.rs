@@ -525,22 +525,25 @@ fn failed_drop_notice_cannot_prevent_a_local_revocation_from_becoming_durable() 
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn failed_drop_notice_cannot_restore_a_team_after_leaving() {
-    let t = team(true);
-    let (dir, db) = fail_notices(&t);
-    learn(&t);
-    t.daemon.accept_anchor(t.source.public(), t.laptop.public(), message()).unwrap();
-    t.daemon.leave(true).await.unwrap();
-    // No further await: the single-thread runtime drops the scheduled process restart without running it.
-    {
+#[test]
+fn failed_drop_notice_cannot_restore_a_team_after_leaving() {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (dir, daemon) = runtime.block_on(async {
+        let t = team(true);
+        let (dir, _db) = fail_notices(&t);
+        learn(&t);
+        t.daemon.accept_anchor(t.source.public(), t.laptop.public(), message()).unwrap();
+        t.daemon.leave(true).await.unwrap();
+        // No further await: shutdown cancels the scheduled process restart before it runs.
         let g = t.daemon.inner.lock().unwrap();
         assert!(g.team.is_none());
         assert!(g.store.get("team").unwrap().is_none(), "restarting cannot rejoin the old team");
         assert!(g.store.anchor_pending().unwrap()[0].cancelled);
-    }
-    drop(db);
-    drop(t);
+        (dir, Arc::downgrade(&t.daemon))
+    });
+    // The restart task owns the daemon's database; release it before Windows removes the files.
+    drop(runtime);
+    assert!(daemon.upgrade().is_none(), "runtime shutdown must release the daemon before cleanup");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
