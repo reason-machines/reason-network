@@ -110,10 +110,12 @@ async fn handle(
         return None;
     }
     let ids = reply.ids;
-    let text = match (reply.text, ev, reply.address) {
-        (Some(t), ..) => t,
-        // Say who it is on Reason Network once, at session start.
-        (None, "start" | "prompt", Some(addr)) if ev == "start" || agent == "antigravity" => {
+    // An older daemon doesn't say: then at session start, as before.
+    let intro = reply.intro.unwrap_or(ev == "start");
+    let text = match (reply.text, reply.address) {
+        (Some(t), _) => t,
+        // Say who it is on Reason Network once per session.
+        (None, Some(addr)) if intro => {
             format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
             )

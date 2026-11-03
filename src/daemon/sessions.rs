@@ -147,6 +147,7 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    introduced: false,
                 },
             );
             self.presence_changed();
@@ -459,7 +460,15 @@ impl Daemon {
             self.reached(g, &key);
         }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
+        let intro = text.is_none()
+            && if agent == "antigravity" {
+                let l = g.live.get_mut(&key).expect("looked up above");
+                matches!(event, "start" | "prompt") && !std::mem::replace(&mut l.introduced, true)
+            } else {
+                event == "start"
+            };
+        Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -898,6 +907,30 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    #[tokio::test]
+    async fn an_antigravity_conversation_hears_who_it_is_once_not_before_every_invocation() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "antigravity".into(),
+            event: event.into(),
+            session_id: "c1".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "prompt", "stop", "prompt", "start"] {
+            seen.push(d.hook(call(event)).await.unwrap().intro);
+        }
+        assert_eq!(seen, [Some(true), Some(false), Some(false), Some(false), Some(false), Some(false), Some(false)]);
     }
 
     #[tokio::test]
