@@ -857,6 +857,45 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_rename_through_upsert_keeps_everything_and_the_store_writes_on() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let r = |name: &str| Remembered {
+            name: name.into(),
+            key: "k".into(),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&r("old"), "lars").unwrap();
+        store.insert(&mut with_files("pending", "lars/old"), false).unwrap();
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER fail_rename BEFORE UPDATE OF name ON sessions
+            BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .unwrap();
+        assert!(store.upsert_session(&r("new"), "lars").is_err());
+        assert!(store.db.is_autocommit());
+        assert_eq!(store.unread("lars/old").unwrap().len(), 1);
+        assert!(store.unread("lars/new").unwrap().is_empty());
+        assert_eq!(store.sessions().unwrap().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), ["old"]);
+        // Later writes are their own, not left in an open transaction.
+        store.insert(&mut with_files("later", "lars/old"), false).unwrap();
+        assert!(store.db.is_autocommit());
+        store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
+        store.upsert_session(&r("new"), "lars").unwrap();
+        assert_eq!(store.unread("lars/new").unwrap().len(), 2);
+        assert_eq!(store.sessions().unwrap().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), ["new"]);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn the_database_is_this_users_and_keeps_nothing_it_deleted() {
         use std::os::unix::fs::PermissionsExt;
