@@ -535,6 +535,8 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
 ## Troubleshooting
 
 - **`reason-network doctor`** checks the daemon, the team connection (direct or relayed, per machine) and every agent.
+  An update doesn't redo what `setup` wrote into an agent, so `doctor` runs `setup` as a dry run for each agent that is
+  wired and says when it would change something; `reason-network setup` brings it up to date.
 - **An agent doesn't have the Reason Network tools:** restart that session; agents load MCP servers at startup.
 - **A teammate shows as offline:** their machine is asleep or Reason Network isn't running there (`reason-network doctor` on
   their side). Messages wait in your outbox and go out when they're back. If it was off while the team changed
