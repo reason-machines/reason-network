@@ -5,7 +5,7 @@
 Needs internet (iroh relays/discovery). Run inside a Claude Code session, the simulated Claude session pushes its
 test messages into that real session (they say "ignore this").
 """
-import base64, json, os, re, subprocess, sys, tempfile, time
+import base64, json, os, re, sqlite3, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofs import TRUST, keygen, proof, serve_relay_lists
 
@@ -36,10 +36,11 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}: {name}" + ("" if ok else f"\n      {detail}"))
 
 
-def env(who, strip_claude=True):
+def env(who, strip_claude=True, extra=None):
     e = dict(os.environ, REASON_NETWORK_HOME=H[who], REASON_NETWORK_MACHINE=MACHINE[who], REASON_NETWORK_NO_MDNS="1", REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_CODEX_BIN=FAKE_CODEX)
     e.update({"HOME": os.path.join(D, "home"), "PATH": FAKE_BIN + os.pathsep + os.environ["PATH"], "REASON_NETWORK_NO_UPDATE": "1",
               "REASON_NETWORK_NO_TRAY": "1", "REASON_NETWORK_TRUST_KEYS": TRUST, "REASON_NETWORK_RELAYS_URL": RELAYS_URL})
+    e.update(extra or {})
     e.update({"REASON_NETWORK_OSASCRIPT_BIN": FAKE_NOTIFY, "REASON_NETWORK_NOTIFY-SEND_BIN": FAKE_NOTIFY, "DBUS_SESSION_BUS_ADDRESS": "test",
               "NOTIFY_LOG": os.path.join(D, f"notify-{who}.log")})
     if strip_claude:
@@ -51,8 +52,8 @@ def env(who, strip_claude=True):
     return e
 
 
-def cli(who, *args):
-    r = subprocess.run([BIN, *args], env=env(who), capture_output=True, text=True, timeout=90)
+def cli(who, *args, extra=None):
+    r = subprocess.run([BIN, *args], env=env(who, extra=extra), capture_output=True, text=True, timeout=90)
     return (r.stdout + r.stderr).strip()
 
 
@@ -632,6 +633,55 @@ cli("alice", "stop")
 time.sleep(3)
 cli("alice", "team")
 time.sleep(5)
+
+# --- a session forgotten with mail it never read: the sender hears, even when its machine was off then ---
+os.makedirs(os.path.join(D, "drop"))
+dropper = Mcp("alex", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "drop"))
+dropper.tool("list_team", {}, {"sessionId": "44444444-dddd", "threadId": "44444444-dddd"})
+dropper.close()
+time.sleep(4)
+bodies = ["dropped unread (e2e test)\nthis second line isn't quoted", "queued before the upgrade (e2e test)"]
+for body in bodies:
+    out = codex.tool("send_message", {"to": "alex/drop-codex", "message": body}, meta)
+    check(f"mail for a session that is offline is queued on its machine: {body.splitlines()[0]}", "queued: last seen" in out, out)
+codex.close()  # (its MCP server would start alice's machine again)
+cli("alice", "stop")
+cli("alex", "stop")
+db = sqlite3.connect(os.path.join(H["alex"], "network.db"), timeout=30)
+rows = [db.execute("SELECT id, sent_at FROM messages WHERE body = ?", (body,)).fetchone() for body in bodies]
+# The second as an engine from before notices kept it: without the machine it came from.
+db.execute("UPDATE messages SET source = NULL WHERE body = ?", (bodies[1],))
+db.execute("UPDATE sessions SET last_seen = ? WHERE name = 'drop-codex'", (int(time.time() * 1000) - 2 * 86_400_000,))
+db.commit()
+# alex's machine back, the session a day gone: forgotten, with its mail. Its daemon forgets from the start, not six hours
+# after it (debug builds only), until it is started again below.
+cli("alex", "who", extra={"REASON_NETWORK_FORGET_GRACE_MS": "0"})
+time.sleep(1)
+outbox = [json.loads(m) for (m,) in db.execute("SELECT msg FROM outbox WHERE target = ?", (ep["alice"],))]
+left = db.execute("SELECT COUNT(*) FROM messages WHERE body IN (?, ?)", bodies).fetchone()[0]
+db.close()
+check("…dropped once the session is forgotten, each leaves a notice for the sender's machine, which is off (one from before notices too)",
+      None not in rows and left == 0 and sorted(m.get("reply_to") for m in outbox if m.get("from_agent") == "reason-network") == sorted(r[0] for r in rows),
+      (rows, outbox))
+cli("alice", "team")
+for _ in range(60):
+    held = cli("alice", "held")
+    if held.count("Not delivered") == 2:
+        break
+    time.sleep(1)
+check("…which come once it is back, and are held like any mail from alex (the hold policy above)", held.count("Not delivered") == 2, held)
+cli("alice", "approve", "--all")
+codex = Mcp("alice", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "work"))
+out = codex.tool("check_inbox", {}, meta)
+for body, row in zip(bodies, rows):
+    first = body.splitlines()[0]
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(row[1] / 1000)) if row else "?"
+    check(f"the sender gets it once back: who the mail was for, when it was sent, its first line ({first})",
+          f'Not delivered: your message to alex/drop-codex (sent {when}) was dropped unread: "{first}"' in message_with(out, f'"{first}"'), out)
+check("…only the first line, from Reason Network", "second line" not in out and "From Reason Network on alex's machine." in out, out)
+out = codex.tool("check_inbox", {}, meta)
+check("…once", "Not delivered" not in out, out)
+cli("alex", "stop")  # the next command starts it again as usual
 
 # --- offline machine: outbox ---
 codex.close()

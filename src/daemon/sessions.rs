@@ -207,6 +207,11 @@ impl Daemon {
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
     /// registered again (each gets the time a hook-only session has to show it is there).
     fn forgetting(&self, now: i64) -> bool {
+        // Debug builds take `REASON_NETWORK_FORGET_GRACE_MS` instead, for tests.
+        #[cfg(debug_assertions)]
+        if let Some(grace) = crate::paths::env_var("FORGET_GRACE_MS").ok().and_then(|v| v.parse::<i64>().ok()) {
+            return now - self.started > grace;
+        }
         now - self.started > HOOK_TTL_MS
     }
 
@@ -602,7 +607,7 @@ fn remembered(l: &Live, now: i64) -> Remembered {
 }
 
 /// The key of a machine's own terminal mailbox (`<you>/terminal`).
-const TERMINAL: &str = "cli:terminal";
+pub(super) const TERMINAL: &str = "cli:terminal";
 
 /// What a machine's presence says when its engine shows a message from another machine's terminal as from
 /// `<person>/terminal@<machine>`, so its agents' replies reach the one it came from.

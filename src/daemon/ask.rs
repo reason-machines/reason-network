@@ -264,7 +264,7 @@ impl Daemon {
             approval: None,
             files: Vec::new(),
         };
-        if let Err(e) = g.store.insert(&mut msg, false) {
+        if let Err(e) = g.store.insert_sent(&mut msg, super::sessions::TERMINAL) {
             return log(&format!("couldn't keep a late answer: {e}"));
         }
         self.deliver(&mut g, key, vec![msg], true);
