@@ -1434,6 +1434,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reading_wait_never_marks_the_new_owners_mail_read() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..codex(key) };
+        let old = d.register(Some(1), named("codex:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.inbox("codex:a".into(), 5, false).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let new = d.set_status("codex:a", None, Some("new".into())).unwrap().address;
+        d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
+        for (to, body) in [(&old, "for b"), (&new, "for a")] {
+            d.send("codex:s".into(), to, body, None, true, false, None, Vec::new()).await.unwrap();
+        }
+        let got: Vec<String> = waiting.await.unwrap().messages.into_iter().map(|m| m.body).collect();
+        assert_eq!(got, ["for a"]);
+        let b: Vec<String> = d.inner.lock().unwrap().store.unread(&old).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(b, ["for b"]);
+        assert!(d.inner.lock().unwrap().store.unread(&new).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wait_whose_session_leaves_ends_empty_and_leaves_the_mail() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..codex(key) };
+        let old = d.register(Some(1), named("codex:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.inbox("codex:a".into(), 5, false).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        d.drop_conn(1);
+        d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
+        let t0 = std::time::Instant::now();
+        d.send("codex:s".into(), &old, "for b", None, true, false, None, Vec::new()).await.unwrap();
+        let got = waiting.await.unwrap().messages;
+        assert!(got.is_empty());
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(d.inner.lock().unwrap().store.unread(&old).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_claude_session_is_told_delivered_only_through_a_server_that_knows_its_inbox() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
