@@ -837,7 +837,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        store.insert(&mut with_files("pending", "lars/old"), false).unwrap();
+        store.insert(&mut message("pending", "lars/old"), false).unwrap();
         store
             .db
             .execute_batch(
@@ -873,7 +873,7 @@ mod tests {
             mailbox: false,
         };
         store.upsert_session(&r("old"), "lars").unwrap();
-        store.insert(&mut with_files("pending", "lars/old"), false).unwrap();
+        store.insert(&mut message("pending", "lars/old"), false).unwrap();
         store
             .db
             .execute_batch(
@@ -887,7 +887,7 @@ mod tests {
         assert!(store.unread("lars/new").unwrap().is_empty());
         assert_eq!(store.sessions().unwrap().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), ["old"]);
         // Later writes are their own, not left in an open transaction.
-        store.insert(&mut with_files("later", "lars/old"), false).unwrap();
+        store.insert(&mut message("later", "lars/old"), false).unwrap();
         assert!(store.db.is_autocommit());
         store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
         store.upsert_session(&r("new"), "lars").unwrap();
