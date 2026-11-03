@@ -15,7 +15,7 @@ pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: 
     let link = Link::new(None);
     let Ok(Some((out, key, ids))) = tokio::time::timeout(
         Duration::from_secs(8),
-        handle(&link, &cfg, agent_name, event, &input, session, state, doing),
+        handle((&link, &cfg), agent_name, event, &input, session, state, doing),
     )
     .await
     else {
@@ -41,8 +41,7 @@ fn read_stdin(limit: Duration) -> String {
 
 /// Returns what to print, the session key, and the ids of the messages in it.
 async fn handle(
-    link: &std::sync::Arc<Link>,
-    cfg: &crate::config::Config,
+    (link, cfg): (&std::sync::Arc<Link>, &crate::config::Config),
     agent_name: &str,
     event: &str,
     input: &str,
