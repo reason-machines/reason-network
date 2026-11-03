@@ -188,7 +188,7 @@ impl Store {
         anyhow::ensure!(ids.len() <= 100, "request at most 100 delivery receipts");
         let mut out = Vec::new();
         for id in ids {
-            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2 AND sent_at>=?3", params![id,key,crate::util::now_ms()-RECEIPT_KEEP_MS], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
+            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2 AND (sent_at>=?3 OR id IN (SELECT id FROM anchor_sends WHERE retain_until>?4))", params![id,key,crate::util::now_ms()-RECEIPT_KEEP_MS,crate::util::now_ms()], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
             out.push(found.unwrap_or_else(|| serde_json::json!({"id":id,"stage":"unknown"})));
         }
         Ok(out)
@@ -224,7 +224,7 @@ impl Store {
     }
 
     fn prune_receipts(&self, now: i64) -> Result<()> {
-        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1", [now - RECEIPT_KEEP_MS])?;
+        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1 AND id NOT IN (SELECT id FROM anchor_sends WHERE retain_until>?2)", params![now - RECEIPT_KEEP_MS,now])?;
         self.db.execute("DELETE FROM send_keys WHERE created_at < ?1", [now - RECEIPT_KEEP_MS])?;
         Ok(())
     }
@@ -540,6 +540,12 @@ impl Store {
     /// (once, however many answers come).
     pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
         let transaction = self.db.unchecked_transaction()?;
+        let removed = self.finish_outbox(id, taken)?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    fn finish_outbox(&self, id: &str, taken: bool) -> Result<bool> {
         let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
         if removed {
             self.db.execute(
@@ -550,7 +556,6 @@ impl Store {
                 let _ = self.count(crate::util::now_ms(), Counted::Sent);
             }
         }
-        transaction.commit()?;
         Ok(removed)
     }
 

@@ -21,6 +21,7 @@ fn team(anchor: bool) -> Team {
 }
 
 fn configured(cfg: Config) -> Team {
+    let offering = cfg.anchor;
     let daemon = Arc::new(test_daemon(cfg));
     let (source, laptop, stranger) = (SecretKey::generate(), SecretKey::generate(), SecretKey::generate());
     let mut roster = TeamState::found("acme", &daemon.person, &daemon.machine, &daemon.key);
@@ -29,6 +30,9 @@ fn configured(cfg: Config) -> Team {
     {
         roster.put_member(&daemon.key, key.public(), person, machine, true);
     }
+    roster.select_anchor(&daemon.key, Some(if offering { daemon.key.public() } else { laptop.public() })).unwrap();
+    roster.trust_anchor(&source, daemon.key.public()).unwrap();
+    roster.trust_anchor(&laptop, daemon.key.public()).unwrap();
     daemon.inner.lock().unwrap().team = Some(roster);
     Team { daemon, source, laptop, stranger }
 }
@@ -62,7 +66,7 @@ fn permanent(names: &[&str]) -> Presence {
 fn advertised(machine: EndpointId, names: &[&str]) -> Remote {
     Remote {
         presence: Presence {
-            features: vec!["anchor".into(), FEATURE.into()],
+            features: vec!["anchor".into(), FEATURE.into(), RECEIPTS.into()],
             anchor_routes: vec![MailboxRoute { machine, names: names.iter().map(|n| n.to_string()).collect() }],
             ..Default::default()
         },
@@ -183,6 +187,15 @@ fn live_and_offline_permanent_mailboxes_are_announced_without_ordinary_sessions(
 #[test]
 fn a_fresh_workspace_resolves_a_saved_destination_only_from_its_own_online_anchor() {
     let t = team(false);
+    t.daemon
+        .inner
+        .lock()
+        .unwrap()
+        .team
+        .as_mut()
+        .unwrap()
+        .select_anchor(&t.daemon.key, Some(t.source.public()))
+        .unwrap();
     let remotes = HashMap::from([(t.source.public(), advertised(t.laptop.public(), &["inbox"]))]);
     let g = t.daemon.inner.lock().unwrap();
     let targets = t.daemon.resolve(&g, &remotes, "alex/inbox@laptop", None).unwrap();
@@ -324,6 +337,10 @@ fn forwards_cannot_impersonate_other_owners_or_target_an_ordinary_session() {
     remember(&t.daemon, "ordinary", false);
     let msg = message();
     assert!(t.daemon.receive_forward(t.stranger.public(), t.source.public(), msg.clone()).is_err());
+    assert!(
+        t.daemon.receive_forward(t.source.public(), t.source.public(), msg.clone()).is_err(),
+        "an own machine is not enough; the forwarding anchor must be selected"
+    );
     assert!(t.daemon.receive_forward(t.laptop.public(), t.stranger.public(), msg.clone()).is_err());
     assert!(
         t.daemon
@@ -404,7 +421,7 @@ fn direct_and_forwarded_delivery_save_one_message_and_one_set_of_files() {
 }
 
 #[test]
-fn mailbox_removal_discards_its_saved_route_and_pending_mail_with_a_notice() {
+fn missing_mailbox_presence_withdraws_discovery_without_discarding_custody() {
     let t = team(true);
     learn(&t);
     let msg = message();
@@ -412,20 +429,27 @@ fn mailbox_removal_discards_its_saved_route_and_pending_mail_with_a_notice() {
     t.daemon.learn_mailboxes(&t.laptop.public(), &permanent(&[])).unwrap();
     let g = t.daemon.inner.lock().unwrap();
     assert!(t.daemon.saved_mailboxes(&g).is_empty());
-    assert!(g.store.anchor_pending().unwrap().is_empty());
-    let notices = g.store.unread(&t.daemon.addr(NOTICE_INBOX)).unwrap();
-    assert_eq!(notices.len(), 1);
-    assert!(notices[0].body.contains("mailbox was removed"));
+    let held = g.store.anchor_pending().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].msg.id, msg.id);
+    assert!(!held[0].cancelled);
+    assert!(g.store.unread(&t.daemon.addr(NOTICE_INBOX)).unwrap().is_empty());
 }
 
 #[test]
 fn losing_protocol_support_invalidates_routes_without_trusting_old_known_names() {
     let t = team(true);
     learn(&t);
+    let msg = message();
+    t.daemon.accept_anchor(t.source.public(), t.laptop.public(), msg.clone()).unwrap();
     let old = Presence { known: vec!["inbox".into()], kept: vec!["inbox".into()], ..Default::default() };
     t.daemon.learn_mailboxes(&t.laptop.public(), &old).unwrap();
     assert!(t.daemon.saved_mailboxes(&t.daemon.inner.lock().unwrap()).is_empty());
     assert!(t.daemon.accept_anchor(t.source.public(), t.laptop.public(), message()).is_err());
+    let held = t.daemon.inner.lock().unwrap().store.anchor_pending().unwrap();
+    assert_eq!(held[0].msg.id, msg.id);
+    assert_eq!(held[0].msg.sent_at, msg.sent_at);
+    assert!(!held[0].cancelled);
 }
 
 #[test]
@@ -473,32 +497,38 @@ fn fail_notices(t: &Team) -> (std::path::PathBuf, rusqlite::Connection) {
 }
 
 #[test]
-fn mailbox_removal_stays_cancelled_even_when_its_notice_cannot_be_saved() {
+fn failed_pin_persistence_keeps_both_live_and_saved_routing_unchanged() {
+    let t = team(true);
+    let (dir, db) = fail_notices(&t);
+    let original = t.daemon.selected_anchor();
+    db.execute_batch(
+        "CREATE TRIGGER fail_pin BEFORE INSERT ON kv WHEN NEW.key='team' BEGIN SELECT RAISE(FAIL,'disk failed'); END;",
+    )
+    .unwrap();
+    assert!(t.daemon.set_anchor("laptop", false).is_err());
+    assert_eq!(t.daemon.selected_anchor(), original);
+    let saved: TeamState =
+        serde_json::from_str(&t.daemon.inner.lock().unwrap().store.get("team").unwrap().unwrap()).unwrap();
+    assert_eq!(saved.selected_anchor(&t.daemon.key.public()), original);
+    drop(db);
+    drop(t);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_presence_does_not_cancel_custody_even_when_notice_inserts_fail() {
     let t = team(true);
     let (dir, db) = fail_notices(&t);
     learn(&t);
-    t.daemon.accept_anchor(t.source.public(), t.laptop.public(), message()).unwrap();
-    assert!(t.daemon.learn_mailboxes(&t.laptop.public(), &permanent(&[])).is_err());
-    {
-        let g = t.daemon.inner.lock().unwrap();
-        assert!(t.daemon.saved_mailboxes(&g).is_empty());
-        let pending = g.store.anchor_pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].cancelled, "a failed notice must not make removed mail deliverable again");
-    }
-    // Recreating the same name is a different mailbox lifetime; it cannot undo the earlier removal.
-    let _ = t.daemon.learn_mailboxes(&t.laptop.public(), &permanent(&["inbox"]));
-    assert!(t.daemon.inner.lock().unwrap().store.anchor_pending().unwrap()[0].cancelled);
-    let cancelled: bool = db.query_row("SELECT cancelled FROM anchor_mail", [], |row| row.get(0)).unwrap();
-    assert!(cancelled, "the cancellation survives an anchor crash before its drop notice is saved");
-    db.execute_batch("DROP TRIGGER fail_anchor_notice").unwrap();
+    let msg = message();
+    t.daemon.accept_anchor(t.source.public(), t.laptop.public(), msg.clone()).unwrap();
     t.daemon.learn_mailboxes(&t.laptop.public(), &permanent(&[])).unwrap();
-    {
-        let g = t.daemon.inner.lock().unwrap();
-        assert!(t.daemon.saved_mailboxes(&g).is_empty());
-        assert!(g.store.anchor_pending().unwrap().is_empty());
-        assert_eq!(g.store.unread(&t.daemon.addr(NOTICE_INBOX)).unwrap().len(), 1);
-    }
+    let pending = t.daemon.inner.lock().unwrap().store.anchor_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].msg.id, msg.id);
+    assert!(!pending[0].cancelled);
+    t.daemon.learn_mailboxes(&t.laptop.public(), &permanent(&["inbox"])).unwrap();
+    assert!(!t.daemon.inner.lock().unwrap().store.anchor_pending().unwrap()[0].cancelled);
     drop(db);
     drop(t);
     std::fs::remove_dir_all(dir).unwrap();

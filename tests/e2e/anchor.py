@@ -70,6 +70,17 @@ class Machine:
         output = self.cli("send", "alex/inbox@laptop", body, *args)
         return re.search(r"message id ([0-9A-Z]{26})", output).group(1)
 
+    def restore_unacked(self, target, held):
+        # Rewind the source's whole acceptance transaction, not just its payload deletion.
+        with sqlite3.connect(self.home / "network.db", timeout=10) as connection:
+            connection.execute("DELETE FROM anchor_sends WHERE id = ?", (held[0],))
+            connection.execute("INSERT INTO outbox(id,target,msg,created_at) VALUES (?,?,?,?)",
+                               (held[0], target, held[3], json.loads(held[3])["sent_at"]))
+
+    def receipt(self, message_id):
+        rows = self.rows("SELECT stage FROM sent_receipts WHERE id = ?", (message_id,))
+        return rows[0][0] if rows else None
+
 
 class Network:
     def __init__(self, binary):
@@ -97,8 +108,8 @@ class Network:
         return machine
 
     def join(self, machine, anchor):
-        link = re.search(r"https://\S+#rn1-\S+", anchor.cli("link")).group()
-        machine.cli("join", link, "--proof", proof("u_alex", "alex", machine.endpoint), "--no-setup")
+        invite = re.search(r"One-time code for another machine of yours: (\S+)", anchor.cli("invite", "--me")).group(1)
+        machine.cli("join", invite, "--as", "alex", "--no-setup")
 
     def close(self):
         for machine in self.machines:
@@ -180,6 +191,26 @@ def learn_laptop(network, anchor):
     return laptop
 
 
+def explicit_anchor_trust(network, sender, anchor):
+    proof_only = network.machine("proof-only")
+    link = re.search(r"https://\S+#rn1-\S+", anchor.cli("link")).group()
+    proof_only.cli("join", link, "--proof", proof("u_alex", "alex", proof_only.endpoint), "--no-setup")
+    state = json.loads(proof_only.rows("SELECT value FROM kv WHERE key='team'")[0][0])
+    assert proof_only.endpoint not in state.get("anchors", {})
+    print("PASS: a public team-link sign-in does not grant anchor routing authority", flush=True)
+    proof_only.cli("anchor", "vps", "--trust")
+    wait_for(lambda: any(row["address"] == "alex/inbox" for row in json.loads(proof_only.cli("who", "--json"))["sessions"]),
+             "an explicit signed trust choice enables saved mailbox discovery")
+    proof_only.stop()
+    sender.stop()
+    config = sender.home / "config.toml"
+    config.write_text("anchor = true\n" + config.read_text())
+    sender.cli("team")
+    wait_for(lambda: any(row["address"] == "alex/inbox" for row in json.loads(sender.cli("who", "--json"))["sessions"]),
+             "the restarted sender rediscovers the selected remote mailbox")
+    wait_for(lambda: "multiple anchor claims" in sender.cli("team"), "extra local anchor claim is visible while signed VPS remains selected")
+
+
 def handoff_and_restart(sender, anchor, laptop):
     attachment = sender.home / "task.md"
     attachment.write_text("durable attachment\n")
@@ -209,16 +240,14 @@ def lost_ack_and_direct_retry(machines, held):
     anchor.cli("team")
     wait_for(lambda: not anchor.pending(), "lost final ACK is safely retried")
     assert len(laptop.inbox()) == 1
-    sender.rows("INSERT INTO outbox(id,target,msg,created_at) VALUES (?,?,?,?)",
-                (held[0], laptop.endpoint, held[3], json.loads(held[3])["sent_at"]))
+    sender.restore_unacked(laptop.endpoint, held)
     sender.cli("team")
     wait_for(lambda: not sender.rows("SELECT id FROM outbox"), "direct retry deduplicates against the forwarded copy")
     assert len(laptop.inbox()) == 1
     print("PASS: direct and forwarded retries preserve one inbox message and file", flush=True)
     laptop.stop()
     sender.stop()
-    sender.rows("INSERT INTO outbox(id,target,msg,created_at) VALUES (?,?,?,?)",
-                (held[0], laptop.endpoint, held[3], json.loads(held[3])["sent_at"]))
+    sender.restore_unacked(laptop.endpoint, held)
     sender.cli("team")
     wait_for(lambda: not sender.rows("SELECT id FROM outbox"), "lost acceptance ACK uses the completed anchor receipt")
     assert not anchor.pending()
@@ -237,6 +266,7 @@ def expiry_and_removal(sender, anchor, laptop):
                 (json.dumps(encoded), encoded["sent_at"] + WEEK_MS, message_id))
     anchor.cli("team")
     wait_for(lambda: not anchor.pending(), "expiry uses the original send time across restart")
+    wait_for(lambda: sender.receipt(message_id) == "expired", "sender receipt learns expiry after anchor restart")
     assert anchor.rows("SELECT body FROM messages WHERE reply_to = ?", (message_id,))
     notice = anchor.cli("listen", "--as", "terminal", "--wait", "0")
     assert message_id in notice and "seven days" in notice
@@ -245,8 +275,38 @@ def expiry_and_removal(sender, anchor, laptop):
     wait_for(anchor.pending, "third handoff is held before revocation")
     sender.cli("remove", "alex/laptop")
     wait_for(lambda: not anchor.pending(), "revocation received from another machine drops pending mail")
+    wait_for(lambda: sender.receipt(message_id) == "rejected", "sender receipt learns the revoked handoff outcome")
     assert not anchor.rows("SELECT key FROM kv WHERE key = ?", (f"anchor-route:{laptop.endpoint}",))
     assert anchor.rows("SELECT body FROM messages WHERE reply_to = ?", (message_id,))
+
+
+def keyed_remote_recovery(sender, anchor, laptop):
+    laptop.stop()
+    session = HostedSession(sender)
+    request = {"op": "send", "from": session.key, "to": "alex/inbox@laptop",
+               "body": "keyed remote recovery", "idempotency_key": "remote-recovery"}
+    try:
+        sender.rows("CREATE TRIGGER fail_keyed_receipt BEFORE UPDATE ON send_keys BEGIN SELECT RAISE(FAIL,'test receipt failure'); END")
+        try:
+            session.request(request)
+            raise AssertionError("the injected receipt write failure must reach the caller")
+        except AssertionError as error:
+            assert "test receipt failure" in str(error), error
+        held = wait_for(lambda: next((row for row in anchor.pending() if json.loads(row[3])["body"] == request["body"]), None),
+                        "background custody survives a failed keyed API receipt write")
+        wait_for(lambda: not sender.rows("SELECT id FROM outbox WHERE id=?", (held[0],)),
+                 "failed keyed call transfers custody before its retry")
+        sender.rows("DROP TRIGGER fail_keyed_receipt")
+        result = session.request(request)
+        assert result["ids"] == [held[0]], result
+        assert not sender.rows("SELECT id FROM outbox WHERE id=?", (held[0],))
+        assert next(row[3] for row in anchor.pending() if row[0] == held[0]) == held[3]
+        assert sender.receipt(held[0]) == "anchored"
+        print("PASS: keyed retry recovers original custody without rebuilding the envelope", flush=True)
+        laptop.cli("team")
+        wait_for(lambda: sender.receipt(held[0]) == "accepted", "recovered keyed handoff reports final recipient storage")
+    finally:
+        session.close()
 
 
 def direct_delivery_first(machines):
@@ -308,11 +368,13 @@ def main():
         anchor = network.machine("vps")
         (anchor.home / "config.toml").write_text("anchor = true\n")
         anchor.cli("init", "anchor-test", "--proof", proof("u_alex", "alex", anchor.endpoint), "--no-setup")
+        anchor.cli("anchor", "vps")
         laptop = learn_laptop(network, anchor)
         laptop.stop()
         sender = network.machine("sender")
         network.join(sender, anchor)
         wait_for(lambda: any(row["address"] == "alex/inbox" and row["tier"] != "none" for row in json.loads(sender.cli("who", "--json"))["sessions"]), "fresh workspace discovers offline laptop via anchor")
+        explicit_anchor_trust(network, sender, anchor)
         unknown = subprocess.run([str(sender.binary), "send", "alex/unknown@laptop", "unknown"],
                                  env=sender.env, cwd=sender.home, text=True, capture_output=True, timeout=90)
         assert unknown.returncode != 0 and "unknown" in unknown.stderr.lower()
@@ -320,6 +382,7 @@ def main():
         held = handoff_and_restart(sender, anchor, laptop)
         lost_ack_and_direct_retry((sender, anchor, laptop), held)
         hosted_connection_switch((sender, anchor, laptop))
+        keyed_remote_recovery(sender, anchor, laptop)
         direct_delivery_first((sender, anchor, laptop))
         full_anchor_keeps_the_sender_copy((sender, anchor, laptop))
         expiry_and_removal(sender, anchor, laptop)

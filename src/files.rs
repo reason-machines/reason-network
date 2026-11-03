@@ -331,19 +331,17 @@ pub fn save(dir: &Path, files: &[Attachment]) -> Result<Vec<Attachment>> {
             }
         }
     }
-    // The message's SQLite commit may release the sender's last copy. Its files and new directory entries must
-    // reach disk first, rather than leaving an acknowledged message pointing at files lost in a power failure.
+    // File data is synced by save_one. Directory metadata is best effort: some filesystems don't support fsync.
     #[cfg(unix)]
-    if let Err(e) = (|| -> std::io::Result<()> {
-        for path in [Some(dir), dir.parent(), dir.parent().and_then(Path::parent)].into_iter().flatten() {
-            std::fs::File::open(path)?.sync_all()?;
-        }
-        Ok(())
-    })() {
-        let _ = std::fs::remove_dir_all(dir);
-        return Err(anyhow!("can't sync the files' folder: {}", e.kind()));
-    }
+    sync_directories(dir, |path| std::fs::File::open(path).and_then(|file| file.sync_all()));
     Ok(saved)
+}
+
+#[cfg(unix)]
+fn sync_directories(dir: &Path, mut sync: impl FnMut(&Path) -> std::io::Result<()>) {
+    for path in [Some(dir), dir.parent(), dir.parent().and_then(Path::parent)].into_iter().flatten() {
+        let _ = sync(path);
+    }
 }
 
 fn save_one(dir: &Path, f: &Attachment) -> std::io::Result<String> {
@@ -465,6 +463,17 @@ pub fn inline(body: &str, files: &[Attachment], recipient: &str, max: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_directory_sync_does_not_refuse_already_saved_files() {
+        let mut tried = Vec::new();
+        sync_directories(Path::new("/inbox/message"), |path| {
+            tried.push(path.to_path_buf());
+            Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+        });
+        assert_eq!(tried, [Path::new("/inbox/message"), Path::new("/inbox"), Path::new("/")]);
+    }
 
     fn file(name: &str, content: &str) -> Attachment {
         Attachment { name: name.into(), content: content.into(), path: None }

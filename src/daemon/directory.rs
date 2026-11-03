@@ -268,9 +268,13 @@ impl Daemon {
             .filter(|r| r.mailbox && !self.cfg.off_in(&r.cwd))
             .map(|r| r.name)
             .collect();
-        let mut features =
-            vec![crate::files::FEATURE.into(), super::sessions::TERMINALS.into(), super::anchor::FEATURE.into()];
-        if self.cfg.anchor {
+        let mut features = vec![
+            crate::files::FEATURE.into(),
+            super::sessions::TERMINALS.into(),
+            super::anchor::FEATURE.into(),
+            super::anchor::RECEIPTS.into(),
+        ];
+        if self.cfg.anchor || g.store.anchor_pending().is_ok_and(|pending| !pending.is_empty()) {
             features.push("anchor".into());
         }
         Presence {

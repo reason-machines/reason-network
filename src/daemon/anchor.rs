@@ -12,6 +12,7 @@ use iroh::EndpointId;
 use std::{collections::HashMap, sync::Arc};
 
 pub(crate) const FEATURE: &str = "anchor-mail";
+pub(crate) const RECEIPTS: &str = "anchor-receipts";
 /// Not a session slug: only this machine's terminal can read its custody notices, even after a rename.
 pub(super) const NOTICE_INBOX: &str = "@anchor";
 
@@ -19,8 +20,91 @@ pub(super) const NOTICE_INBOX: &str = "@anchor";
 mod tests;
 
 impl Daemon {
+    pub fn selected_anchor(&self) -> Option<EndpointId> {
+        self.team_state()?.selected_anchor(&self.key.public())
+    }
+
+    pub(super) fn set_anchor(&self, machine: &str, trust: bool) -> Result<String> {
+        let state = {
+            let mut g = self.inner.lock().unwrap();
+            let mut team = g.team.clone().ok_or_else(|| anyhow!("not in a team"))?;
+            let endpoint = if machine == "none" {
+                None
+            } else {
+                let matches: Vec<_> = team
+                    .active()
+                    .filter(|m| m.person == self.person && (m.machine == machine || m.endpoint.to_string() == machine))
+                    .map(|m| m.endpoint)
+                    .collect();
+                if matches.len() != 1 {
+                    bail!("name one of your own computers from `reason-network team`, or `none`");
+                }
+                Some(matches[0])
+            };
+            if trust {
+                team.trust_anchor(&self.key, endpoint.ok_or_else(|| anyhow!("name a trusted own computer"))?)?;
+            } else {
+                team.select_anchor(&self.key, endpoint)?;
+            }
+            let state = team.clone();
+            g.store.set("team", &serde_json::to_string(&state)?)?;
+            g.team = Some(team);
+            state
+        };
+        if let Some(net) = self.net() {
+            net.broadcast(&Wire::State { state: Box::new(state) });
+            net.presence_changed();
+        }
+        Ok(format!(
+            "Anchor choice signed on {}: {machine}. Enable `anchor = true` on the chosen computer.",
+            self.machine
+        ))
+    }
+
+    pub(super) fn anchor_status(&self) -> Vec<String> {
+        let Some(team) = self.team_state() else { return Vec::new() };
+        let selected = team.selected_anchor(&self.key.public());
+        let mut lines = vec![match selected.and_then(|id| team.member(&id)) {
+            Some(m) => format!("anchor: {} ({})", m.machine, m.endpoint),
+            None => "anchor: none selected; use `reason-network anchor <machine>` on a trusted own computer".into(),
+        }];
+        let mut claims: Vec<_> = self
+            .net()
+            .map(|n| {
+                n.remotes()
+                    .into_iter()
+                    .filter(|(id, r)| {
+                        r.online
+                            && r.presence.has("anchor")
+                            && team.member(id).is_some_and(|m| m.active && m.person == self.person)
+                    })
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self.cfg.anchor {
+            claims.push(self.key.public());
+        }
+        claims.sort();
+        claims.dedup();
+        if claims.is_empty() && team.anchor_choice(&self.key.public()).is_none() {
+            return Vec::new();
+        }
+        if claims.len() > 1 || claims.iter().any(|id| Some(*id) != selected) {
+            lines.push(format!(
+                "! unselected/multiple anchor claims: {}; only the signed choice is used",
+                claims
+                    .iter()
+                    .filter_map(|id| team.member(id))
+                    .map(|m| m.machine.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        lines
+    }
     pub fn anchor_local(&self) -> bool {
-        self.cfg.anchor
+        self.cfg.anchor && self.selected_anchor() == Some(self.key.public())
     }
 
     pub fn same_owner(&self, peer: &EndpointId) -> bool {
@@ -62,15 +146,8 @@ impl Daemon {
         } else {
             Some(serde_json::to_string(&MailboxRoute { machine: *peer, names: names.clone() })?)
         };
-        let mut drops = Vec::new();
-        for held in g.store.anchor_pending()?.into_iter().filter(|h| h.target == peer.to_string()) {
-            if !held.msg.to.split_once('/').is_some_and(|(_, n)| names.iter().any(|known| known == n)) {
-                let notice = self
-                    .anchor_notice(&held.msg, "the destination mailbox was removed or no longer supports the anchor");
-                drops.push((held.msg.id, notice));
-            }
-        }
-        g.store.anchor_update_route(&key, route.as_deref(), &drops)?;
+        // Presence is discovery, not a cancellation: an old engine or failed mailbox read may omit these names.
+        g.store.anchor_update_route(&key, route.as_deref(), &[])?;
         // The next presence contains the changed routes, even when no local session changed.
         drop(g);
         if let Some(net) = self.net() {
@@ -85,6 +162,7 @@ impl Daemon {
         for (id, r) in remotes {
             if r.online
                 && r.presence.has("anchor")
+                && Some(*id) == g.team.as_ref().and_then(|t| t.selected_anchor(&self.key.public()))
                 && g.team.as_ref().is_some_and(|t| t.member(id).is_some_and(|m| m.active && m.person == self.person))
             {
                 routes.extend(r.presence.anchor_routes.iter().filter(|route| {
@@ -101,12 +179,15 @@ impl Daemon {
         if !self.same_owner(target) {
             return None;
         }
+        let selected = self.selected_anchor()?;
         let mut peers: Vec<_> = remotes
             .iter()
             .filter(|(id, r)| {
                 *id != target
+                    && **id == selected
                     && r.online
                     && r.presence.has("anchor")
+                    && r.presence.has(RECEIPTS)
                     && self.same_owner(id)
                     && r.presence.anchor_routes.iter().any(|route| route.machine == *target)
             })
@@ -117,7 +198,12 @@ impl Daemon {
     }
 
     pub fn accept_anchor(&self, source: EndpointId, target: EndpointId, msg: Message) -> Result<()> {
-        if !self.cfg.anchor || !self.same_owner(&source) || !self.same_owner(&target) || target == self.key.public() {
+        if !self.cfg.anchor
+            || !self.same_owner(&source)
+            || !self.same_owner(&target)
+            || target == self.key.public()
+            || self.team_state().and_then(|t| t.selected_anchor(&source)) != Some(self.key.public())
+        {
             bail!("an anchor only accepts mail between its owner's other machines");
         }
         let msg = mail::clean(msg)?;
@@ -142,7 +228,7 @@ impl Daemon {
         source: EndpointId,
         msg: Message,
     ) -> Result<(String, String)> {
-        if !self.same_owner(&anchor) || !self.same_owner(&source) {
+        if !self.same_owner(&anchor) || !self.same_owner(&source) || self.selected_anchor() != Some(anchor) {
             bail!("a forwarded message must come from this person's machines");
         }
         let now = util::now_ms();
@@ -206,6 +292,24 @@ impl Daemon {
         }
     }
 
+    pub fn anchor_stored(&self, anchor: &EndpointId, target: &EndpointId, id: &str) -> Result<bool> {
+        self.inner.lock().unwrap().store.outbox_anchored(&anchor.to_string(), &target.to_string(), id)
+    }
+
+    pub fn anchor_result(&self, source: &EndpointId, target: &EndpointId, id: &str) -> Result<Option<String>> {
+        self.inner.lock().unwrap().store.anchor_result(&source.to_string(), &target.to_string(), id, util::now_ms())
+    }
+
+    pub fn anchor_record_result(
+        &self,
+        anchor: &EndpointId,
+        target: &EndpointId,
+        id: &str,
+        stage: &str,
+    ) -> Result<bool> {
+        self.inner.lock().unwrap().store.anchor_record_result(&anchor.to_string(), &target.to_string(), id, stage)
+    }
+
     fn anchor_flush(self: &Arc<Self>, net: &Net) -> Result<()> {
         let remotes = net.remotes();
         let now = util::now_ms();
@@ -226,12 +330,24 @@ impl Daemon {
                 let notice = self.anchor_notice(&held.msg, reason);
                 let g = self.inner.lock().unwrap();
                 g.store.anchor_cancel(&held.msg.id)?;
-                g.store.anchor_finish(&held.msg.id, Some(&notice))?;
+                let stage = if held.msg.sent_at <= now.saturating_sub(ANCHOR_TTL_MS) { "expired" } else { "rejected" };
+                g.store.anchor_finish_as(&held.msg.id, Some(&notice), stage)?;
             } else if remotes.get(&target).is_some_and(|r| r.online && r.presence.has(FEATURE)) {
                 net.anchor_send(target, &held.msg.id, Wire::Forward { source, msg: held.msg.clone() });
             }
         }
         self.inner.lock().unwrap().store.anchor_prune(now)?;
+        let queries = self.inner.lock().unwrap().store.anchor_queries(now)?;
+        for (id, anchor, target) in queries {
+            let (anchor, target): (EndpointId, EndpointId) = (anchor.parse()?, target.parse()?);
+            if anchor == self.key.public() {
+                if let Some(stage) = self.anchor_result(&self.key.public(), &target, &id)? {
+                    self.anchor_record_result(&anchor, &target, &id, &stage)?;
+                }
+            } else {
+                net.anchor_send(anchor, &id, Wire::AnchorQuery { target, id: id.clone() });
+            }
+        }
         for target in self.peer_ids().into_iter().filter(|p| self.same_owner(p) && !net.is_online(p)) {
             let routes = {
                 let g = self.inner.lock().unwrap();
@@ -244,9 +360,12 @@ impl Daemon {
                 }) {
                     continue;
                 }
-                if self.cfg.anchor {
-                    if self.accept_anchor(self.key.public(), target, msg.clone()).is_ok() {
-                        self.outbox_done_from(&target, &msg.id, true);
+                if self.anchor_local() {
+                    if net.anchor_attempt(self.key.public(), &msg.id, Some(target))
+                        && self.accept_anchor(self.key.public(), target, msg.clone()).is_ok()
+                    {
+                        self.anchor_stored(&self.key.public(), &target, &msg.id)?;
+                        net.anchor_attempt_done(self.key.public(), &msg.id);
                     }
                 } else if let Some(anchor) = self.anchor_peer(&remotes, &target) {
                     net.anchor_send(anchor, &msg.id.clone(), Wire::Anchor { target, msg });

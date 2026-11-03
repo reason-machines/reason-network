@@ -147,7 +147,13 @@ impl Daemon {
     }
 
     pub fn outbox_done_from(&self, peer: &EndpointId, id: &str, taken: bool) {
-        match self.inner.lock().unwrap().store.outbox_done_from(&peer.to_string(), id, taken) {
+        let result = (|| {
+            let g = self.inner.lock().unwrap();
+            let removed = g.store.outbox_done_from(&peer.to_string(), id, taken)?;
+            let direct = taken && g.store.anchor_direct_done(&peer.to_string(), id)?;
+            Ok::<_, anyhow::Error>(removed || direct)
+        })();
+        match result {
             Ok(true) => self.usage.stage(id, if taken { "accepted" } else { "rejected" }),
             Ok(false) => {}
             Err(e) => log(&format!("confirming sent mail: {e:#}")),
@@ -278,6 +284,7 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: Vec::new(),
             features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
+            anchor: Vec::new(),
             messages: Vec::new(),
             udp: None,
         })
@@ -347,6 +354,8 @@ impl Daemon {
             proof: proof.clone(),
             owner_only: proof.is_some(),
         };
+        let own_code = invite::normalize(invite_text).map(|code| invite::key(&code).public());
+        let invite_hash = team::hash(&req.secret);
         // Another computer of an account that holds a name is best let in by one of that person's own machines, which
         // every build takes: ask for that first, and once more shortly if a machine on the link couldn't be reached (it
         // may be theirs, not found yet). Else any machine of this build lets it in on its proof, which builds before
@@ -386,6 +395,24 @@ impl Daemon {
         if let Some(p) = &proof {
             state.attest(&me, p);
         }
+        // Only the private own-machine code establishes routing trust. A public team link and a Reason proof don't.
+        if own_code == Some(by) {
+            // Codes authenticate their secret-derived listener key; the signed invite identifies its member key.
+            let authority = state
+                .invites
+                .get(&invite_hash)
+                .filter(|i| {
+                    !i.body.reusable && i.body.person.as_deref() == Some(person.as_str()) && i.body.used_by == Some(me)
+                })
+                .map(|i| i.by)
+                .filter(|authority| {
+                    state.member(authority).is_some_and(|m| m.active && m.person == person)
+                        && state.admissions.get(&me.to_string()).is_some_and(|a| a.by == *authority)
+                });
+            if let Some(authority) = authority {
+                state.trust_anchor(&self.key, authority)?;
+            }
+        }
         let info = TeamInfo {
             id: state.id.clone(),
             name: state.whole_name(),
@@ -396,6 +423,7 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: Vec::new(),
             features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
+            anchor: Vec::new(),
             messages: Vec::new(),
             udp: None,
         };
@@ -550,6 +578,7 @@ impl Daemon {
             machine: self.machine.clone(),
             machines: self.machines(),
             features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
+            anchor: self.anchor_status(),
             messages: self.inner.lock().unwrap().store.counts(util::now_ms()).unwrap_or_default(),
             udp: self.net().map(|n| n.udp()),
         })

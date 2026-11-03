@@ -11,6 +11,10 @@ const CLOCK_SKEW_MS: i64 = 5 * 60_000;
 const MAX_PENDING: i64 = 1_000;
 const MAX_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_RECEIPTS: i64 = 10_000;
+const MAX_SOURCE_PENDING: i64 = MAX_PENDING / 4;
+const MAX_SOURCE_BYTES: i64 = MAX_BYTES / 4;
+const MAX_SOURCE_RECEIPTS: i64 = MAX_RECEIPTS / 4;
+pub const RESULT_KEEP_MS: i64 = TTL_MS;
 
 pub struct AnchorMail {
     pub source: String,
@@ -20,6 +24,37 @@ pub struct AnchorMail {
 }
 
 impl Store {
+    /// A keyed retry must not rebuild an envelope whose outbox payload or custody already exists.
+    pub fn retry_remote_send(&self, id: &str) -> Result<Option<crate::proto::Recipient>> {
+        let receipt: Option<(String, String)> = self
+            .db
+            .query_row("SELECT recipient,stage FROM sent_receipts WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((address, stage)) = receipt else { return Ok(None) };
+        let queued = self.db.prepare_cached("SELECT 1 FROM outbox WHERE id=?1")?.exists([id])?;
+        let anchored = self
+            .db
+            .prepare_cached("SELECT 1 FROM anchor_sends WHERE id=?1 AND retain_until>?2")?
+            .exists(params![id, crate::util::now_ms()])?;
+        if !queued
+            && !anchored
+            && !matches!(stage.as_str(), "accepted" | "held" | "handed_to_agent" | "replied" | "rejected" | "expired")
+        {
+            return Ok(None);
+        }
+        let state = match stage.as_str() {
+            "anchored" => "stored",
+            "rejected" | "expired" => "refused",
+            "handed_to_agent" | "replied" => "accepted",
+            _ => &stage,
+        };
+        Ok(Some(crate::proto::Recipient {
+            address,
+            state: state.into(),
+            note: format!("original message retained with status {stage}; retry does not create another handoff"),
+        }))
+    }
+
     pub fn init_anchor(&self) -> Result<()> {
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS anchor_mail (
@@ -29,9 +64,21 @@ impl Store {
                 digest TEXT NOT NULL,
                 msg TEXT,
                 cancelled INTEGER NOT NULL DEFAULT 0,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                final_stage TEXT NOT NULL DEFAULT 'stored'
+            );
+            CREATE INDEX IF NOT EXISTS anchor_source ON anchor_mail(source);
+            CREATE TABLE IF NOT EXISTS anchor_sends (
+                id TEXT PRIMARY KEY, anchor TEXT NOT NULL, target TEXT NOT NULL,
+                retain_until INTEGER NOT NULL, complete INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        if !self.db.prepare("SELECT 1 FROM pragma_table_info('anchor_mail') WHERE name='final_stage'")?.exists([])? {
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("ALTER TABLE anchor_mail ADD COLUMN final_stage TEXT NOT NULL DEFAULT 'stored'", [])?;
+            tx.execute("UPDATE anchor_mail SET final_stage='unknown' WHERE msg IS NULL", [])?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -58,7 +105,7 @@ impl Store {
             }
             return Ok(false);
         }
-        tx.execute("DELETE FROM anchor_mail WHERE msg IS NULL AND expires_at <= ?1", [now])?;
+        tx.execute("DELETE FROM anchor_mail WHERE msg IS NULL AND expires_at <= ?1", [now - RESULT_KEEP_MS])?;
         let (receipts, pending, bytes): (i64, i64, i64) = tx.query_row(
             "SELECT COUNT(*), COUNT(msg), COALESCE(SUM(length(CAST(msg AS BLOB))), 0) FROM anchor_mail",
             [],
@@ -66,6 +113,17 @@ impl Store {
         )?;
         if receipts >= MAX_RECEIPTS || pending >= MAX_PENDING || encoded.len() as i64 > MAX_BYTES - bytes {
             bail!("anchor is full; the sender must keep its copy");
+        }
+        let (receipts, pending, bytes): (i64, i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COUNT(msg), COALESCE(SUM(length(CAST(msg AS BLOB))), 0) FROM anchor_mail WHERE source=?1",
+            [source],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if receipts >= MAX_SOURCE_RECEIPTS
+            || pending >= MAX_SOURCE_PENDING
+            || encoded.len() as i64 > MAX_SOURCE_BYTES - bytes
+        {
+            bail!("this sender's anchor share is full; the sender must keep its copy");
         }
         tx.execute(
             "INSERT INTO anchor_mail (id, source, target, digest, msg, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -107,8 +165,13 @@ impl Store {
 
     /// The optional owner notice and release commit together; a storage error leaves the last copy intact.
     pub fn anchor_finish(&self, id: &str, notice: Option<&Message>) -> Result<()> {
+        self.anchor_finish_as(id, notice, if notice.is_some() { "rejected" } else { "accepted" })
+    }
+
+    pub fn anchor_finish_as(&self, id: &str, notice: Option<&Message>, stage: &str) -> Result<()> {
+        anyhow::ensure!(matches!(stage, "accepted" | "rejected" | "expired"), "invalid anchor result");
         let tx = self.db.unchecked_transaction()?;
-        self.finish_anchor(id, notice)?;
+        self.finish_anchor(id, notice, stage)?;
         tx.commit()?;
         Ok(())
     }
@@ -146,7 +209,7 @@ impl Store {
         Ok(())
     }
 
-    fn finish_anchor(&self, id: &str, notice: Option<&Message>) -> Result<()> {
+    fn finish_anchor(&self, id: &str, notice: Option<&Message>, stage: &str) -> Result<()> {
         let pending = self
             .db
             .query_row("SELECT 1 FROM anchor_mail WHERE id = ?1 AND msg IS NOT NULL", [id], |_| Ok(()))
@@ -159,15 +222,86 @@ impl Store {
                 }
                 self.insert(&mut notice.clone(), false)?;
             }
-            self.db.execute("UPDATE anchor_mail SET msg = NULL WHERE id = ?1", [id])?;
+            self.db.execute("UPDATE anchor_mail SET msg = NULL, final_stage=?2 WHERE id = ?1", params![id, stage])?;
         }
         Ok(())
     }
 
     /// Pending expiry is handled by the daemon first, so dropping mail can leave an owner-visible notice.
     pub fn anchor_prune(&self, now: i64) -> Result<()> {
-        self.db.execute("DELETE FROM anchor_mail WHERE msg IS NULL AND expires_at <= ?1", [now])?;
+        self.db.execute("DELETE FROM anchor_mail WHERE msg IS NULL AND expires_at <= ?1", [now - RESULT_KEEP_MS])?;
+        self.db.execute("DELETE FROM anchor_sends WHERE retain_until <= ?1", [now])?;
         Ok(())
+    }
+
+    /// The source saves a compact receipt route before releasing its payload, in the same transaction.
+    pub fn outbox_anchored(&self, anchor: &str, target: &str, id: &str) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let sent: Option<i64> = self
+            .db
+            .query_row("SELECT created_at FROM outbox WHERE id=?1 AND target=?2", params![id, target], |r| r.get(0))
+            .optional()?;
+        let Some(sent) = sent else { return Ok(false) };
+        self.db.execute(
+            "INSERT INTO anchor_sends(id,anchor,target,retain_until) VALUES(?1,?2,?3,?4)",
+            params![id, anchor, target, sent.saturating_add(TTL_MS).saturating_add(RESULT_KEEP_MS)],
+        )?;
+        self.finish_outbox(id, true)?;
+        self.db.execute(
+            "UPDATE sent_receipts SET stage='anchored' WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn anchor_queries(&self, now: i64) -> Result<Vec<(String, String, String)>> {
+        let mut st =
+            self.db.prepare("SELECT id,anchor,target FROM anchor_sends WHERE complete=0 AND retain_until>?1")?;
+        Ok(st.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn anchor_result(&self, source: &str, target: &str, id: &str, now: i64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT final_stage FROM anchor_mail WHERE id=?1 AND source=?2 AND target=?3 AND expires_at>?4",
+                params![id, source, target, now - RESULT_KEEP_MS],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn anchor_record_result(&self, anchor: &str, target: &str, id: &str, stage: &str) -> Result<bool> {
+        if !matches!(stage, "accepted" | "rejected" | "expired" | "unknown") {
+            return Ok(false);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let changed = self.db.execute("UPDATE anchor_sends SET complete=1 WHERE id=?1 AND anchor=?2 AND target=?3 AND complete=0 AND retain_until>?4",
+            params![id,anchor,target,crate::util::now_ms()])?;
+        if changed == 1 {
+            self.db.execute("UPDATE sent_receipts SET stage=?2,updated_at=?3 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')",
+                params![id,stage,crate::util::now_ms()])?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// A direct recipient ACK can race the anchor's acceptance or expiry; actual storage wins over a relay outcome.
+    pub fn anchor_direct_done(&self, target: &str, id: &str) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let valid = self.db.execute(
+            "UPDATE anchor_sends SET complete=1 WHERE id=?1 AND target=?2 AND retain_until>?3",
+            params![id, target, crate::util::now_ms()],
+        )?;
+        let changed = if valid == 1 {
+            self.db.execute("UPDATE sent_receipts SET stage='accepted',updated_at=?2 WHERE id=?1 AND stage NOT IN ('accepted','handed_to_agent','replied')",
+                params![id,crate::util::now_ms()])? > 0
+        } else {
+            false
+        };
+        tx.commit()?;
+        Ok(changed)
     }
 }
 
@@ -202,6 +336,129 @@ mod tests {
         let store = Store::open(Path::new(":memory:"), inbox).unwrap();
         store.init_anchor().unwrap();
         store
+    }
+
+    #[test]
+    fn a_senders_share_leaves_room_for_other_machines_and_retry_receipts() {
+        let store = store();
+        for n in 0..MAX_SOURCE_PENDING {
+            store.anchor_accept("busy", "target", &message(&n.to_string()), NOW).unwrap();
+        }
+        assert!(store.anchor_accept("busy", "target", &message("extra"), NOW).is_err());
+        assert!(!store.anchor_accept("busy", "target", &message("0"), NOW).unwrap());
+        assert!(store.anchor_accept("another", "target", &message("other"), NOW).unwrap());
+        for n in 0..MAX_SOURCE_PENDING {
+            store.anchor_finish(&n.to_string(), None).unwrap();
+        }
+        for n in MAX_SOURCE_PENDING..MAX_SOURCE_RECEIPTS {
+            store.anchor_accept("busy", "target", &message(&n.to_string()), NOW).unwrap();
+            store.anchor_finish(&n.to_string(), None).unwrap();
+        }
+        assert!(store.anchor_accept("busy", "target", &message("more"), NOW).is_err());
+        assert!(store.anchor_accept("another", "target", &message("other2"), NOW).unwrap());
+    }
+
+    #[test]
+    fn source_receipts_are_bound_to_the_original_custodian_and_final_outcome() {
+        let source = store();
+        let anchor = store();
+        let now = crate::util::now_ms();
+        let msg = Message { sent_at: now, ..message("mail") };
+        source.record_sent("sender", &msg, "alex/inbox@laptop", "queued").unwrap();
+        source.outbox_add("target", &msg).unwrap();
+        anchor.anchor_accept("source", "target", &msg, now).unwrap();
+        source.outbox_anchored("anchor", "target", &msg.id).unwrap();
+        let stage = || source.delivery_status("sender", std::slice::from_ref(&msg.id)).unwrap()[0]["stage"].clone();
+        assert_eq!(stage(), "anchored");
+        assert!(source.outbox_for("target", now).unwrap().0.is_empty());
+        assert!(anchor.anchor_result("stranger", "target", &msg.id, now).unwrap().is_none());
+        assert!(!source.anchor_record_result("imposter", "target", &msg.id, "rejected").unwrap());
+        assert!(!source.anchor_record_result("anchor", "other-target", &msg.id, "expired").unwrap());
+        anchor.anchor_finish_as(&msg.id, None, "expired").unwrap();
+        let outcome = anchor.anchor_result("source", "target", &msg.id, now + TTL_MS).unwrap().unwrap();
+        assert_eq!(outcome, "expired");
+        source.anchor_record_result("anchor", "target", &msg.id, &outcome).unwrap();
+        assert_eq!(stage(), "expired");
+        assert!(source.anchor_queries(now).unwrap().is_empty());
+        assert!(!source.anchor_record_result("anchor", "target", &msg.id, "accepted").unwrap());
+        assert_eq!(stage(), "expired");
+        assert!(anchor.anchor_result("source", "target", &msg.id, now + TTL_MS + RESULT_KEEP_MS).unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_legacy_result_migration_rolls_back_and_recovers_as_unknown() {
+        let store = store();
+        store.db.execute_batch("DROP TABLE anchor_mail;
+            CREATE TABLE anchor_mail(id TEXT PRIMARY KEY,source TEXT NOT NULL,target TEXT NOT NULL,digest TEXT NOT NULL,msg TEXT,cancelled INTEGER NOT NULL DEFAULT 0,expires_at INTEGER NOT NULL);
+            INSERT INTO anchor_mail VALUES('legacy','source','target','digest',NULL,0,9999999999999);
+            CREATE TRIGGER fail_result_upgrade BEFORE UPDATE ON anchor_mail BEGIN SELECT RAISE(FAIL,'disk failed'); END;").unwrap();
+        assert!(store.init_anchor().is_err());
+        assert!(
+            !store
+                .db
+                .prepare("SELECT 1 FROM pragma_table_info('anchor_mail') WHERE name='final_stage'")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        store.db.execute_batch("DROP TRIGGER fail_result_upgrade").unwrap();
+        store.init_anchor().unwrap();
+        assert_eq!(store.anchor_result("source", "target", "legacy", NOW).unwrap().as_deref(), Some("unknown"));
+        let now = crate::util::now_ms();
+        let msg = Message { sent_at: now, ..message("legacy") };
+        store.record_sent("sender", &msg, "alex/inbox", "queued").unwrap();
+        store.outbox_add("target", &msg).unwrap();
+        store.outbox_anchored("anchor", "target", "legacy").unwrap();
+        assert!(store.anchor_record_result("anchor", "target", "legacy", "unknown").unwrap());
+        assert_eq!(store.delivery_status("sender", &["legacy".into()]).unwrap()[0]["stage"], "unknown");
+        assert!(store.anchor_queries(now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_expiry_results_remain_readable_after_the_original_send_week() {
+        let store = store();
+        let now = crate::util::now_ms();
+        let msg = Message { sent_at: now - TTL_MS - 1, ..message("mail") };
+        store.record_sent("sender", &msg, "alex/inbox", "queued").unwrap();
+        store.outbox_add("target", &msg).unwrap();
+        store.outbox_anchored("anchor", "target", "mail").unwrap();
+        store.anchor_record_result("anchor", "target", "mail", "expired").unwrap();
+        store.sweep_files(now).unwrap();
+        assert_eq!(store.delivery_status("sender", &["mail".into()]).unwrap()[0]["stage"], "expired");
+        store.anchor_prune(now + RESULT_KEEP_MS).unwrap();
+        store.sweep_files(now + RESULT_KEEP_MS).unwrap();
+        assert_eq!(store.delivery_status("sender", &["mail".into()]).unwrap()[0]["stage"], "unknown");
+    }
+
+    #[test]
+    fn a_late_direct_storage_ack_wins_over_anchor_expiry_without_double_counting() {
+        let store = store();
+        let now = crate::util::now_ms();
+        let msg = Message { sent_at: now, ..message("mail") };
+        store.record_sent("sender", &msg, "alex/inbox", "queued").unwrap();
+        store.outbox_add("target", &msg).unwrap();
+        store.outbox_anchored("anchor", "target", "mail").unwrap();
+        assert!(!store.outbox_done_from("target", "mail", true).unwrap());
+        assert!(!store.anchor_direct_done("other", "mail").unwrap());
+        store.anchor_record_result("anchor", "target", "mail", "expired").unwrap();
+        assert!(store.anchor_direct_done("target", "mail").unwrap());
+        assert!(!store.anchor_record_result("anchor", "target", "mail", "rejected").unwrap());
+        assert!(!store.anchor_direct_done("target", "mail").unwrap());
+        assert_eq!(store.delivery_status("sender", &["mail".into()]).unwrap()[0]["stage"], "accepted");
+        assert_eq!(store.counts(now).unwrap().iter().map(|c| c.sent).sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn failed_source_acceptance_preserves_the_payload_and_retry_state() {
+        let store = store();
+        let msg = Message { sent_at: crate::util::now_ms(), ..message("mail") };
+        store.record_sent("sender", &msg, "alex/inbox", "queued").unwrap();
+        store.outbox_add("target", &msg).unwrap();
+        store.db.execute_batch("CREATE TRIGGER fail_source_release BEFORE DELETE ON outbox BEGIN SELECT RAISE(FAIL,'disk failed'); END;").unwrap();
+        assert!(store.outbox_anchored("anchor", "target", &msg.id).is_err());
+        assert_eq!(store.outbox_for("target", crate::util::now_ms()).unwrap().0.len(), 1);
+        assert!(store.anchor_queries(crate::util::now_ms()).unwrap().is_empty());
+        assert_eq!(store.delivery_status("sender", &[msg.id]).unwrap()[0]["stage"], "queued");
     }
 
     #[test]
@@ -255,6 +512,9 @@ mod tests {
         assert_eq!(receipts, 1);
         store.anchor_prune(NOW + TTL_MS).unwrap();
         let receipts: i64 = store.db.query_row("SELECT COUNT(*) FROM anchor_mail", [], |r| r.get(0)).unwrap();
+        assert_eq!(receipts, 1, "compact outcomes survive payload expiry");
+        store.anchor_prune(NOW + TTL_MS + RESULT_KEEP_MS).unwrap();
+        let receipts: i64 = store.db.query_row("SELECT COUNT(*) FROM anchor_mail", [], |r| r.get(0)).unwrap();
         assert_eq!(receipts, 0);
         assert!(store.anchor_accept("source", "target", &msg, NOW + TTL_MS + 1).is_err());
     }
@@ -274,12 +534,14 @@ mod tests {
     fn pending_count_is_bounded_but_identical_retries_still_succeed_when_full() {
         let store = store();
         for n in 0..MAX_PENDING {
-            store.anchor_accept("source", "target", &message(&n.to_string()), NOW).unwrap();
+            store
+                .anchor_accept(&format!("source{}", n / MAX_SOURCE_PENDING), "target", &message(&n.to_string()), NOW)
+                .unwrap();
         }
         assert!(store.anchor_accept("source", "target", &message("extra"), NOW).is_err());
-        assert!(!store.anchor_accept("source", "target", &message("0"), NOW).unwrap());
+        assert!(!store.anchor_accept("source0", "target", &message("0"), NOW).unwrap());
         store.anchor_finish("0", None).unwrap();
-        assert!(store.anchor_accept("source", "target", &message("extra"), NOW).unwrap());
+        assert!(store.anchor_accept("source0", "target", &message("extra"), NOW).unwrap());
         assert_eq!(store.anchor_pending().unwrap().len(), MAX_PENDING as usize);
     }
 
@@ -290,11 +552,12 @@ mod tests {
         msg.body = "界".repeat((MAX_BYTES / 3) as usize);
         assert!(store.anchor_accept("source", "target", &msg, NOW).is_err());
         assert!(store.anchor_pending().unwrap().is_empty());
-        msg.body = "界".repeat((MAX_BYTES / 3 - 1024) as usize);
+        msg.body = "界".repeat((MAX_SOURCE_BYTES / 3 - 1024) as usize);
         store.anchor_accept("source", "target", &msg, NOW).unwrap();
         let next = Message { body: "x".repeat(4_000), ..message("next") };
         assert!(store.anchor_accept("source", "target", &next, NOW).is_err());
-        assert_eq!(store.anchor_pending().unwrap().len(), 1);
+        assert!(store.anchor_accept("another", "target", &message("other"), NOW).unwrap());
+        assert_eq!(store.anchor_pending().unwrap().len(), 2);
     }
 
     #[test]
@@ -304,7 +567,7 @@ mod tests {
         for n in 0..MAX_RECEIPTS {
             tx.execute(
                 "INSERT INTO anchor_mail (id,source,target,digest,msg,expires_at) VALUES (?1, 'source', 'target', 'digest', NULL, ?2)",
-                params![n.to_string(), NOW + 1],
+                params![n.to_string(), NOW + 1 - RESULT_KEEP_MS],
             )
             .unwrap();
         }

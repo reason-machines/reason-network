@@ -59,6 +59,7 @@ pub enum Wire {
     Anchor { target: EndpointId, msg: Message },
     Anchored { target: EndpointId, id: String, state: String, note: String },
     Forward { source: EndpointId, msg: Message },
+    AnchorQuery { target: EndpointId, id: String },
 }
 
 /// Permanent destinations learned directly by an owner's anchor, never ordinary agent sessions.
@@ -142,7 +143,7 @@ struct Link {
 }
 
 type AckWaiters = HashMap<(EndpointId, String), oneshot::Sender<(String, String)>>;
-type AnchorAttempts = HashMap<(EndpointId, String), (Instant, Option<EndpointId>)>;
+type AnchorAttempts = HashMap<(EndpointId, String), (Instant, Option<EndpointId>, Duration)>;
 
 pub struct Net {
     endpoint: Endpoint,
@@ -898,9 +899,28 @@ impl Net {
     }
 
     pub fn broadcast(&self, w: &Wire) {
-        for (peer, l) in self.links.lock().unwrap().iter() {
-            let _ = l.tx.send(for_peer(w, peer));
+        let peers: Vec<_> = self.links.lock().unwrap().iter().map(|(peer, l)| (*peer, l.tx.clone())).collect();
+        for (peer, tx) in peers {
+            let _ = tx.send(self.for_peer(w, &peer));
         }
+    }
+
+    fn for_peer(&self, w: &Wire, peer: &EndpointId) -> Wire {
+        if let Wire::Presence { presence } = w
+            && !self.daemon.upgrade().is_some_and(|d| d.same_owner(peer))
+        {
+            let mut presence = presence.clone();
+            presence.features.retain(|f| f != "anchor");
+            presence.mailboxes.clear();
+            presence.anchor_routes.clear();
+            return Wire::Presence { presence };
+        }
+        for_peer(w, peer)
+    }
+
+    fn supports(&self, peer: &EndpointId, feature: &str) -> bool {
+        self.links.lock().unwrap().get(peer).is_some_and(|l| l.presence_seen)
+            && self.remote.lock().unwrap().get(peer).is_some_and(|r| r.presence.has(feature))
     }
 
     /// Drops a removed machine, after a moment so the state telling it so gets there first.
@@ -960,28 +980,53 @@ impl Net {
         let feature = match &frame {
             Wire::Anchor { .. } => "anchor",
             Wire::Forward { .. } => "anchor-mail",
+            Wire::AnchorQuery { .. } => crate::daemon::anchor::RECEIPTS,
             _ => return,
         };
         if !self.remote.lock().unwrap().get(&peer).is_some_and(|r| r.presence.has(feature)) {
             return;
         }
-        let mut sent = self.anchor_sent.lock().unwrap();
-        sent.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
-        if sent.contains_key(&(peer, id.to_string())) {
-            return;
-        }
         let target = if let Wire::Anchor { target, .. } = &frame { Some(*target) } else { None };
-        if link.tx.send(frame).is_ok() {
-            sent.insert((peer, id.to_string()), (Instant::now(), target));
+        if self.anchor_attempt(peer, id, target) {
+            // Small receipt queries have a fixed cadence; only complete payload retries back off exponentially.
+            if matches!(&frame, Wire::AnchorQuery { .. })
+                && let Some(attempt) = self.anchor_sent.lock().unwrap().get_mut(&(peer, id.to_string()))
+            {
+                attempt.2 = Duration::from_secs(30);
+            }
+            let _ = link.tx.send(frame);
         }
+    }
+
+    pub fn anchor_attempt(&self, peer: EndpointId, id: &str, target: Option<EndpointId>) -> bool {
+        let mut sent = self.anchor_sent.lock().unwrap();
+        sent.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(3600));
+        let previous = sent.get(&(peer, id.to_string()));
+        if previous.is_some_and(|(at, _, delay)| at.elapsed() < *delay) {
+            return false;
+        }
+        let delay =
+            previous.map_or(Duration::from_secs(30), |(_, _, delay)| (*delay * 2).min(Duration::from_secs(600)));
+        sent.insert((peer, id.to_string()), (Instant::now(), target, delay));
+        true
+    }
+
+    pub fn anchor_attempt_done(&self, peer: EndpointId, id: &str) {
+        self.anchor_sent.lock().unwrap().remove(&(peer, id.to_string()));
     }
 
     pub async fn send_anchor(&self, target: EndpointId, msg: &Message) -> Option<(String, String)> {
         let daemon = self.daemon.upgrade()?;
         if daemon.anchor_local() {
+            if !self.anchor_attempt(self.me, &msg.id, Some(target)) {
+                return None;
+            }
             return match daemon.accept_anchor(self.me, target, msg.clone()) {
                 Ok(()) => {
-                    daemon.outbox_done_from(&target, &msg.id, true);
+                    if let Err(e) = daemon.anchor_stored(&self.me, &target, &msg.id) {
+                        return Some(("queued".into(), format!("sender retains the message: {e:#}")));
+                    }
+                    self.anchor_attempt_done(self.me, &msg.id);
                     daemon.anchor_tick(self);
                     Some(("stored".into(), "stored durably on this anchor".into()))
                 }
@@ -1148,7 +1193,7 @@ impl Net {
         if let Some(state) = daemon.team_state() {
             let _ = tx.send(for_peer(&Wire::State { state: Box::new(state) }, &peer));
         }
-        let _ = tx.send(Wire::Presence { presence: daemon.presence().await });
+        let _ = tx.send(self.for_peer(&Wire::Presence { presence: daemon.presence().await }, &peer));
         for msg in daemon.outbox_for(&peer) {
             let _ = tx.send(Wire::Msg { msg });
         }
@@ -1222,7 +1267,9 @@ impl Net {
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
                 if state != "retry" {
                     daemon.outbox_done_from(&peer, &id, state != "refused");
-                    daemon.forward_done(&peer, &id, &state, &note)?;
+                    if let Err(e) = daemon.forward_done(&peer, &id, &state, &note) {
+                        log(&format!("saving anchor delivery result: {e:#}"));
+                    }
                 }
                 if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
                     let _ = waiter.send((state, note));
@@ -1237,19 +1284,33 @@ impl Net {
                 let _ = tx.send(Wire::Anchored { target, id, state, note });
             }
             Wire::Anchored { target, id, state, note } => {
+                if matches!(state.as_str(), "accepted" | "rejected" | "expired" | "unknown") {
+                    match daemon.anchor_record_result(&peer, &target, &id, &state) {
+                        Ok(true) => {
+                            self.anchor_sent.lock().unwrap().remove(&(peer, id));
+                        }
+                        Ok(false) => {}
+                        Err(e) => log(&format!("saving anchor receipt: {e:#}")),
+                    }
+                    return Ok(());
+                }
                 let offered = self
                     .anchor_sent
                     .lock()
                     .unwrap()
                     .get(&(peer, id.clone()))
-                    .is_some_and(|(_, offered)| *offered == Some(target));
+                    .is_some_and(|(_, offered, _)| *offered == Some(target));
                 if offered
                     && self.remotes().get(&peer).is_some_and(|r| r.presence.has("anchor"))
                     && daemon.same_owner(&peer)
+                    && daemon.selected_anchor() == Some(peer)
                 {
-                    self.anchor_sent.lock().unwrap().remove(&(peer, id.clone()));
                     if state == "stored" {
-                        daemon.outbox_done_from(&target, &id, true);
+                        if let Err(e) = daemon.anchor_stored(&peer, &target, &id) {
+                            log(&format!("retaining sender's anchor copy: {e:#}"));
+                            return Ok(());
+                        }
+                        self.anchor_sent.lock().unwrap().remove(&(peer, id.clone()));
                     }
                     if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
                         let _ = waiter.send((state, note));
@@ -1258,12 +1319,24 @@ impl Net {
             }
             Wire::Forward { source, msg } => {
                 let id = msg.id.clone();
-                let (state, note) = match daemon.receive_forward(peer, source, msg) {
+                let result = if self.supports(&peer, "anchor") {
+                    daemon.receive_forward(peer, source, msg)
+                } else {
+                    Err(anyhow!("the forwarding computer has not announced anchor custody"))
+                };
+                let (state, note) = match result {
                     Ok(v) => v,
                     Err(e) => ("retry".into(), format!("forward not saved: {e:#}")),
                 };
                 let _ = tx.send(Wire::Ack { id, state, note });
             }
+            Wire::AnchorQuery { target, id } => match daemon.anchor_result(&peer, &target, &id) {
+                Ok(Some(state)) => {
+                    let _ = tx.send(Wire::Anchored { target, id, state, note: String::new() });
+                }
+                Ok(None) => {}
+                Err(e) => log(&format!("reading anchor result: {e:#}")),
+            },
         }
         Ok(())
     }
@@ -1318,6 +1391,7 @@ fn tidy_presence(mut p: Presence) -> Presence {
 }
 
 fn tidy_mailboxes(mut names: Vec<String>) -> Vec<String> {
+    names.truncate(100);
     names.retain(|n| !n.is_empty() && n.len() <= 64 && util::slug(n) == *n);
     names.sort();
     names.dedup();

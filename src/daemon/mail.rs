@@ -285,6 +285,14 @@ impl Daemon {
                 } else {
                     Ulid::generate().to_string()
                 };
+                if send_key.is_some()
+                    && let Some(receipt) = g.store.retry_remote_send(&id)?
+                {
+                    *may_have_dispatched = true;
+                    res.ids.push(id);
+                    res.recipients.push(receipt);
+                    continue;
+                }
                 if let Some(old) = g.store.message(&id)? {
                     *may_have_dispatched = true;
                     res.ids.push(id);
@@ -429,10 +437,10 @@ impl Daemon {
                     } else {
                         verdict
                     };
-                    (i, name, verdict)
+                    (i, name, online, verdict)
                 }
             });
-            for (i, name, verdict) in futures_join(sends).await {
+            for (i, name, online, verdict) in futures_join(sends).await {
                 let r = &mut res.recipients[i];
                 match verdict {
                     // A pop-up only (see above): nothing kept to retry.
@@ -444,6 +452,7 @@ impl Daemon {
                         r.note = note;
                     }
                     None if r.state == "not notified" => r.note = format!("no answer from {name}"),
+                    None if !online => {}
                     None => r.note = format!("queued: no answer from {name} yet; it will be retried"),
                 }
             }

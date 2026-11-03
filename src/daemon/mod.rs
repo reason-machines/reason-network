@@ -2,7 +2,7 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
-mod anchor;
+pub(crate) mod anchor;
 mod antigravity;
 mod ask;
 mod diagnostics;
@@ -437,6 +437,7 @@ impl Daemon {
             Request::Remove { who } => json!(self.remove(&who)?),
             Request::Leave { force } => json!(self.leave(force).await?),
             Request::SetRelay { url } => json!(self.set_relay(url).await?),
+            Request::SetAnchor { machine, trust } => json!(self.set_anchor(&machine, trust)?),
             Request::Held => json!(self.inner.lock().unwrap().store.held()?),
             Request::Settle { ids, release } => json!(self.settle(&ids, release)?),
             Request::Shutdown => {
@@ -496,6 +497,17 @@ fn test_daemon(cfg: Config) -> Daemon {
     let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
     let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
     Daemon::with(cfg, store, SecretKey::generate()).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_anchor_peer(peer: &SecretKey) -> Arc<Daemon> {
+    let d = Arc::new(test_daemon(Config { person: Some("alex".into()), ..Default::default() }));
+    let mut team = TeamState::found("test", "alex", "local", &d.key);
+    team.put_member(&d.key, peer.public(), "alex", "anchor", true);
+    team.put_member(&d.key, SecretKey::generate().public(), "bob", "teammate", true);
+    team.select_anchor(&d.key, Some(peer.public())).unwrap();
+    d.inner.lock().unwrap().team = Some(team);
+    d
 }
 
 #[cfg(test)]

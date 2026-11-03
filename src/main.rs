@@ -128,6 +128,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Select your trusted anchor by machine name (or `none` to disable handoffs)
+    Anchor {
+        machine: String,
+        /// Follow this trusted own computer's signed choice instead of selecting a custodian directly
+        #[arg(long)]
+        trust: bool,
+    },
     /// Show who is working on what, across the team
     Who {
         /// Only sessions matching this text
@@ -637,6 +644,9 @@ async fn cli(cmd: Cmd) -> Result<()> {
         Cmd::Team { json: true } => {
             println!("{}", shown(&serde_json::to_string_pretty(&team_json(&link, None, false).await?)?))
         }
+        Cmd::Anchor { machine, trust } => {
+            println!("{}", shown(&link.call::<String>(Request::SetAnchor { machine, trust }).await?));
+        }
         Cmd::Team { json: false } => {
             let t: TeamInfo = link.call(Request::Team).await?;
             print!("{}", shown(&render::team(&t)));
@@ -953,6 +963,7 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![me],
             features: vec![],
+            anchor: Vec::new(),
             messages: vec![],
             udp: None,
         };

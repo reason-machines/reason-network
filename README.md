@@ -129,6 +129,13 @@ computer (a VPS or Pi, signed in as you), add this at the top of `~/.reason/netw
 anchor = true
 ```
 
+Choose it explicitly with `reason-network anchor vps` on that computer (replace `vps` with its machine name from
+`team`). On existing own computers, `reason-network anchor vps --trust` follows the VPS's signed choice. Membership
+or a Reason sign-in proof alone cannot select a custodian. New own computers joining with the private code from
+`invite --me` sign that trust in their inviter automatically; a public team-link join needs an explicit choice or
+`--trust` command. `team` and `doctor` show the selected anchor and warn about unselected or multiple claims.
+Use `reason-network anchor none` to stop new handoffs on this computer.
+
 Run `reason-network listen --as inbox --wait 0` on the laptop while both computers are online once. The anchor
 remembers that permanent mailbox. After that, even a fresh workspace signed in as you can find it with `who` and send
 to `you/inbox@laptop` (use your name and the laptop's machine name). Use one anchor per person; the sending and receiving
@@ -139,11 +146,18 @@ files in its SQLite database before answering **stored**. The sender can then go
 the laptop saves it. This confirms storage, not that an agent has read or completed the work. Your own anchor can read
 the mail, just as your laptop can; keep its state on persistent disk.
 
-An anchor holds up to 1,000 pending messages and 64 MB of message data, with up to 10,000 retry receipts. When full it
-refuses the handoff and the sender keeps its copy. Mail expires seven days from the original send, including after a
-restart or retry. Removal of a mailbox or revocation of a machine drops its pending mail. Drop notices stay in the
+An anchor holds up to 1,000 pending messages and 64 MB of message data, with up to 10,000 retry receipts. One sending
+computer can use at most 250 pending messages, 16 MB, and 2,500 receipts. When full it refuses the handoff and the sender
+keeps its copy; payload retries back off from 30 seconds to ten minutes. Mail expires seven days from the original send,
+including after a restart or retry. Missing mailbox announcements or an older engine withdraw discovery without
+discarding accepted mail. Actual delivery refusal or machine revocation drops that handoff. Drop notices stay in the
 anchor's `terminal` inbox (`reason-network listen --as terminal --wait 0` there), even if the sending workspace is gone.
-Already accepted mail continues to drain if you turn the setting off. Reason keeps hosted assistants' inboxes centrally,
+The sender's receipt stays `anchored` until the anchor reports recipient storage, refusal, or expiry. Compact results
+and corresponding source receipts remain available for seven more days after payload expiry, without retaining the
+payload. Queries continue against the original custodian after a selection change. Already accepted mail continues to
+drain if you turn the anchor setting off while keeping it selected; changing the selected anchor can leave old custody
+waiting until the original expiry. File data is synced before storage acknowledgment; directory syncing is best effort
+on filesystems that don't support it. Reason keeps hosted assistants' inboxes centrally,
 but mail not yet handed to Reason can still be waiting on a computer or its peers. This anchor covers permanent
 mailboxes, not that hosted-session handoff.
 

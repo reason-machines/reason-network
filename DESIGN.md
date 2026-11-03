@@ -268,7 +268,18 @@ An **anchor** is an opt-in member daemon on an always-on box (VPS, Pi), enabled 
 It announces `anchor` in `Presence.features`; upgraded engines also announce `anchor-mail` and their permanent
 `mailboxes`. The anchor remembers only direct, same-person mailbox announcements in SQLite and advertises those
 `anchor_routes` to that person's other computers. Fresh workspaces can discover the offline destinations without a
-registration step. Direct presence wins over a cached route; removal or revocation invalidates routes and pending mail.
+registration step. Direct presence wins over a cached route. Missing or downgraded presence withdraws routes but does
+not cancel accepted custody; roster revocation still cancels it.
+
+An `anchors` map in team state holds choices signed under the `anchor` domain, keyed by the selecting machine.
+`reason-network anchor <machine>` signs a local selection; `--trust` delegates to another own computer's signed choice.
+Resolution starts only from the local key's record and follows active, same-person delegations; missing records,
+cycles, removal or a different person fail closed, without choosing an older record or a machine advertising itself.
+Private `invite --me` code enrollment signs the joiner's delegation to its authenticated inviter. Public team links and
+Reason identity proofs do not establish anchor authority. Existing machines opt into a selection or trusted selector
+explicitly. Old engines ignore the map and cannot erase it by omitting it. Re-admitting the same key restores its
+existing delegation. `team` and `doctor` expose the selected endpoint and extra claims; anchor presence/routes are sent
+only to own computers.
 
 Direct delivery is tried first. For an offline own machine, `Anchor` carries its endpoint and the complete original
 message. `Anchored` confirms only after a durable SQLite transaction. `Forward` retains the original source endpoint,
@@ -277,10 +288,20 @@ uses its normal validation, policy, file storage and ID deduplication before ack
 matched to the destination computer; anchor acceptance is a separate, correlated acknowledgment. New frames only go to
 engines advertising support; old engines and machines without an anchor use their existing path.
 
-The anchor keeps at most 1,000 pending envelopes, 64 MB of serialized payloads, and 10,000 receipts. Full storage refuses
-acceptance explicitly. Completed receipts retain the ID, source, destination and payload digest until the original
-seven-day expiry, so a lost acknowledgment cannot resurrect delivered mail or extend its lifetime. Expiry, mailbox
-removal and revocation save a notice in the anchor's own terminal inbox while releasing the payload in one transaction.
+The anchor keeps at most 1,000 pending envelopes, 64 MB of serialized payloads, and 10,000 receipts. Each sending machine
+has a quarter of each limit. Full storage refuses acceptance explicitly. A refused or unanswered payload keeps its
+retry guard, backing off from 30 seconds to ten minutes. File data sync is required; unsupported directory fsync does
+not refuse an otherwise saved attachment.
+
+The source atomically replaces its outbox payload with compact custodian/target metadata and an `anchored` receipt.
+`AnchorQuery`, gated by `anchor-receipts`, retrieves results through `Anchored`; results are correlated to the recorded
+custodian, source, target and ID, independently of later pin changes. Small queries have a fixed 30-second cadence.
+The anchor commits its terminal result with payload release and any local notice. Compact results/digests and their
+source receipts remain until seven days after the original seven-day payload expiry. This does not extend payload
+lifetime. Recipient storage changes the source receipt to `accepted`; final refusal/revocation or expiry changes it
+to `rejected` or `expired`. Lost responses and failed source writes are retried after restart. Expiry and revocation
+also leave an owner notice on the anchor. Changing the selected anchor does not authorize the old one to impersonate
+a source: its undelivered custody waits until it is selected again or expires, with the original result route retained.
 This is trusted same-person custody over encrypted transport: the anchor can read the stored content. It is not an
 untrusted ciphertext store or searchable team history. Reason already keeps hosted inboxes centrally; handing mail from
 computer-bound sessions to Reason across a carrier change remains a separate follow-up.
