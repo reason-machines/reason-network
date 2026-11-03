@@ -200,6 +200,8 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// Told who it is on Reason Network (Antigravity's hooks, which may say it at any invocation).
+    introduced: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {

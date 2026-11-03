@@ -112,8 +112,8 @@ async fn handle(
     let ids = reply.ids;
     let text = match (reply.text, ev, reply.address) {
         (Some(t), ..) => t,
-        // Say who it is on Reason Network once, at session start.
-        (None, "start" | "prompt", Some(addr)) if ev == "start" || agent == "antigravity" => {
+        // Say who it is on Reason Network once: at session start, or for Antigravity at the one hook the daemon picks.
+        (None, "start" | "prompt", Some(addr)) if (ev == "start" && agent != "antigravity") || reply.introduce => {
             format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
             )

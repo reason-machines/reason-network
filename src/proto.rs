@@ -507,6 +507,10 @@ pub struct HookReply {
     /// Their ids, to acknowledge with `Delivered` once shown.
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Antigravity: say who it is on Reason Network, which it hears once per conversation. Its prompt hook runs before
+    /// every model call, so saying it there each time put a new user message in front of every step.
+    #[serde(default)]
+    pub introduce: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -147,6 +147,7 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    introduced: false,
                 },
             );
             self.presence_changed();
@@ -459,7 +460,13 @@ impl Daemon {
             self.reached(g, &key);
         }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        // Antigravity hears who it is at its first hook that can show it, and never again: PreInvocation fires before
+        // every model call, and each copy would be a user message it answers.
+        let introduce = agent == "antigravity"
+            && matches!(event, "start" | "prompt")
+            && text.is_none()
+            && g.live.get_mut(&key).is_some_and(|l| !std::mem::replace(&mut l.introduced, true));
+        Ok(HookReply { address: Some(address), text, ids, introduce })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -898,6 +905,44 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    #[tokio::test]
+    async fn an_antigravity_conversation_hears_who_it_is_once_not_before_every_model_call() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "antigravity".into(),
+            event: event.into(),
+            session_id: "c1".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        // SessionStart, then PreInvocation before each model call of the turn, and a natural Stop.
+        let mut told = Vec::new();
+        for event in ["start", "prompt", "prompt", "tool", "prompt", "stop", "prompt"] {
+            told.push(d.hook(call(event)).await.unwrap().introduce);
+        }
+        assert_eq!(told, [true, false, false, false, false, false, false]);
+        // Mail it is handed is not the introduction, so that doesn't use it up.
+        let call = |event: &str| HookCall { session_id: "c2".into(), ..call(event) };
+        d.hook(call("tool")).await.unwrap();
+        let name = d.inner.lock().unwrap().live["antigravity:c2"].name.clone();
+        mail(&d, "m1", &name);
+        let handed = d.hook(call("prompt")).await.unwrap();
+        assert!(handed.text.is_some() && !handed.introduce);
+        let next = d.hook(call("prompt")).await.unwrap();
+        assert!(next.text.is_none() && next.introduce);
+        assert!(!d.hook(call("prompt")).await.unwrap().introduce);
+        // Other agents are told at session start by their hook, as before; the daemon doesn't ask for it.
+        let claude = HookCall { agent: "claude-code".into(), session_id: "c3".into(), ..call("start") };
+        assert!(!d.hook(claude).await.unwrap().introduce);
     }
 
     #[tokio::test]
