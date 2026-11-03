@@ -411,7 +411,7 @@ fn terminal_cwd(cwd: String, off: bool, agent: bool) -> Result<String> {
 
 /// Whether this command runs in a folder that is off: by the agent's project folder, or the shell's own.
 fn here_off() -> bool {
-    let cfg = config::Config::load_strict().unwrap_or_default();
+    let cfg = config::Config::load();
     let shell = std::env::current_dir().ok().map(|p| p.display().to_string());
     [Some(agent::cwd()), shell].into_iter().flatten().any(|d| cfg.off_in(&d))
 }
@@ -458,7 +458,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let cwd = std::env::current_dir()?;
             // An agent's shell sends no file from a folder that is off, wherever it runs.
             let files = if agent_shell() {
-                files::read_outside(&files, &cwd, &config::Config::load_strict().unwrap_or_default())?
+                files::read_outside(&files, &cwd, &config::Config::load())?
             } else {
                 files::read(&files, &cwd)?
             };

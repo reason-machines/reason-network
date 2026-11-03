@@ -1374,6 +1374,49 @@ mod tests {
         assert!(d.inner.lock().unwrap().store.session_by_name("review-2").unwrap().is_none());
     }
 
+    #[test]
+    fn paused_sessions_and_held_mail_keep_the_normal_expiry() {
+        let mut d =
+            super::super::test_daemon(crate::config::Config { person: Some("alex".into()), ..Default::default() });
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        d.cfg.unreadable = Some("bad TOML".into());
+        d.cfg.all_folders_off = true;
+        d.cfg.inbound.default = crate::config::Policy::Hold;
+        settled(&mut d);
+        let d = Arc::new(d);
+        let msg = Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr("api-claude"),
+            via: None,
+            reply_to: None,
+            body: "kept while paused".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "held");
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.unread(&d.addr("api-claude")).unwrap().is_empty());
+        drop(g);
+        d.inner.lock().unwrap().store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.prune(&mut g);
+        }
+        assert!(d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap().is_none());
+        assert!(d.inner.lock().unwrap().store.held().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn mail_held_for_a_conversation_goes_with_it_and_never_to_the_next_session() {
         let cfg = crate::config::Config {

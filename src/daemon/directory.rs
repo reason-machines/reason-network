@@ -331,6 +331,7 @@ impl Daemon {
         };
         rows.sort_by_key(rank);
         Ok(Directory {
+            config_warning: self.cfg.warning(),
             team: self.team_state().map(|t| t.shown_name()),
             person: self.person.clone(),
             machine: self.machine.clone(),

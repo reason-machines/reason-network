@@ -1287,6 +1287,7 @@ mod tests {
         };
         let p = tidy_presence(Presence { sessions: vec![s], ..Default::default() });
         let d = crate::proto::Directory {
+            config_warning: None,
             team: None,
             person: "alex".into(),
             machine: "mbp".into(),

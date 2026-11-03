@@ -8,6 +8,10 @@ use std::{collections::BTreeMap, path::Path};
 pub struct Config {
     /// Your name in the team, e.g. `alex`. Defaults to `$USER`.
     pub person: Option<String>,
+    #[serde(skip)]
+    pub unreadable: Option<String>,
+    #[serde(skip)]
+    pub all_folders_off: bool,
     /// Show teammates full working directories (otherwise only the last component, plus repo@branch).
     pub share_paths: bool,
     /// Show teammates this machine's Claude Code sessions that don't have Reason Network loaded.
@@ -65,6 +69,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             person: None,
+            unreadable: None,
+            all_folders_off: false,
             share_paths: false,
             share_unmanaged: false,
             lan: true,
@@ -87,10 +93,111 @@ impl Default for Inbound {
 
 impl Config {
     pub fn load() -> Self {
-        Self::load_strict().unwrap_or_else(|e| {
-            eprintln!("reason-network: ignoring {} (fix or delete it): {e}", paths::config().display());
-            Config::default()
+        let cfg = match std::fs::read_to_string(paths::config()) {
+            Ok(text) => Self::read_private(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => Self::paused(e.to_string()),
+        };
+        if let Some(warning) = cfg.warning() {
+            eprintln!("{warning}");
+        }
+        cfg
+    }
+
+    pub fn warning(&self) -> Option<String> {
+        self.unreadable.as_ref().map(|error| {
+            format!(
+                "Reason Network is paused here where settings could not be read: fix {}, then run `reason-network stop` and `reason-network who`: {error}",
+                paths::config().display()
+            )
         })
+    }
+
+    fn paused(error: String) -> Self {
+        Self {
+            unreadable: Some(error),
+            all_folders_off: true,
+            lan: false,
+            share_paths: false,
+            share_unmanaged: false,
+            inbound: Inbound { default: Policy::Hold, people: BTreeMap::new() },
+            ..Self::default()
+        }
+    }
+
+    fn read_private(text: &str) -> Self {
+        let table = match text.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(error) => return Self::paused(error.to_string()),
+        };
+        let mut cfg = Self::default();
+        let mut errors = Vec::new();
+        macro_rules! key {
+            ($name:ident, $fallback:expr) => {
+                if let Some(value) = table.get(stringify!($name)) {
+                    cfg.$name = value.clone().try_into().unwrap_or_else(|error| {
+                        errors.push(format!("{}: {error}", stringify!($name)));
+                        $fallback
+                    });
+                }
+            };
+        }
+        key!(person, None);
+        key!(share_paths, false);
+        key!(share_unmanaged, false);
+        key!(lan, false);
+        key!(tray, false);
+        key!(reason, false);
+        key!(auto_update, true);
+        key!(port, None);
+        key!(debug_log, false);
+        if let Some(value) = table.get("folders") {
+            if let Some(folders) = value.as_table() {
+                for (folder, value) in folders {
+                    let rule = if value.as_str() == Some("off") {
+                        "off"
+                    } else {
+                        errors.push(format!("folders.{folder}: expected \"off\""));
+                        "off"
+                    };
+                    cfg.folders.insert(folder.clone(), rule.into());
+                }
+            } else {
+                errors.push("folders: expected a table".into());
+                cfg.all_folders_off = true;
+            }
+        }
+        if let Some(value) = table.get("inbound") {
+            if let Some(inbound) = value.as_table() {
+                if let Some(value) = inbound.get("default") {
+                    cfg.inbound.default = value.clone().try_into().unwrap_or_else(|error| {
+                        errors.push(format!("inbound.default: {error}"));
+                        Policy::Hold
+                    });
+                }
+                if let Some(value) = inbound.get("people") {
+                    if let Some(people) = value.as_table() {
+                        for (person, value) in people {
+                            let policy = value.clone().try_into().unwrap_or_else(|error| {
+                                errors.push(format!("inbound.people.{person}: {error}"));
+                                Policy::Hold
+                            });
+                            cfg.inbound.people.insert(person.clone(), policy);
+                        }
+                    } else {
+                        errors.push("inbound.people: expected a table".into());
+                        cfg.inbound.default = Policy::Hold;
+                    }
+                }
+            } else {
+                errors.push("inbound: expected a table".into());
+                cfg.inbound.default = Policy::Hold;
+            }
+        }
+        if !errors.is_empty() {
+            cfg.unreadable = Some(errors.join("; "));
+        }
+        cfg
     }
 
     /// Like `load`, but a file that doesn't parse is an error (before rewriting it, say).
@@ -103,6 +210,9 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
+        if let Some(warning) = self.warning() {
+            anyhow::bail!(warning);
+        }
         paths::ensure_home()?;
         std::fs::write(paths::config(), toml::to_string_pretty(self)?)?;
         Ok(())
@@ -136,6 +246,9 @@ impl Config {
 
     /// Whether sessions working in `cwd` stay off the network.
     pub fn off_in(&self, cwd: &str) -> bool {
+        if self.all_folders_off {
+            return true;
+        }
         if self.folders.is_empty() {
             return false;
         }
@@ -302,6 +415,56 @@ mod tests {
 
     fn folders(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn bad_syntax_pauses_folders_and_holds_mail_without_disabling_updates() {
+        for text in ["[inbound", "[inbound]\n[inbound]", "folders = 3"] {
+            let cfg = Config::read_private(text);
+            assert!(cfg.off_in("/anywhere"));
+            if text != "folders = 3" {
+                assert_eq!(cfg.policy_for("alice"), Policy::Hold);
+            }
+            assert!(cfg.auto_update);
+            assert!(cfg.warning().is_some());
+        }
+    }
+
+    #[test]
+    fn missing_settings_and_unknown_keys_keep_normal_defaults() {
+        for text in ["", "future_setting = true"] {
+            let cfg = Config::read_private(text);
+            assert!(!cfg.off_in("/work"));
+            assert_eq!(cfg.policy_for("alice"), Policy::Accept);
+            assert!(cfg.warning().is_none());
+        }
+    }
+
+    #[test]
+    fn typed_errors_preserve_other_privacy_settings() {
+        let cfg = Config::read_private(
+            r#"port = "41641"
+lan = "yes"
+share_paths = 5
+[inbound]
+default = "wrong"
+[inbound.people]
+alice = "refuse"
+bob = false
+[folders]
+"/private" = "off"
+"/other" = 7
+"#,
+        );
+        assert!(cfg.off_in("/private/work"));
+        assert!(cfg.off_in("/other/work"));
+        assert!(!cfg.off_in("/public"));
+        assert_eq!(cfg.policy_for("alice"), Policy::Refuse);
+        assert_eq!(cfg.policy_for("bob"), Policy::Hold);
+        assert_eq!(cfg.policy_for("carol"), Policy::Hold);
+        assert!(!cfg.lan && !cfg.share_paths);
+        assert_eq!(cfg.port(), None);
+        assert!(cfg.auto_update);
     }
 
     #[test]

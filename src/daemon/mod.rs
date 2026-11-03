@@ -228,8 +228,10 @@ impl Daemon {
         }
     }
     fn open() -> Result<Self> {
-        // A typo mustn't quietly undo what the person chose (a folder off, mail held): don't start on defaults.
-        let cfg = Config::load_strict().map_err(|e| anyhow!("fix {} first: {e}", paths::config().display()))?;
+        let cfg = Config::load();
+        if let Some(warning) = cfg.warning() {
+            log(&warning);
+        }
         let mut daemon = Self::with(cfg, Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
         daemon.usage = crate::usage::Usage::open(paths::home().join("usage.sqlite"));
         Ok(daemon)

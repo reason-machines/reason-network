@@ -10,11 +10,14 @@ use std::{
 };
 
 pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: Option<String>, doing: Option<String>) {
+    let cfg = crate::config::Config::load();
     let input = if session.is_none() { read_stdin(Duration::from_secs(3)) } else { String::new() };
     let link = Link::new(None);
-    let Ok(Some((out, key, ids))) =
-        tokio::time::timeout(Duration::from_secs(8), handle(&link, agent_name, event, &input, session, state, doing))
-            .await
+    let Ok(Some((out, key, ids))) = tokio::time::timeout(
+        Duration::from_secs(8),
+        handle(&link, &cfg, agent_name, event, &input, session, state, doing),
+    )
+    .await
     else {
         return;
     };
@@ -39,6 +42,7 @@ fn read_stdin(limit: Duration) -> String {
 /// Returns what to print, the session key, and the ids of the messages in it.
 async fn handle(
     link: &std::sync::Arc<Link>,
+    cfg: &crate::config::Config,
     agent_name: &str,
     event: &str,
     input: &str,
@@ -71,7 +75,6 @@ async fn handle(
     );
     let cwd = dirs.first().cloned().or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
     // In a folder that is off, the agent hears nothing; the daemon only that this session is off.
-    let cfg = crate::config::Config::load_strict().unwrap_or_default();
     let off = cwd.iter().chain(&dirs).any(|d| cfg.off_in(d));
     let ev = match (event, state.as_deref()) {
         ("session-start", _) => "start",
