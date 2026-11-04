@@ -200,6 +200,8 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// The `CODEX_HOME` a Codex session's hooks run with; `None` for the default home (and other agents).
+    codex_home: Option<String>,
     /// Told who it is on Reason Network (Antigravity's hooks, which may say it at any invocation).
     introduced: bool,
 }

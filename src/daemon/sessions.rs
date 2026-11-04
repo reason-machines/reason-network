@@ -147,6 +147,7 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    codex_home: None,
                     introduced: false,
                 },
             );
@@ -331,8 +332,21 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
-            h;
+        let HookCall {
+            agent,
+            event,
+            session_id,
+            cwd,
+            pid,
+            mail,
+            transcript,
+            doing,
+            name,
+            dirs,
+            keep,
+            through_reason,
+            codex_home,
+        } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
@@ -413,6 +427,11 @@ impl Daemon {
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {
             l.transcript = Some(t.into());
+        }
+        // Kept with the session too: mail reaches it through that home while it is offline.
+        if agent == "codex" && l.codex_home != codex_home {
+            l.codex_home = codex_home;
+            g.store.remember_codex_home(&key, l.codex_home.as_deref())?;
         }
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
@@ -845,6 +864,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         d.hook(doing).await.unwrap();
         let old = Remembered {
@@ -894,6 +914,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
@@ -917,6 +938,7 @@ mod tests {
             session_id: "c1".into(),
             cwd: Some("/work/api".into()),
             pid: None,
+            codex_home: None,
             mail: true,
             transcript: None,
             doing: None,
@@ -964,6 +986,7 @@ mod tests {
                 name: None,
                 dirs: Vec::new(),
                 keep: false,
+                codex_home: None,
             })
             .await
             .unwrap();
@@ -1060,6 +1083,7 @@ mod tests {
             name: Some(id.into()),
             dirs: Vec::new(),
             keep,
+            codex_home: None,
         };
         // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
         d.hook(cli("ask-1a2b3c", false)).await.unwrap();
@@ -1218,6 +1242,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
         assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
@@ -1251,6 +1276,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         }
     }
 
@@ -1590,6 +1616,7 @@ mod tests {
             name: Some("terminal".into()),
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
@@ -1766,6 +1793,7 @@ mod tests {
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
             keep: false,
+            codex_home: None,
         };
         // Working in /work/api, with /work/private open too.
         let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();
