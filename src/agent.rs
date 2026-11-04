@@ -153,10 +153,15 @@ fn find_in(name: &str, path: &std::ffi::OsStr, home: &Path) -> Option<PathBuf> {
 fn install_dirs(home: &Path, windows: bool) -> Vec<PathBuf> {
     let under = |parts: &[&str]| parts.iter().fold(home.to_path_buf(), |d, p| d.join(p));
     if windows {
-        return [&[".local", "bin"][..], &["AppData", "Roaming", "npm"], &[".bun", "bin"]]
-            .into_iter()
-            .map(under)
-            .collect();
+        return [
+            &[".local", "bin"][..],
+            &["AppData", "Roaming", "npm"],
+            &[".bun", "bin"],
+            &["AppData", "Local", "Reason", "bin"],
+        ]
+        .into_iter()
+        .map(under)
+        .collect();
     }
     let mut dirs: Vec<PathBuf> = [".local/bin", ".bun/bin", ".npm-global/bin", ".cargo/bin", ".opencode/bin"]
         .iter()
