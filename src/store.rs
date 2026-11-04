@@ -128,7 +128,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     mailbox INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
-CREATE TABLE IF NOT EXISTS settled_names (key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS counts (
     day TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0,
@@ -242,13 +241,16 @@ impl Store {
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
     pub fn open(path: &Path, inbox: PathBuf) -> Result<Self> {
         let db = Connection::open(path)?;
-        let settled_before =
-            db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settled_names'")?.exists([])?;
         db.execute_batch(SCHEMA)?;
         // Added when a title could name a session: a session remembered from before may have had its name chosen, and
-        // nothing says which, so a title names none of them.
-        if !settled_before {
-            db.execute("INSERT OR IGNORE INTO settled_names (key) SELECT key FROM sessions", [])?;
+        // nothing says which, so a title names none of them. One transaction, so the table is never there without them.
+        {
+            let tx = db.unchecked_transaction()?;
+            if !tx.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settled_names'")?.exists([])? {
+                tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", [])?;
+                tx.execute("INSERT INTO settled_names (key) SELECT DISTINCT key FROM sessions", [])?;
+            }
+            tx.commit()?;
         }
         // Deleted rows are overwritten, not just let go (see `scrub`).
         db.execute_batch("PRAGMA secure_delete = ON;")?;
@@ -909,6 +911,10 @@ mod tests {
             let store = Store::open(&db, temp_inbox()).unwrap();
             store.upsert_session(&session, "alex").unwrap();
             store.db.execute("DROP TABLE settled_names", []).unwrap();
+            // A migration cut short (the engine stopped before the backfill) leaves no table behind to skip it next time.
+            let tx = store.db.unchecked_transaction().unwrap();
+            tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", []).unwrap();
+            drop(tx);
         }
         let store = Store::open(&db, temp_inbox()).unwrap();
         assert!(store.name_settled("claude-code:old").unwrap());
