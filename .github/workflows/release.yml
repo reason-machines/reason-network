@@ -1,9 +1,11 @@
 name: release
 
-# Push a tag like v0.10.4 to build reason-network for macOS, Linux and Windows and publish a GitHub release, with the
+# Push a tag like v0.10.4 to build reason-network for macOS, Linux and Windows and create a GitHub release, with the
 # install scripts a standalone install (and its updates) uses. The reason CLI pins the macOS and Linux archives' sha256.
 # Reason then replaces the macOS archives (and their .sha256) with Developer ID signed and notarized builds of the same
 # binaries, so macOS knows every release as one program. install.sh never puts an unsigned build over a signed one.
+# A release starts as a draft, which installs and auto-updates can't see: its assets are tested on every platform
+# first, and publishing the draft is what ships it.
 on:
   push:
     tags: ["v*"]
@@ -74,3 +76,4 @@ jobs:
           generate_release_notes: true
           # v1.2.0-rc.1 and the like: a test release, which installs and auto-updates never pick as "latest".
           prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: ${{ !contains(github.ref_name, '-') }}
