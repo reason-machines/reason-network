@@ -232,6 +232,7 @@ impl Daemon {
             name: Some("terminal".into()),
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         if let Err(e) = self.hook(call).await {
             log(&format!("couldn't register {}/terminal: {e:#}", self.person));
