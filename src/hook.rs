@@ -104,6 +104,7 @@ async fn handle(
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
         keep: false,
+        codex_home: (agent == "codex").then(|| std::env::var("CODEX_HOME").ok()).flatten().filter(|h| !h.is_empty()),
     });
     let reply: HookReply = link.call(req).await.ok()?;
     if off {

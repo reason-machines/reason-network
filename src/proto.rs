@@ -87,6 +87,10 @@ pub struct HookCall {
     /// Every folder the agent says the session is in (besides `cwd`): one turned off keeps it off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<String>,
+    /// The `CODEX_HOME` a Codex session's hooks run with, for `codex queue` and its thread names to use that home's
+    /// app-server and files. Unset: the default home. Older hooks leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +566,20 @@ pub struct Unread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_names_its_codex_home_and_an_older_hook_leaves_it_out() {
+        let old = serde_json::json!({"op": "hook", "agent": "codex", "event": "start", "session_id": "t1"});
+        let Request::Hook(h) = serde_json::from_value(old).unwrap() else { panic!("a hook") };
+        assert_eq!(h.codex_home, None);
+        let new = serde_json::json!({"op": "hook", "agent": "codex", "event": "start", "session_id": "t1",
+            "codex_home": "/work/.codex-b"});
+        let Request::Hook(h) = serde_json::from_value(new).unwrap() else { panic!("a hook") };
+        assert_eq!(h.codex_home.as_deref(), Some("/work/.codex-b"));
+        // Without one, nothing new goes to an older daemon.
+        let v = serde_json::to_value(Request::Hook(HookCall { codex_home: None, ..h })).unwrap();
+        assert!(v.get("codex_home").is_none());
+    }
 
     #[test]
     fn the_team_reply_names_the_team_by_id_and_name() {

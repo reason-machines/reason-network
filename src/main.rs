@@ -395,6 +395,7 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         name: Some(id.into()),
         dirs: Vec::new(),
         keep: true,
+        codex_home: None,
     });
     link.call(req).await
 }

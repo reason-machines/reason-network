@@ -100,6 +100,8 @@ Only team members can connect, and a computer can only speak for its own person.
 Messages to someone offline wait and go out when they're back.
 An agent session's name stays with its conversation, for a session the agent identifies: resumed after a restart, it
 gets the same name back with the messages that waited for it, and for a day no new session takes the name.
+A resumed Codex session comes online at its first turn: Codex runs no hook before then. Mail for a Codex session seen
+within the last day goes into its thread with `codex queue`, so the first message starts that turn when it's resumed.
 
 Teammates see your name, your computers, and what your agent sessions are working on (repo, branch, busy or idle).
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer
@@ -145,8 +147,8 @@ python3 tests/e2e/tray_memory.py --output /tmp/tray-memory.json  # macOS desktop
 The tray memory check uses synthetic local data and writes its measurements to JSON. Separately open a test submenu,
 close it, and reopen it after several updates to verify that the menu still works; see the script's instructions.
 
-A `v*` tag builds the macOS, Linux and Windows archives and the install scripts; the Reason CLI pins the macOS and
-Linux ones.
+A `v*` tag builds the macOS, Linux and Windows archives and the install scripts as a draft release, and publishing the
+draft ships it; the Reason CLI pins the macOS and Linux ones.
 
 ## Contributing
 
