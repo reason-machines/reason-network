@@ -133,6 +133,21 @@ impl Store {
         Ok(true)
     }
 
+    pub fn anchor_holds_mail(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM anchor_mail WHERE msg IS NOT NULL)")?
+            .query_row([], |row| row.get(0))?)
+    }
+
+    /// Completed receipts still need pruning when the feature is switched off.
+    pub fn anchor_has_work(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM anchor_mail) OR EXISTS(SELECT 1 FROM anchor_sends)")?
+            .query_row([], |row| row.get(0))?)
+    }
+
     pub fn anchor_pending(&self) -> Result<Vec<AnchorMail>> {
         let mut statement = self.db.prepare_cached(
             "SELECT source, target, msg, cancelled FROM anchor_mail WHERE msg IS NOT NULL ORDER BY rowid",
@@ -336,6 +351,21 @@ mod tests {
         let store = Store::open(Path::new(":memory:"), inbox).unwrap();
         store.init_anchor().unwrap();
         store
+    }
+
+    #[test]
+    fn completed_receipts_keep_cleanup_reachable_without_advertising_custody() {
+        let s = store();
+        let now = crate::util::now_ms();
+        assert!(!s.anchor_has_work().unwrap());
+        let mut msg = message("old-result");
+        msg.sent_at = now - TTL_MS - RESULT_KEEP_MS - 1;
+        s.anchor_accept("source", "target", &msg, msg.sent_at).unwrap();
+        s.anchor_finish(&msg.id, None).unwrap();
+        assert!(s.anchor_has_work().unwrap());
+        assert!(!s.anchor_holds_mail().unwrap());
+        s.anchor_prune(now).unwrap();
+        assert!(!s.anchor_has_work().unwrap());
     }
 
     #[test]

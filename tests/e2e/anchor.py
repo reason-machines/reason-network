@@ -2,11 +2,12 @@
 
     cargo build && python3 tests/e2e/anchor.py --old-bin /path/to/unmodified/reason-network
 
-Needs internet for iroh discovery/relays. Never signs in or touches real agent sessions.
+Needs Unix file locks and internet for iroh discovery/relays. Never signs in or touches real agent sessions.
 The optional old binary exercises mixed versions; all other cases always run.
 """
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,20 @@ def wait_for(read, description):
     raise AssertionError(f"Timed out: {description}")
 
 
+def daemon_stopped(home):
+    try:
+        lock = (home / "daemon.lock").open("rb")
+    except FileNotFoundError:
+        return True
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return True
+
+
 class Machine:
     def __init__(self, network, name):
         self.name = name
@@ -59,6 +74,7 @@ class Machine:
 
     def stop(self):
         self.cli("stop")
+        wait_for(lambda: daemon_stopped(self.home), f"{self.name} daemon releases its lifetime lock")
 
     def pending(self):
         return self.rows("SELECT id, source, target, msg FROM anchor_mail WHERE msg IS NOT NULL ORDER BY rowid")
@@ -318,6 +334,28 @@ def direct_delivery_first(machines):
     print("PASS: direct delivery creates no anchor custody receipt", flush=True)
 
 
+def recipient_consent(network, sender, anchor):
+    target = network.machine("unconsented")
+    link = re.search(r"https://\S+#rn1-\S+", anchor.cli("link")).group()
+    target.cli("join", link, "--proof", proof("u_alex", "alex", target.endpoint), "--no-setup")
+    target.cli("listen", "--as", "consent-check", "--wait", "0")
+    wait_for(lambda: any(row["address"] == "alex/consent-check" for row in json.loads(sender.cli("who", "--json"))["sessions"]),
+             "the unconsented laptop announces its direct mailbox")
+    assert not anchor.rows("SELECT key FROM kv WHERE key=?", (f"anchor-route:{target.endpoint}",))
+    target.stop()
+    output = sender.cli("send", "alex/consent-check@unconsented", "recipient has not selected an anchor")
+    message_id = re.search(r"message id ([0-9A-Z]{26})", output).group(1)
+    assert sender.rows("SELECT id FROM outbox WHERE id=?", (message_id,))
+    assert not anchor.rows("SELECT id FROM anchor_mail WHERE id=?", (message_id,))
+    print("PASS: missing recipient consent keeps custody on the sender", flush=True)
+    target.cli("team")
+    wait_for(lambda: target.rows("SELECT id FROM messages WHERE id=?", (message_id,)),
+             "unconsented recipient still receives ordinary direct delivery")
+    wait_for(lambda: not sender.rows("SELECT id FROM outbox WHERE id=?", (message_id,)),
+             "direct recipient storage releases the original sender copy")
+    target.stop()
+
+
 def full_anchor_keeps_the_sender_copy(machines):
     sender, anchor, laptop = machines
     laptop.stop()
@@ -351,7 +389,15 @@ def mixed_version(network, anchor, old_binary):
     anchor.cli("send", "alex/legacy@old", "ordinary mixed-version message")
     wait_for(lambda: old.rows("SELECT id FROM messages WHERE body = 'ordinary mixed-version message'"),
              "old release receives ordinary messages with a new anchor present")
-    old.cli("send", "alex/terminal@vps", "ordinary reply from old release")
+    old.cli("listen", "--as", "terminal", "--wait", "0")
+
+    def current_terminal():
+        name = anchor.rows("SELECT name FROM sessions WHERE key='cli:terminal'")[0][0]
+        sessions = json.loads(old.cli("who", "--json"))["sessions"]
+        return name if any(row["address"] == f"alex/{name}" and row["machine"] == "vps" for row in sessions) else None
+
+    terminal = wait_for(current_terminal, "old release discovers the VPS terminal's current name")
+    old.cli("send", f"alex/{terminal}@vps", "ordinary reply from old release")
     wait_for(lambda: anchor.rows("SELECT id FROM messages WHERE body = 'ordinary reply from old release'"),
              "old release can reply to a new engine")
     assert not anchor.rows("SELECT value FROM kv WHERE key = ?", (f"anchor-route:{old.endpoint}",))
@@ -379,6 +425,7 @@ def main():
                                  env=sender.env, cwd=sender.home, text=True, capture_output=True, timeout=90)
         assert unknown.returncode != 0 and "unknown" in unknown.stderr.lower()
         print("PASS: unknown mailbox gives a clear error", flush=True)
+        recipient_consent(network, sender, anchor)
         held = handoff_and_restart(sender, anchor, laptop)
         lost_ack_and_direct_retry((sender, anchor, laptop), held)
         hosted_connection_switch((sender, anchor, laptop))

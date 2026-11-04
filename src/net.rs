@@ -788,6 +788,29 @@ impl ProtocolHandler for JoinProto {
 }
 
 impl Net {
+    #[cfg(test)]
+    pub(crate) fn isolated(daemon: &Arc<Daemon>, endpoint: Endpoint) -> Self {
+        Net {
+            me: endpoint.id(),
+            udp: UdpPort { port: endpoint.bound_sockets()[0].port(), fixed: None, fell_back: false },
+            endpoint,
+            relays: Vec::new(),
+            proxy: None,
+            at: None,
+            router: Mutex::new(None),
+            invites: Default::default(),
+            daemon: Arc::downgrade(daemon),
+            links: Default::default(),
+            remote: Default::default(),
+            acks: Default::default(),
+            dialing: Default::default(),
+            wake: Notify::new(),
+            changed: Notify::new(),
+            next_link: AtomicU64::new(1),
+            anchor_sent: Default::default(),
+        }
+    }
+
     pub fn start(
         daemon: &Arc<Daemon>,
         bound: Bound,
@@ -1016,6 +1039,10 @@ impl Net {
     }
 
     pub async fn send_anchor(&self, target: EndpointId, msg: &Message) -> Option<(String, String)> {
+        // Person-only popups have no durable outbox copy or mailbox to hand over.
+        if !msg.to.contains('/') {
+            return None;
+        }
         let daemon = self.daemon.upgrade()?;
         if daemon.anchor_local() {
             if !self.anchor_attempt(self.me, &msg.id, Some(target)) {

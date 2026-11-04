@@ -135,6 +135,8 @@ or a Reason sign-in proof alone cannot select a custodian. New own computers joi
 `invite --me` sign that trust in their inviter automatically; a public team-link join needs an explicit choice or
 `--trust` command. `team` and `doctor` show the selected anchor and warn about unselected or multiple claims.
 Use `reason-network anchor none` to stop new handoffs on this computer.
+Both the sender and destination must select the same anchor. If the destination has not opted in, the sender keeps
+its queued copy for direct delivery.
 
 Run `reason-network listen --as inbox --wait 0` on the laptop while both computers are online once. The anchor
 remembers that permanent mailbox. After that, even a fresh workspace signed in as you can find it with `who` and send

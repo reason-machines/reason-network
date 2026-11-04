@@ -280,6 +280,8 @@ Reason identity proofs do not establish anchor authority. Existing machines opt 
 explicitly. Old engines ignore the map and cannot erase it by omitting it. Re-admitting the same key restores its
 existing delegation. `team` and `doctor` expose the selected endpoint and extra claims; anchor presence/routes are sent
 only to own computers.
+Route learning, advertisement and new custody require the destination's signed choice as well as the source's.
+Withdrawal hides cached routes immediately; previously accepted custody keeps its original expiry.
 
 Direct delivery is tried first. For an offline own machine, `Anchor` carries its endpoint and the complete original
 message. `Anchored` confirms only after a durable SQLite transaction. `Forward` retains the original source endpoint,

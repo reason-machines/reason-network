@@ -146,6 +146,149 @@ fn an_unconfigured_machine_does_not_accept_custody_or_learn_routes() {
 }
 
 #[test]
+fn recipient_consent_gates_new_routes_and_custody_even_with_a_cached_route() {
+    let t = team(true);
+    let target = t.laptop.public();
+    t.daemon.inner.lock().unwrap().team.as_mut().unwrap().anchors.remove(&target.to_string());
+    learn(&t);
+    assert!(t.daemon.saved_mailboxes(&t.daemon.inner.lock().unwrap()).is_empty());
+    assert!(t.daemon.accept_anchor(t.source.public(), target, message()).is_err());
+    {
+        let mut g = t.daemon.inner.lock().unwrap();
+        g.team.as_mut().unwrap().select_anchor(&t.laptop, Some(t.daemon.key.public())).unwrap();
+    }
+    learn(&t);
+    let msg = message();
+    t.daemon.accept_anchor(t.source.public(), target, msg.clone()).unwrap();
+    t.daemon.inner.lock().unwrap().team.as_mut().unwrap().select_anchor(&t.laptop, None).unwrap();
+    assert!(t.daemon.presence_of(Vec::new()).anchor_routes.is_empty(), "State-only withdrawal hides cached routes");
+    assert!(t.daemon.accept_anchor(t.source.public(), target, message()).is_err());
+    learn(&t);
+    let g = t.daemon.inner.lock().unwrap();
+    assert!(g.store.get(&format!("anchor-route:{target}")).unwrap().is_none());
+    assert_eq!(g.store.anchor_pending().unwrap()[0].msg.id, msg.id, "accepted custody is retained");
+}
+
+#[test]
+fn an_advertised_route_cannot_override_the_recipients_signed_choice() {
+    let t = team(false);
+    t.daemon.inner.lock().unwrap().team.as_mut().unwrap().select_anchor(&t.laptop, None).unwrap();
+    t.daemon
+        .inner
+        .lock()
+        .unwrap()
+        .team
+        .as_mut()
+        .unwrap()
+        .select_anchor(&t.daemon.key, Some(t.source.public()))
+        .unwrap();
+    let remotes = HashMap::from([(t.source.public(), advertised(t.laptop.public(), &["inbox"]))]);
+    assert!(t.daemon.anchor_peer(&remotes, &t.laptop.public()).is_none());
+    let g = t.daemon.inner.lock().unwrap();
+    assert!(t.daemon.learned_routes(&g, &remotes).is_empty());
+}
+
+#[test]
+fn trust_instructions_name_the_resolved_custodian_and_none_disables_handoffs() {
+    let t = team(true);
+    t.daemon.inner.lock().unwrap().team.as_mut().unwrap().select_anchor(&t.source, Some(t.laptop.public())).unwrap();
+    let note = t.daemon.set_anchor("cloud", true).unwrap();
+    assert!(note.contains("currently laptop"), "{note}");
+    assert!(!note.contains("Enable"), "a trusted selector is not necessarily a custodian");
+    assert!(t.daemon.set_anchor("none", false).unwrap().contains("disabled"));
+}
+
+#[tokio::test]
+async fn ticks_without_a_usable_route_never_read_queued_payloads() {
+    for enabled in [false, true] {
+        let t = team(enabled);
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let net = Net::isolated(&t.daemon, endpoint.clone());
+        {
+            let mut g = t.daemon.inner.lock().unwrap();
+            g.team.as_mut().unwrap().select_anchor(&t.daemon.key, None).unwrap();
+            for _ in 0..40 {
+                g.store.outbox_add(&t.laptop.public().to_string(), &message()).unwrap();
+            }
+        }
+        for _ in 0..60 {
+            t.daemon.anchor_flush(&net).unwrap();
+        }
+        t.daemon
+            .inner
+            .lock()
+            .unwrap()
+            .team
+            .as_mut()
+            .unwrap()
+            .select_anchor(&t.daemon.key, Some(t.laptop.public()))
+            .unwrap();
+        for _ in 0..60 {
+            t.daemon.anchor_flush(&net).unwrap();
+        }
+        assert_eq!(t.daemon.inner.lock().unwrap().store.outbox_reads.get(), 0);
+        endpoint.close().await;
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_unselected_anchor_still_expires_custody() {
+    let t = team(false);
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    let mut msg = message();
+    msg.sent_at -= ANCHOR_TTL_MS + 1;
+    {
+        let mut g = t.daemon.inner.lock().unwrap();
+        g.team.as_mut().unwrap().select_anchor(&t.daemon.key, None).unwrap();
+        g.store
+            .anchor_accept(&t.source.public().to_string(), &t.laptop.public().to_string(), &msg, msg.sent_at)
+            .unwrap();
+    }
+    assert!(t.daemon.presence_of(Vec::new()).has("anchor"));
+    t.daemon.anchor_flush(&net).unwrap();
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        assert!(g.store.anchor_pending().unwrap().is_empty());
+        assert_eq!(
+            g.store
+                .anchor_result(&t.source.public().to_string(), &t.laptop.public().to_string(), &msg.id, util::now_ms())
+                .unwrap()
+                .as_deref(),
+            Some("expired")
+        );
+    }
+    assert!(!t.daemon.presence_of(Vec::new()).has("anchor"));
+    endpoint.close().await;
+}
+
+#[tokio::test]
+async fn transient_popups_cannot_claim_queued_anchor_custody() {
+    let t = team(true);
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    let popup = Message { to: "alex".into(), notify: true, ..message() };
+    assert!(net.send_anchor(t.laptop.public(), &popup).await.is_none());
+    assert!(t.daemon.inner.lock().unwrap().store.anchor_pending().unwrap().is_empty());
+    endpoint.close().await;
+}
+
+#[test]
 fn learning_keeps_explicit_permanent_mailboxes_and_ignores_other_sessions_and_anchors() {
     let t = team(true);
     let mut p = permanent(&["inbox"]);

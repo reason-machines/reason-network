@@ -30,25 +30,7 @@ async fn anchor_frames_require_the_current_connections_matching_capability() {
     let conn = conn.unwrap();
     let accepted = accepted.unwrap();
     let daemon = crate::daemon::test_anchor_peer(&other_key);
-    let net = Net {
-        me: endpoint.id(),
-        udp: UdpPort { port: endpoint.bound_sockets()[0].port(), fixed: None, fell_back: false },
-        endpoint: endpoint.clone(),
-        relays: Vec::new(),
-        proxy: None,
-        at: None,
-        router: Mutex::new(None),
-        invites: Default::default(),
-        daemon: Arc::downgrade(&daemon),
-        links: Default::default(),
-        remote: Default::default(),
-        acks: Default::default(),
-        dialing: Default::default(),
-        wake: Notify::new(),
-        changed: Notify::new(),
-        next_link: AtomicU64::new(1),
-        anchor_sent: Default::default(),
-    };
+    let net = Net::isolated(&daemon, endpoint.clone());
     let msg = Message {
         id: ulid::Ulid::generate().to_string(),
         from: "alex/terminal".into(),

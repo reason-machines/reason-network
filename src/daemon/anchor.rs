@@ -51,14 +51,22 @@ impl Daemon {
             g.team = Some(team);
             state
         };
+        let note = if trust {
+            let selected = state
+                .selected_anchor(&self.key.public())
+                .and_then(|id| state.member(&id))
+                .map_or("none", |m| m.machine.as_str());
+            format!("Following {machine}'s signed anchor choice on {} (currently {selected}).", self.machine)
+        } else if machine == "none" {
+            format!("Anchor handoffs disabled on {}.", self.machine)
+        } else {
+            format!("Anchor choice signed on {}: {machine}. Enable `anchor = true` on that computer.", self.machine)
+        };
         if let Some(net) = self.net() {
             net.broadcast(&Wire::State { state: Box::new(state) });
             net.presence_changed();
         }
-        Ok(format!(
-            "Anchor choice signed on {}: {machine}. Enable `anchor = true` on the chosen computer.",
-            self.machine
-        ))
+        Ok(note)
     }
 
     pub(super) fn anchor_status(&self) -> Vec<String> {
@@ -126,9 +134,10 @@ impl Daemon {
             .into_iter()
             .filter_map(|(_, s)| serde_json::from_str::<MailboxRoute>(&s).ok())
             .filter(|r| {
-                g.team
-                    .as_ref()
-                    .is_some_and(|t| t.member(&r.machine).is_some_and(|m| m.active && m.person == self.person))
+                g.team.as_ref().is_some_and(|t| {
+                    t.member(&r.machine).is_some_and(|m| m.active && m.person == self.person)
+                        && t.selected_anchor(&r.machine) == Some(self.key.public())
+                })
             })
             .collect()
     }
@@ -139,7 +148,8 @@ impl Daemon {
             return Ok(());
         }
         let g = self.inner.lock().unwrap();
-        let names = if p.has(FEATURE) { p.mailboxes.clone() } else { Vec::new() };
+        let consent = g.team.as_ref().and_then(|t| t.selected_anchor(peer)) == Some(self.key.public());
+        let names = if p.has(FEATURE) && consent { p.mailboxes.clone() } else { Vec::new() };
         let key = format!("anchor-route:{peer}");
         let route = if names.is_empty() {
             None
@@ -157,16 +167,18 @@ impl Daemon {
     }
 
     pub(super) fn learned_routes(&self, g: &Inner, remotes: &HashMap<EndpointId, Remote>) -> Vec<MailboxRoute> {
-        let mut routes = self.saved_mailboxes(g);
+        let selected = g.team.as_ref().and_then(|t| t.selected_anchor(&self.key.public()));
+        let mut routes = if selected == Some(self.key.public()) { self.saved_mailboxes(g) } else { Vec::new() };
         routes.retain(|route| !remotes.get(&route.machine).is_some_and(|r| r.online));
         for (id, r) in remotes {
             if r.online
                 && r.presence.has("anchor")
-                && Some(*id) == g.team.as_ref().and_then(|t| t.selected_anchor(&self.key.public()))
+                && Some(*id) == selected
                 && g.team.as_ref().is_some_and(|t| t.member(id).is_some_and(|m| m.active && m.person == self.person))
             {
                 routes.extend(r.presence.anchor_routes.iter().filter(|route| {
-                    g.team.as_ref().is_some_and(|t| t.member(&route.machine).is_some_and(|m| m.active && m.person == self.person))
+                    g.team.as_ref().is_some_and(|t| t.member(&route.machine).is_some_and(|m| m.active && m.person == self.person)
+                        && t.selected_anchor(&route.machine) == Some(*id))
                     // Fresh direct presence, including an empty mailbox list, wins over a saved route.
                     && !remotes.get(&route.machine).is_some_and(|r| r.online)
                 }).cloned());
@@ -180,6 +192,9 @@ impl Daemon {
             return None;
         }
         let selected = self.selected_anchor()?;
+        if self.team_state()?.selected_anchor(target) != Some(selected) {
+            return None;
+        }
         let mut peers: Vec<_> = remotes
             .iter()
             .filter(|(id, r)| {
@@ -198,13 +213,17 @@ impl Daemon {
     }
 
     pub fn accept_anchor(&self, source: EndpointId, target: EndpointId, msg: Message) -> Result<()> {
+        let g = self.inner.lock().unwrap();
         if !self.cfg.anchor
-            || !self.same_owner(&source)
-            || !self.same_owner(&target)
             || target == self.key.public()
-            || self.team_state().and_then(|t| t.selected_anchor(&source)) != Some(self.key.public())
+            || !g.team.as_ref().is_some_and(|t| {
+                [source, target].iter().all(|id| {
+                    t.member(id).is_some_and(|m| m.active && m.person == self.person)
+                        && t.selected_anchor(id) == Some(self.key.public())
+                })
+            })
         {
-            bail!("an anchor only accepts mail between its owner's other machines");
+            bail!("both own machines must select this anchor before it accepts their mail");
         }
         let msg = mail::clean(msg)?;
         let Some((person, name)) = msg.to.split_once('/') else {
@@ -213,7 +232,6 @@ impl Daemon {
         if person != self.person || !msg.from.starts_with(&format!("{person}/")) {
             bail!("an anchor only accepts its owner's mail");
         }
-        let g = self.inner.lock().unwrap();
         let known = self.saved_mailboxes(&g).iter().any(|r| r.machine == target && r.names.iter().any(|n| n == name));
         if !known {
             bail!("unknown permanent mailbox {} on {target}; connect that machine once to learn it", msg.to);
@@ -311,6 +329,15 @@ impl Daemon {
     }
 
     fn anchor_flush(self: &Arc<Self>, net: &Net) -> Result<()> {
+        {
+            let g = self.inner.lock().unwrap();
+            if !self.cfg.anchor
+                && g.team.as_ref().and_then(|t| t.selected_anchor(&self.key.public())).is_none()
+                && !g.store.anchor_has_work()?
+            {
+                return Ok(());
+            }
+        }
         let remotes = net.remotes();
         let now = util::now_ms();
         let pending = self.inner.lock().unwrap().store.anchor_pending()?;
@@ -348,11 +375,14 @@ impl Daemon {
                 net.anchor_send(anchor, &id, Wire::AnchorQuery { target, id: id.clone() });
             }
         }
+        let routes = self.learned_routes(&self.inner.lock().unwrap(), &remotes);
+        if routes.is_empty() {
+            return Ok(());
+        }
         for target in self.peer_ids().into_iter().filter(|p| self.same_owner(p) && !net.is_online(p)) {
-            let routes = {
-                let g = self.inner.lock().unwrap();
-                self.learned_routes(&g, &remotes)
-            };
+            if !routes.iter().any(|r| r.machine == target) {
+                continue;
+            }
             for msg in self.outbox_for(&target) {
                 if !routes.iter().any(|r| {
                     r.machine == target

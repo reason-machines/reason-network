@@ -274,7 +274,7 @@ impl Daemon {
             super::anchor::FEATURE.into(),
             super::anchor::RECEIPTS.into(),
         ];
-        if self.cfg.anchor || g.store.anchor_pending().is_ok_and(|pending| !pending.is_empty()) {
+        if self.cfg.anchor || g.store.anchor_holds_mail().unwrap_or(false) {
             features.push("anchor".into());
         }
         Presence {

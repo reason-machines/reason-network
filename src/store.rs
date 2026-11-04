@@ -20,6 +20,8 @@ pub use anchor::TTL_MS as ANCHOR_TTL_MS;
 pub struct Store {
     db: Connection,
     inbox: PathBuf,
+    #[cfg(test)]
+    pub(crate) outbox_reads: std::cell::Cell<usize>,
 }
 
 /// What the `files` column keeps of a message's files: their folder in the inbox folder, named by an id made here
@@ -297,7 +299,12 @@ impl Store {
             // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
             db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
-        let store = Store { db, inbox };
+        let store = Store {
+            db,
+            inbox,
+            #[cfg(test)]
+            outbox_reads: Default::default(),
+        };
         store.init_anchor()?;
         Ok(store)
     }
@@ -530,6 +537,8 @@ impl Store {
 
     /// Undelivered messages for a machine; older than a week are given up on.
     pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
+        #[cfg(test)]
+        self.outbox_reads.set(self.outbox_reads.get() + 1);
         let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
