@@ -171,7 +171,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
-    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks.
+    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
+    /// their next SessionStart or a `codex queue` that works.
     codex_failed: HashSet<String>,
 }
 

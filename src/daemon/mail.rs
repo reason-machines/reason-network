@@ -612,7 +612,8 @@ impl Daemon {
     /// Mail for a session here that is offline waits for it, except wake mail for a Codex thread seen within the last
     /// day: that goes to `codex queue`, which holds it until the thread is resumed and then starts a turn with it. In
     /// flight meanwhile, so the hooks of that turn don't show it again; if `codex queue` fails, they show it instead,
-    /// and that thread's mail waits for them from then on. Never for a thread in a folder that is off.
+    /// and that thread's mail waits for them until its next SessionStart or a `codex queue` that works. Never for a
+    /// thread in a folder that is off.
     fn deliver_offline(
         self: &Arc<Self>,
         g: &mut Inner,
@@ -1489,6 +1490,22 @@ mod tests {
         assert_eq!(d.hook(codex_hook("t1", "stop", None)).await.unwrap().text, None);
     }
 
+    #[tokio::test]
+    async fn a_codex_threads_session_start_clears_its_failed_codex_queue() {
+        let (d, _, ids) = codex_queue_in_flight().await;
+        d.handed("codex", "codex:t1", &ids, Err("no app-server".into()));
+        let failed = || d.inner.lock().unwrap().codex_failed.contains("codex:t1");
+        assert!(failed());
+        // Its other hooks leave the mark: its offline mail keeps waiting for its hooks.
+        for event in ["prompt", "tool", "stop"] {
+            d.hook(codex_hook("t1", event, None)).await.unwrap();
+            assert!(failed(), "{event}");
+        }
+        // Started again: its offline wake mail gets another try at `codex queue`.
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert!(!failed());
+    }
+
     /// A fake `codex` for `d` to run: it records each command, as `CODEX_HOME|arguments`, in a file of its own in the
     /// folder returned, and fails if `fails`, as `codex queue` does when it can't reach an app-server.
     #[cfg(unix)]
@@ -1581,10 +1598,51 @@ mod tests {
         // Its hooks show all of it when it is back.
         let shown = d.hook(codex_hook("t1", "start", None)).await.unwrap().text.unwrap();
         assert!(["first try", "second try", "from bob's agent"].iter().all(|b| shown.contains(b)), "{shown}");
-        // Once `codex queue` takes its mail again, so does its offline mail.
-        d.handed("codex", "codex:t1", &[], Ok(()));
-        assert!(!d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn once_codex_queue_takes_a_threads_mail_again_its_offline_mail_goes_through_it_again() {
+        let (d, _, _) = with_teammate();
+        let failing = fake_codex(&d, true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let send = |body: &'static str| {
+            let (d, name) = (d.clone(), name.clone());
+            async move {
+                let res = d.send("codex:1".into(), &name, body, None, true, false, None, Vec::new()).await;
+                res.unwrap().recipients.remove(0)
+            }
+        };
+        assert_eq!(send("first try").await.state, "pushed");
+        assert_eq!(codex_queued(&d, &failing, "t1").await.len(), 1);
+        assert!(d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Back at a prompt (no SessionStart, which clears the mark too), with `codex queue` working again: its hook
+        // shows what failed, and it takes mail through `codex queue`, as with `codex` on PATH.
+        let working = fake_codex(&d, false);
+        let shown = d.hook(codex_hook("t1", "prompt", None)).await.unwrap();
+        assert!(shown.text.unwrap().contains("first try"));
+        d.handle(0, Request::Delivered { key: "codex:t1".into(), ids: shown.ids }).await.unwrap();
+        d.inner.lock().unwrap().live.get_mut("codex:t1").unwrap().reg.tier = Tier::Push;
+        let live = send("while it is here").await;
+        assert!(live.state == "pushed" && live.note.starts_with("queued into the Codex session"), "{}", live.note);
+        assert_eq!(codex_queued(&d, &working, "t1").await.len(), 1);
+        assert!(!d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Offline again: its next wake mail goes through `codex queue` again, which takes it once.
+        gone(&d, "codex:t1", HOUR);
+        let later = send("once it is gone again").await;
+        assert!(later.state == "pushed" && later.note.starts_with("queued into the Codex thread"), "{}", later.note);
+        let queued = codex_queued(&d, &working, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued.iter().filter(|q| q.contains("once it is gone again")).count(), 1, "{queued:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // Read: the turn it starts doesn't show it again.
+        assert_eq!(d.hook(codex_hook("t1", "start", None)).await.unwrap().text, None);
+        for log in [failing, working] {
+            let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        }
     }
 
     #[cfg(unix)]
