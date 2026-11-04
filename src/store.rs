@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     mailbox INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
-CREATE TABLE IF NOT EXISTS named (key TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS settled_names (key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS counts (
     day TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0,
@@ -153,7 +153,8 @@ impl Store {
             "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",
             params![message.id, key, message.from, recipient, stage, message.sent_at],
         )?;
-        Ok(())
+        // Mail went from it: a reply goes to the name it sent from (see `settle_name`).
+        self.settle_name(key)
     }
     pub fn handoff(&self, ids: &[String], now: i64) -> Result<()> {
         for id in ids {
@@ -241,7 +242,14 @@ impl Store {
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
     pub fn open(path: &Path, inbox: PathBuf) -> Result<Self> {
         let db = Connection::open(path)?;
+        let settled_before =
+            db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settled_names'")?.exists([])?;
         db.execute_batch(SCHEMA)?;
+        // Added when a title could name a session: a session remembered from before may have had its name chosen, and
+        // nothing says which, so a title names none of them.
+        if !settled_before {
+            db.execute("INSERT OR IGNORE INTO settled_names (key) SELECT key FROM sessions", [])?;
+        }
         // Deleted rows are overwritten, not just let go (see `scrub`).
         db.execute_batch("PRAGMA secure_delete = ON;")?;
         // Only this user reads it, like machine.key: it holds the team link. (SQLite gives the log files the mode the
@@ -351,6 +359,15 @@ impl Store {
         );
         if n.as_ref().is_ok_and(|n| *n == 1) && !held {
             let _ = self.observe_reply(m);
+        }
+        // Mail went to the session with this name: its name is settled (see `settle_name`).
+        if n.as_ref().is_ok_and(|n| *n == 1)
+            && let Some((_, name)) = m.to.split_once('/')
+        {
+            let _ = self.db.execute(
+                "INSERT OR IGNORE INTO settled_names (key) SELECT key FROM sessions WHERE name = ?1",
+                [name.split('@').next().unwrap_or(name)],
+            );
         }
         match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
@@ -718,20 +735,16 @@ impl Store {
         Ok(())
     }
 
-    /// Marks a session's name as given, not the default it got for asking none: someone chose it (`/rename`,
-    /// `set_name`, a name it registered with), or it came from the conversation's title. A title never renames it.
-    pub fn mark_named(&self, key: &str) -> Result<()> {
-        self.db.execute("INSERT OR IGNORE INTO named (key) VALUES (?1)", [key])?;
+    /// Settles a session's name: a title never renames it. Someone chose it (`/rename`, `set_name`, a name it
+    /// registered with), it came from the conversation's title, or mail went to or from it (a reply goes to the name
+    /// the mail had).
+    pub fn settle_name(&self, key: &str) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO settled_names (key) VALUES (?1)", [key])?;
         Ok(())
     }
 
-    pub fn is_named(&self, key: &str) -> Result<bool> {
-        Ok(self.db.prepare_cached("SELECT 1 FROM named WHERE key = ?1")?.exists([key])?)
-    }
-
-    /// Whether the session sent mail lately (its receipts are kept a week): a reply to it goes to the name it sent from.
-    pub fn has_sent(&self, key: &str) -> Result<bool> {
-        Ok(self.db.prepare_cached("SELECT 1 FROM sent_receipts WHERE sender_key = ?1")?.exists([key])?)
+    pub fn name_settled(&self, key: &str) -> Result<bool> {
+        Ok(self.db.prepare_cached("SELECT 1 FROM settled_names WHERE key = ?1")?.exists([key])?)
     }
 
     pub fn session_by_key(&self, key: &str) -> Result<Option<Remembered>> {
@@ -871,6 +884,42 @@ mod tests {
         assert!(store.unread("lars/old").unwrap().is_empty());
         assert_eq!(store.unread("lars/new").unwrap().len(), 1);
         assert_eq!(store.sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sessions_remembered_from_before_titles_keep_their_names() {
+        let dir = std::env::temp_dir().join(format!("reason-network-store-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("network.db");
+        let session = Remembered {
+            name: "api-claude-3".into(),
+            key: "claude-code:old".into(),
+            agent: "claude-code".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        // A database from an engine before titles named sessions: whether `api-claude-3` was chosen, nothing says.
+        {
+            let store = Store::open(&db, temp_inbox()).unwrap();
+            store.upsert_session(&session, "alex").unwrap();
+            store.db.execute("DROP TABLE settled_names", []).unwrap();
+        }
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert!(store.name_settled("claude-code:old").unwrap());
+        assert!(!store.name_settled("claude-code:new").unwrap());
+        // Opened again, it settles no more: a session since is the one it was.
+        store
+            .upsert_session(&Remembered { name: "api-claude".into(), key: "claude-code:new".into(), ..session }, "alex")
+            .unwrap();
+        drop(store);
+        assert!(!Store::open(&db, temp_inbox()).unwrap().name_settled("claude-code:new").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

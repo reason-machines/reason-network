@@ -102,7 +102,11 @@ impl Daemon {
             self.moved_on(g, before, now);
         }
         if let Some(l) = g.live.get_mut(&key) {
-            // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
+            // Known already (e.g. from a hook, now the MCP server connects, or a reconnect). Asking for the name it
+            // has settles it, as asking for any name does.
+            if reg.name.as_deref().map(util::slug).is_some_and(|n| n == l.name) {
+                g.store.settle_name(&key)?;
+            }
             if conn.is_some() {
                 l.conn = conn;
                 l.attached = true;
@@ -121,7 +125,7 @@ impl Daemon {
             }
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
             if reg.name.is_some() {
-                g.store.mark_named(&key)?;
+                g.store.settle_name(&key)?;
             }
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
@@ -322,7 +326,7 @@ impl Daemon {
             live.doing = (!d.is_empty()).then(|| d.chars().take(200).collect());
         }
         if new_name.is_some() {
-            g.store.mark_named(key)?;
+            g.store.settle_name(key)?;
         }
         if let Some(n) = new_name
             && n != live.name
@@ -612,14 +616,13 @@ impl Daemon {
 }
 
 /// Whether a title may still name this session: it is an agent's conversation (not one of the person's mailboxes or a
-/// `cli:` one), on the name it got for asking none, never named (by someone or by an earlier title), and it has sent no
-/// mail lately, since a reply to that would go to the name it sent from.
+/// `cli:` one), on the name it got for asking none, and its name is not settled: never named (by someone or by an
+/// earlier title), and no mail went to or from it, since a reply goes to the name the mail had.
 pub(super) fn title_may_name(g: &Inner, key: &str, l: &Live) -> Result<bool> {
     Ok(!l.mailbox
         && !key.starts_with("cli:")
         && agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git)
-        && !g.store.is_named(key)?
-        && !g.store.has_sent(key)?)
+        && !g.store.name_settled(key)?)
 }
 
 fn remembered(l: &Live, now: i64) -> Remembered {

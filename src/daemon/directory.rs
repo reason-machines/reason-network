@@ -95,7 +95,7 @@ impl Daemon {
                 .collect();
             for (key, name) in &chosen {
                 if g.live[key].name == *name {
-                    let _ = g.store.mark_named(key);
+                    let _ = g.store.settle_name(key);
                 }
             }
             chosen.into_iter().filter(|(k, n)| g.live[k].name != *n).collect()
@@ -183,8 +183,8 @@ impl Daemon {
     /// its conversation is about once its agent has titled it (`api-fix-the-login-bug`), so the chats in one folder can
     /// be told apart, by the person and by the agents they ask to message one. Once: a name from a title, or one someone
     /// chose (`/rename`, `set_name`), stays. Its mail comes along, as for any rename. `-2`, `-3`, … when the name is
-    /// taken, and the default name is kept when none of those is free. Not a session that sent mail lately: a reply goes
-    /// to the name it sent from (see `title_may_name`, checked again under the rename's lock).
+    /// taken, and the default name is kept when none of those is free. Not one that mail went to or from: a reply goes
+    /// to the name the mail had (see `title_may_name`, checked again under the rename's lock).
     fn name_after_titles(&self, titles: &HashMap<String, String>) {
         let renames: Vec<(String, String)> = {
             let g = self.inner.lock().unwrap();
@@ -655,19 +655,6 @@ mod tests {
         assert_eq!(reg("b", 2), "api-claude-2");
         assert_eq!(reg("c", 3), "api-claude-3");
         assert_eq!(reg("d", 4), "api-claude-4");
-        // Mail for one that is about to be named comes along.
-        d.send(
-            "claude-code:c".into(),
-            "api-claude-2",
-            "how is the login fix going?",
-            None,
-            true,
-            false,
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
         // The person named one themselves; two get the same title.
         d.set_status("claude-code:c", None, Some("review".into())).unwrap();
         titled("a", "Fix the login bug on Safari");
@@ -681,17 +668,17 @@ mod tests {
         assert_eq!(same, ["api-fix-the-login-bug", "api-fix-the-login-bug-2"]);
         assert_eq!(name("b"), "api-add-csv-export-to");
         assert_eq!(name("c"), "review");
-        // The directory (list_team, `who`) shows the new names, and the mail reached the renamed session.
+        // The directory (list_team, `who`) shows the new names.
         let mut shown: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         shown.sort();
         assert_eq!(shown, ["api-add-csv-export-to", "api-fix-the-login-bug", "api-fix-the-login-bug-2", "review"]);
-        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr("api-add-csv-export-to")).unwrap(), 1);
         // A later title leaves a titled name alone.
         titled("b", "Something new");
         d.local_rows(None, false).await.unwrap();
         assert_eq!(name("b"), "api-add-csv-export-to");
+        let is_default = |n: &str| agent::is_default_name(n, agent::CLAUDE_CODE, "/work/api", &GitInfo::default());
         // A title that reads like a default name (`Claude 7`) is still a title: the next one leaves it alone.
-        assert!(agent::is_default_name(&reg("e", 5), agent::CLAUDE_CODE, "/work/api", &GitInfo::default()));
+        assert!(is_default(&reg("e", 5)));
         titled("e", "Claude 7");
         d.local_rows(None, false).await.unwrap();
         assert_eq!(name("e"), "api-claude-7");
@@ -704,12 +691,34 @@ mod tests {
         titled("f", "Rename me please");
         d.local_rows(None, false).await.unwrap();
         assert_eq!(name("f"), "api-claude-3");
-        // So does the name of one that sent mail: a reply goes to the name it sent from.
-        let default = reg("g", 7);
-        d.send("claude-code:g".into(), "review", "done?", None, true, false, None, Vec::new()).await.unwrap();
-        titled("g", "Ship the release notes");
+        // So does one its MCP server asks for, after its hooks registered it under that name.
+        let first = reg("i", 9);
+        let asked = SessionReg {
+            key: "claude-code:i".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("i".into()),
+            pid: None,
+            tier: Tier::Pull,
+            name: Some(first.clone()),
+        };
+        d.register(Some(10), asked, GitInfo::default()).unwrap();
+        titled("i", "Rename me too");
         d.local_rows(None, false).await.unwrap();
-        assert_eq!(name("g"), default);
+        assert_eq!(name("i"), first);
+        // And the name of one that mail went from or to: a reply goes to the name the mail had.
+        let sender = reg("g", 7);
+        d.send("claude-code:g".into(), "review", "done?", None, true, false, None, Vec::new()).await.unwrap();
+        let receiver = reg("j", 11);
+        d.send("claude-code:c".into(), &receiver, "how is it going?", None, true, false, None, Vec::new())
+            .await
+            .unwrap();
+        titled("g", "Ship the release notes");
+        titled("j", "Write the changelog");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("g"), sender);
+        assert_eq!(name("j"), receiver);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr(&receiver)).unwrap(), 1);
         // A title decided before someone named the session never overrides that name (checked under the rename's lock).
         reg("h", 8);
         d.set_status("claude-code:h", None, Some("mine".into())).unwrap();
