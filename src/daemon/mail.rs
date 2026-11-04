@@ -1601,8 +1601,8 @@ mod tests {
         assert!(d.hook(off).await.is_err());
         let res = d.send("gemini:1".into(), &name, "hi", None, true, false, None, Vec::new()).await.unwrap();
         assert_eq!(res.recipients[0].state, "queued", "{}", res.recipients[0].note);
-        // Remembered in a folder that is off (turned off since).
-        d.hook(codex_hook("t2", "start", None)).await.unwrap();
+        // Remembered in a folder that is off (turned off since). In a folder of its own: never the first one's name.
+        d.hook(HookCall { cwd: Some("/work/web".into()), ..codex_hook("t2", "start", None) }).await.unwrap();
         let other = gone(&d, "codex:t2", HOUR);
         {
             let mut g = d.inner.lock().unwrap();
