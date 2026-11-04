@@ -43,6 +43,16 @@ pub fn of(s: &Source) -> Option<String> {
     Some(clip(&crate::team::without_tickets(&line)))
 }
 
+/// The session's title alone (Claude Code's `ai-title`, Codex's thread name), which says what the conversation is about.
+pub fn title(s: &Source) -> Option<String> {
+    let transcript = s
+        .transcript
+        .clone()
+        .or_else(|| (s.agent == agent::CLAUDE_CODE).then(|| claude_transcript(s.session.as_deref()?)).flatten());
+    let seen = transcript.as_deref().map(scan).unwrap_or_default();
+    seen.title.or_else(|| (s.agent == "codex").then(|| codex_title(s.session.as_deref()?)).flatten())
+}
+
 fn clip(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= MAX_LEN { s } else { format!("{}…", s.chars().take(MAX_LEN - 1).collect::<String>()) }

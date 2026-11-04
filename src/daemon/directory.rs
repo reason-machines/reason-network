@@ -111,10 +111,22 @@ impl Daemon {
             });
             live.chain(unmanaged).collect()
         };
-        let doings: HashMap<String, String> = tokio::task::spawn_blocking(move || {
-            sources.into_iter().filter_map(|(k, s)| Some((k, doing::of(&s)?))).collect()
-        })
-        .await?;
+        let (doings, titles): (HashMap<String, String>, HashMap<String, String>) =
+            tokio::task::spawn_blocking(move || {
+                let mut doings = HashMap::new();
+                let mut titles = HashMap::new();
+                for (k, s) in sources {
+                    if let Some(t) = doing::title(&s) {
+                        titles.insert(k.clone(), t);
+                    }
+                    if let Some(d) = doing::of(&s) {
+                        doings.insert(k, d);
+                    }
+                }
+                (doings, titles)
+            })
+            .await?;
+        self.name_after_titles(&titles);
 
         let mut g = self.inner.lock().unwrap();
         self.prune(&mut g);
@@ -158,6 +170,31 @@ impl Daemon {
             }
         }
         Ok(rows)
+    }
+
+    /// A session still on the name it got for asking none (`api-claude`, `api-claude-3`) goes by its folder and what
+    /// its conversation is about once its agent has titled it (`api-fix-the-login-bug`), so the chats in one folder can
+    /// be told apart, by the person and by the agents they ask to message one. Once: a name from a title, or one someone
+    /// chose (`/rename`, `set_name`), stays. Its mail comes along, as for any rename. `-2`, `-3`, … when the name is
+    /// taken, and the default name is kept when none of those is free.
+    fn name_after_titles(&self, titles: &HashMap<String, String>) {
+        let renames: Vec<(String, String)> = {
+            let g = self.inner.lock().unwrap();
+            g.live
+                .iter()
+                .filter(|(k, l)| !l.mailbox && !k.starts_with("cli:"))
+                .filter(|(_, l)| agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git))
+                .filter_map(|(k, l)| Some((k.clone(), agent::titled_name(&l.reg.cwd, &l.git, titles.get(k)?)?)))
+                .collect()
+        };
+        for (key, base) in renames {
+            let names = std::iter::once(base.clone()).chain((2..10).map(|i| util::joined(&base, &i.to_string())));
+            for name in names {
+                if self.set_status(&key, None, Some(name)).is_ok() {
+                    break;
+                }
+            }
+        }
     }
 
     /// A live Claude Code session in Claude Code's own registry: on the team, and the conversation its process is in.
@@ -580,6 +617,72 @@ mod tests {
         let mut live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
         live.sort();
         assert_eq!(live, ["claude-code:inner", "claude-code:outer"]);
+    }
+
+    #[tokio::test]
+    async fn chats_in_one_folder_go_by_what_they_are_about_once_titled() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let dir = std::env::temp_dir().join(format!("reason-network-titles-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = |id: &str, conn: u64| {
+            let reg = SessionReg {
+                key: format!("claude-code:{id}"),
+                agent: agent::CLAUDE_CODE.into(),
+                cwd: "/work/api".into(),
+                agent_session_id: Some(id.into()),
+                pid: None,
+                tier: Tier::Pull,
+                name: None,
+            };
+            d.register(Some(conn), reg, GitInfo::default()).unwrap().name
+        };
+        let titled = |id: &str, title: &str| {
+            let path = dir.join(format!("{id}.jsonl"));
+            let line = serde_json::json!({"type": "ai-title", "aiTitle": title, "sessionId": id});
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            d.inner.lock().unwrap().live.get_mut(&format!("claude-code:{id}")).unwrap().transcript = Some(path);
+        };
+        // Four chats in one folder: what they are called before Claude Code titles them.
+        assert_eq!(reg("a", 1), "api-claude");
+        assert_eq!(reg("b", 2), "api-claude-2");
+        assert_eq!(reg("c", 3), "api-claude-3");
+        assert_eq!(reg("d", 4), "api-claude-4");
+        // Mail for one that is about to be named comes along.
+        d.send(
+            "claude-code:a".into(),
+            "api-claude-2",
+            "how is the login fix going?",
+            None,
+            true,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        // The person named one themselves; two get the same title.
+        d.set_status("claude-code:c", None, Some("review".into())).unwrap();
+        titled("a", "Fix the login bug on Safari");
+        titled("b", "Add CSV export to reports");
+        titled("c", "Something else entirely");
+        titled("d", "Fix the login bug on Safari");
+        let rows = d.local_rows(None, false).await.unwrap();
+        let name = |id: &str| d.inner.lock().unwrap().live[&format!("claude-code:{id}")].name.clone();
+        let mut same = [name("a"), name("d")];
+        same.sort();
+        assert_eq!(same, ["api-fix-the-login-bug", "api-fix-the-login-bug-2"]);
+        assert_eq!(name("b"), "api-add-csv-export-to");
+        assert_eq!(name("c"), "review");
+        // The directory (list_team, `who`) shows the new names, and the mail reached the renamed session.
+        let mut shown: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        shown.sort();
+        assert_eq!(shown, ["api-add-csv-export-to", "api-fix-the-login-bug", "api-fix-the-login-bug-2", "review"]);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr("api-add-csv-export-to")).unwrap(), 1);
+        // A later title leaves a titled name alone.
+        titled("b", "Something new");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("b"), "api-add-csv-export-to");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
