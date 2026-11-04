@@ -1024,12 +1024,11 @@ impl Net {
     }
 
     pub fn anchor_retry_ready(&self, peer: EndpointId, id: &str) -> bool {
-        !self
-            .anchor_sent
+        self.anchor_sent
             .lock()
             .unwrap()
             .get(&(peer, id.to_string()))
-            .is_some_and(|(at, _, delay)| at.elapsed() < *delay)
+            .is_none_or(|(at, _, delay)| at.elapsed() >= *delay)
     }
 
     /// New frames only go to engines that announced support. Repeated ticks don't flood a busy receiver.
