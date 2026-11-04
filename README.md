@@ -145,8 +145,8 @@ python3 tests/e2e/tray_memory.py --output /tmp/tray-memory.json  # macOS desktop
 The tray memory check uses synthetic local data and writes its measurements to JSON. Separately open a test submenu,
 close it, and reopen it after several updates to verify that the menu still works; see the script's instructions.
 
-A `v*` tag builds the macOS, Linux and Windows archives and the install scripts; the Reason CLI pins the macOS and
-Linux ones.
+A `v*` tag builds the macOS, Linux and Windows archives and the install scripts as a draft release, and publishing the
+draft ships it; the Reason CLI pins the macOS and Linux ones.
 
 ## Contributing
 

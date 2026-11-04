@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag like v0.10.4 to build reason-network for macOS, Linux and Windows and publish a GitHub release, with the
+# Push a tag like v0.10.4 to build reason-network for macOS, Linux and Windows and create a GitHub release, with the
 # install scripts a standalone install (and its updates) uses. The reason CLI pins the macOS and Linux archives' sha256.
 # Reason then replaces the macOS archives (and their .sha256) with Developer ID signed and notarized builds of the same
 # binaries, so macOS knows every release as one program. install.sh never puts an unsigned build over a signed one.
