@@ -163,7 +163,7 @@ pub fn command_for(name: &str) -> Option<std::process::Command> {
 }
 
 /// [`command_for`] for the program at `bin`.
-fn command_at(bin: &Path) -> std::process::Command {
+pub fn command_at(bin: &Path) -> std::process::Command {
     #[cfg(windows)]
     if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
         && let Some(dir) = bin.parent()

@@ -145,6 +145,9 @@ pub struct Daemon {
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
+    /// Agent CLIs a test runs in place of the ones on this machine.
+    #[cfg(test)]
+    fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
 }
 
 struct Inner {
@@ -168,6 +171,8 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks.
+    codex_failed: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -260,6 +265,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                codex_failed: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -271,7 +277,18 @@ impl Daemon {
             started: util::now_ms(),
             plain_until: Mutex::new(None),
             capped: Default::default(),
+            #[cfg(test)]
+            fake_bins: Default::default(),
         })
+    }
+
+    /// The agent's own CLI `bin` on this machine (in a test, its fake).
+    fn agent_bin(&self, bin: &str) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_bins.lock().unwrap().get(bin) {
+            return Some(fake.clone());
+        }
+        crate::agent::find_bin(bin)
     }
 
     fn addr(&self, name: &str) -> String {

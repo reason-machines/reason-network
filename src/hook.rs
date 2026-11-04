@@ -25,6 +25,19 @@ pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: 
     }
 }
 
+/// The `CODEX_HOME` a Codex hook runs with, for the daemon to run `codex queue` against: only a full path to a folder
+/// that is there, as its real path. Anything else is left out, and the daemon uses the default home.
+fn codex_home(value: Option<std::ffi::OsString>) -> Option<String> {
+    let path = std::path::PathBuf::from(value?);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    let real = std::fs::canonicalize(path).ok()?;
+    let real = real.to_str()?;
+    // Windows gives it as `\\?\C:\…`; kept as `C:\…`, as Codex would be given it (a share's path as it comes).
+    Some(real.strip_prefix(r"\\?\").filter(|p| !p.starts_with("UNC")).unwrap_or(real).to_string())
+}
+
 /// The hook payload, without hanging if the agent never closes our stdin.
 fn read_stdin(limit: Duration) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -104,7 +117,7 @@ async fn handle(
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
         keep: false,
-        codex_home: (agent == "codex").then(|| std::env::var("CODEX_HOME").ok()).flatten().filter(|h| !h.is_empty()),
+        codex_home: (agent == "codex").then(|| codex_home(std::env::var_os("CODEX_HOME"))).flatten(),
     });
     let reply: HookReply = link.call(req).await.ok()?;
     if off {
@@ -194,7 +207,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_for, grok_ignores, takes_mail};
+    use super::{codex_home, format_for, grok_ignores, takes_mail};
     use serde_json::json;
 
     #[test]
@@ -211,6 +224,29 @@ mod tests {
         assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
         assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
+    }
+
+    #[test]
+    fn a_codex_home_is_named_only_as_the_real_path_of_a_folder_that_is_there() {
+        let dir = std::env::temp_dir().join(format!("reason-network-codex-home-{}", std::process::id()));
+        let home = dir.join("codex-b");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        let real = std::fs::canonicalize(&home).unwrap();
+        let real = real.to_str().unwrap();
+        let real = real.strip_prefix(r"\\?\").unwrap_or(real);
+        let named = |p: &std::path::Path| codex_home(Some(p.as_os_str().to_owned()));
+        assert_eq!(named(&home).as_deref(), Some(real));
+        // By another path to it: its real one (macOS's temp folder is under a link, `/var` to `/private/var`).
+        assert_eq!(named(&dir.join("x").join("..").join("codex-b")).as_deref(), Some(real));
+        // Not a folder, not there, not a full path, or empty: none, so the daemon's own home.
+        assert_eq!(named(&dir.join("file")), None);
+        assert_eq!(named(&dir.join("missing")), None);
+        assert_eq!(named(std::path::Path::new("codex-b")), None);
+        assert_eq!(codex_home(Some("".into())), None);
+        assert_eq!(codex_home(None), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
