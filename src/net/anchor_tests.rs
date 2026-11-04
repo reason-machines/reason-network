@@ -66,6 +66,7 @@ async fn anchor_frames_require_the_current_connections_matching_capability() {
         net.anchor_send(peer, &msg.id, frame.clone());
         assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "cached {feature} is insufficient");
         assert!(net.anchor_sent.lock().unwrap().is_empty());
+        assert!(!net.anchor_ready(peer, &msg.id, feature));
 
         net.links.lock().unwrap().get_mut(&peer).unwrap().presence_seen = true;
         for features in [Vec::new(), vec![wrong_feature.into()]] {
@@ -76,7 +77,9 @@ async fn anchor_frames_require_the_current_connections_matching_capability() {
         }
 
         net.remote.lock().unwrap().get_mut(&peer).unwrap().presence.features = vec![feature.into()];
+        assert!(net.anchor_ready(peer, &msg.id, feature));
         net.anchor_send(peer, &msg.id, frame.clone());
+        assert!(!net.anchor_ready(peer, &msg.id, feature));
         let sent = rx.try_recv().expect("the current connection advertised the matching capability");
         assert_eq!(serde_json::to_value(sent).unwrap(), serde_json::to_value(&frame).unwrap());
         if feature == "anchor" {
@@ -97,6 +100,7 @@ async fn anchor_frames_require_the_current_connections_matching_capability() {
             );
             net.anchor_sent.lock().unwrap().get_mut(&(peer, msg.id.clone())).unwrap().0 =
                 Instant::now() - Duration::from_secs(31);
+            assert!(net.anchor_ready(peer, &msg.id, feature));
             net.anchor_send(peer, &msg.id, frame.clone());
             assert!(rx.try_recv().is_ok());
             assert_eq!(net.anchor_sent.lock().unwrap()[&(peer, msg.id.clone())].2, Duration::from_secs(60));

@@ -811,6 +811,28 @@ impl Net {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_connect(
+        &self,
+        other: &Endpoint,
+        presence: Presence,
+    ) -> (mpsc::UnboundedReceiver<Wire>, Connection) {
+        let peer = other.id();
+        let address = EndpointAddr::new(peer).with_ip_addr(other.bound_sockets()[0]);
+        let (conn, accepted) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(self.endpoint.connect(address, ALPN), async { other.accept().await.unwrap().await })
+        })
+        .await
+        .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.links.lock().unwrap().insert(
+            peer,
+            Link { id: 1, tx, conn: conn.unwrap(), dialer: self.me, since: Instant::now(), presence_seen: true },
+        );
+        self.remote.lock().unwrap().insert(peer, Remote { presence, last_seen: util::now_ms(), online: true });
+        (rx, accepted.unwrap())
+    }
+
     pub fn start(
         daemon: &Arc<Daemon>,
         bound: Bound,
@@ -994,6 +1016,20 @@ impl Net {
                 None
             }
         }
+    }
+
+    /// A cheap preflight before loading a queued body; sending still rechecks and reserves the attempt.
+    pub fn anchor_ready(&self, peer: EndpointId, id: &str, feature: &str) -> bool {
+        self.supports(&peer, feature) && self.anchor_retry_ready(peer, id)
+    }
+
+    pub fn anchor_retry_ready(&self, peer: EndpointId, id: &str) -> bool {
+        !self
+            .anchor_sent
+            .lock()
+            .unwrap()
+            .get(&(peer, id.to_string()))
+            .is_some_and(|(at, _, delay)| at.elapsed() < *delay)
     }
 
     /// New frames only go to engines that announced support. Repeated ticks don't flood a busy receiver.

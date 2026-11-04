@@ -340,7 +340,7 @@ impl Daemon {
         }
         let remotes = net.remotes();
         let now = util::now_ms();
-        let pending = self.inner.lock().unwrap().store.anchor_pending()?;
+        let pending = self.inner.lock().unwrap().store.anchor_pending_meta()?;
         for held in pending {
             let source: EndpointId = held.source.parse()?;
             let target: EndpointId = held.target.parse()?;
@@ -348,19 +348,25 @@ impl Daemon {
                 Some("this handoff was cancelled before delivery")
             } else if !self.same_owner(&source) || !self.same_owner(&target) {
                 Some("a machine was removed or revoked")
-            } else if held.msg.sent_at <= now.saturating_sub(ANCHOR_TTL_MS) {
+            } else if held.expires_at <= now {
                 Some("seven days elapsed since the original send")
             } else {
                 None
             };
             if let Some(reason) = reason {
-                let notice = self.anchor_notice(&held.msg, reason);
                 let g = self.inner.lock().unwrap();
-                g.store.anchor_cancel(&held.msg.id)?;
-                let stage = if held.msg.sent_at <= now.saturating_sub(ANCHOR_TTL_MS) { "expired" } else { "rejected" };
-                g.store.anchor_finish_as(&held.msg.id, Some(&notice), stage)?;
-            } else if remotes.get(&target).is_some_and(|r| r.online && r.presence.has(FEATURE)) {
-                net.anchor_send(target, &held.msg.id, Wire::Forward { source, msg: held.msg.clone() });
+                let Some(payload) = g.store.anchor_for_ack(&held.id, &held.target)? else { continue };
+                let notice = self.anchor_notice(&payload.msg, reason);
+                g.store.anchor_cancel(&held.id)?;
+                let stage = if held.expires_at <= now { "expired" } else { "rejected" };
+                g.store.anchor_finish_as(&held.id, Some(&notice), stage)?;
+            } else if remotes.get(&target).is_some_and(|r| r.online && r.presence.has(FEATURE))
+                && net.anchor_ready(target, &held.id, FEATURE)
+            {
+                let payload = self.inner.lock().unwrap().store.anchor_for_ack(&held.id, &held.target)?;
+                if let Some(payload) = payload.filter(|p| !p.cancelled) {
+                    net.anchor_send(target, &held.id, Wire::Forward { source, msg: payload.msg });
+                }
             }
         }
         self.inner.lock().unwrap().store.anchor_prune(now)?;
@@ -383,22 +389,42 @@ impl Daemon {
             if !routes.iter().any(|r| r.machine == target) {
                 continue;
             }
-            for msg in self.outbox_for(&target) {
-                if !routes.iter().any(|r| {
-                    r.machine == target
-                        && msg.to.split_once('/').is_some_and(|(_, name)| r.names.iter().any(|n| n == name))
-                }) {
+            let matches_route = |to: &str| {
+                routes.iter().any(|r| {
+                    r.machine == target && to.split_once('/').is_some_and(|(_, name)| r.names.iter().any(|n| n == name))
+                })
+            };
+            let (pending, expired) = self.inner.lock().unwrap().store.outbox_meta_for(&target.to_string(), now)?;
+            if expired > 0 {
+                self.usage.count("expired", Default::default(), expired as u64);
+            }
+            for (id, recipient) in pending {
+                // Older queues can lack a receipt; their body still supplies the mailbox below.
+                if recipient.as_ref().is_some_and(|to| !matches_route(to.split('@').next().unwrap_or(to))) {
                     continue;
                 }
-                if self.anchor_local() {
+                let local = self.anchor_local();
+                let anchor = if local { Some(self.key.public()) } else { self.anchor_peer(&remotes, &target) };
+                let Some(anchor) = anchor else { continue };
+                if !(if local { net.anchor_retry_ready(anchor, &id) } else { net.anchor_ready(anchor, &id, "anchor") })
+                {
+                    continue;
+                }
+                let Some(msg) = self.inner.lock().unwrap().store.outbox_message(&target.to_string(), &id)? else {
+                    continue;
+                };
+                if !matches_route(&msg.to) {
+                    continue;
+                }
+                if local {
                     if net.anchor_attempt(self.key.public(), &msg.id, Some(target))
                         && self.accept_anchor(self.key.public(), target, msg.clone()).is_ok()
                     {
                         self.anchor_stored(&self.key.public(), &target, &msg.id)?;
                         net.anchor_attempt_done(self.key.public(), &msg.id);
                     }
-                } else if let Some(anchor) = self.anchor_peer(&remotes, &target) {
-                    net.anchor_send(anchor, &msg.id.clone(), Wire::Anchor { target, msg });
+                } else {
+                    net.anchor_send(anchor, &id, Wire::Anchor { target, msg });
                 }
             }
         }

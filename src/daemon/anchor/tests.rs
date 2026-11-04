@@ -288,6 +288,220 @@ async fn transient_popups_cannot_claim_queued_anchor_custody() {
     endpoint.close().await;
 }
 
+#[tokio::test]
+async fn held_payloads_are_loaded_only_for_due_capable_connections() {
+    let t = team(true);
+    learn(&t);
+    let msg = message();
+    t.daemon.accept_anchor(t.source.public(), t.laptop.public(), msg.clone()).unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.daemon.key.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    for _ in 0..120 {
+        t.daemon.anchor_flush(&net).unwrap();
+    }
+    assert_eq!(t.daemon.inner.lock().unwrap().store.anchor_payload_reads.get(), 0);
+    let other = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.laptop.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .alpns(vec![crate::net::ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let (mut unsupported, _unsupported_connection) = net.test_connect(&other, Presence::default()).await;
+    t.daemon.anchor_flush(&net).unwrap();
+    assert!(unsupported.try_recv().is_err());
+    assert_eq!(t.daemon.inner.lock().unwrap().store.anchor_payload_reads.get(), 0);
+    let (mut frames, _connection) = net.test_connect(&other, permanent(&["inbox"])).await;
+    t.daemon.anchor_flush(&net).unwrap();
+    let Wire::Forward { source, msg: forwarded } = frames.try_recv().unwrap() else { panic!("expected forward") };
+    assert_eq!(source, t.source.public());
+    assert_eq!(serde_json::to_value(&forwarded).unwrap(), serde_json::to_value(&msg).unwrap());
+    for _ in 0..120 {
+        t.daemon.anchor_flush(&net).unwrap();
+    }
+    assert!(frames.try_recv().is_err());
+    assert_eq!(t.daemon.inner.lock().unwrap().store.anchor_payload_reads.get(), 1);
+    // A later retry can load the same envelope again; the earlier attempt never released custody.
+    net.anchor_attempt_done(t.laptop.public(), &msg.id);
+    t.daemon.anchor_flush(&net).unwrap();
+    assert!(matches!(frames.try_recv().unwrap(), Wire::Forward { .. }));
+    assert_eq!(t.daemon.inner.lock().unwrap().store.anchor_payload_reads.get(), 2);
+    t.daemon.forward_done(&t.laptop.public(), &msg.id, "queued", "").unwrap();
+    assert!(t.daemon.inner.lock().unwrap().store.anchor_pending_meta().unwrap().is_empty());
+    endpoint.close().await;
+    other.close().await;
+}
+
+#[tokio::test]
+async fn sender_payloads_wait_for_the_anchors_capability_and_retry_guard() {
+    let t = team(false);
+    {
+        let mut g = t.daemon.inner.lock().unwrap();
+        let state = g.team.as_mut().unwrap();
+        state.select_anchor(&t.daemon.key, Some(t.source.public())).unwrap();
+        state.select_anchor(&t.source, Some(t.source.public())).unwrap();
+        state.select_anchor(&t.laptop, Some(t.source.public())).unwrap();
+    }
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.daemon.key.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let other = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.source.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .alpns(vec![crate::net::ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    let messages = [message(), message()];
+    for msg in &messages {
+        t.daemon.inner.lock().unwrap().store.outbox_add(&t.laptop.public().to_string(), msg).unwrap();
+    }
+    let ordinary = Message { to: "alex/ordinary".into(), ..message() };
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        g.store.record_sent("cli:terminal", &ordinary, "alex/ordinary@laptop", "queued").unwrap();
+        g.store.outbox_add(&t.laptop.public().to_string(), &ordinary).unwrap();
+    }
+    let old = Message { sent_at: util::now_ms() - ANCHOR_TTL_MS - 1, ..message() };
+    t.daemon.inner.lock().unwrap().store.outbox_add(&t.laptop.public().to_string(), &old).unwrap();
+    let p = advertised(t.laptop.public(), &["inbox"]).presence;
+    let mut incomplete = p.clone();
+    incomplete.features.retain(|f| f != RECEIPTS);
+    let (mut unsupported, _unsupported_connection) = net.test_connect(&other, incomplete).await;
+    t.daemon.anchor_flush(&net).unwrap();
+    assert_eq!(t.daemon.inner.lock().unwrap().store.outbox_reads.get(), 0);
+    assert!(unsupported.try_recv().is_err());
+    assert!(
+        t.daemon.inner.lock().unwrap().store.outbox_message(&t.laptop.public().to_string(), &old.id).unwrap().is_none(),
+        "missing receipt support must not stop outbox expiry"
+    );
+    let (mut frames, _connection) = net.test_connect(&other, p).await;
+    t.daemon.anchor_flush(&net).unwrap();
+    for original in &messages {
+        let Wire::Anchor { target, msg } = frames.try_recv().unwrap() else { panic!("expected handoff") };
+        assert_eq!(target, t.laptop.public());
+        assert_eq!(serde_json::to_value(msg).unwrap(), serde_json::to_value(original).unwrap());
+    }
+    for _ in 0..120 {
+        t.daemon.anchor_flush(&net).unwrap();
+    }
+    assert_eq!(t.daemon.inner.lock().unwrap().store.outbox_reads.get(), 2);
+    assert!(frames.try_recv().is_err());
+    net.anchor_attempt_done(t.source.public(), &messages[0].id);
+    t.daemon.anchor_flush(&net).unwrap();
+    assert!(matches!(frames.try_recv().unwrap(), Wire::Anchor { msg, .. } if msg.id == messages[0].id));
+    assert!(frames.try_recv().is_err());
+    assert_eq!(t.daemon.inner.lock().unwrap().store.outbox_reads.get(), 3);
+    let mut expired = message();
+    expired.sent_at -= ANCHOR_TTL_MS + 1;
+    t.daemon.inner.lock().unwrap().store.outbox_add(&t.laptop.public().to_string(), &expired).unwrap();
+    t.daemon.anchor_flush(&net).unwrap();
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        assert_eq!(g.store.outbox_reads.get(), 3, "expiry must not load a blocked outbox");
+        assert_eq!(g.store.outbox_meta_for(&t.laptop.public().to_string(), util::now_ms()).unwrap().0.len(), 3);
+    }
+    endpoint.close().await;
+    other.close().await;
+}
+
+#[tokio::test]
+async fn local_custody_attempts_skip_backed_off_outbox_bodies() {
+    let t = team(true);
+    learn(&t);
+    let msg = message();
+    t.daemon.inner.lock().unwrap().store.outbox_add(&t.laptop.public().to_string(), &msg).unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.daemon.key.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    assert!(net.anchor_attempt(t.daemon.key.public(), &msg.id, Some(t.laptop.public())));
+    for _ in 0..120 {
+        t.daemon.anchor_flush(&net).unwrap();
+    }
+    assert_eq!(t.daemon.inner.lock().unwrap().store.outbox_reads.get(), 0);
+    net.anchor_attempt_done(t.daemon.key.public(), &msg.id);
+    t.daemon.anchor_flush(&net).unwrap();
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        assert_eq!(g.store.outbox_reads.get(), 1);
+        assert_eq!(g.store.anchor_pending_meta().unwrap()[0].id, msg.id);
+        assert!(g.store.outbox_meta_for(&t.laptop.public().to_string(), util::now_ms()).unwrap().0.is_empty());
+    }
+    endpoint.close().await;
+}
+
+#[tokio::test]
+async fn offline_expiry_and_cancellation_bypass_payload_retry_backoff() {
+    let t = team(true);
+    learn(&t);
+    let expired = Message { sent_at: util::now_ms() - ANCHOR_TTL_MS, ..message() };
+    let cancelled = message();
+    let retained = message();
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        for msg in [&expired, &cancelled, &retained] {
+            g.store
+                .anchor_accept(&t.source.public().to_string(), &t.laptop.public().to_string(), msg, msg.sent_at)
+                .unwrap();
+        }
+        g.store.anchor_cancel(&cancelled.id).unwrap();
+    }
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(t.daemon.key.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let net = Net::isolated(&t.daemon, endpoint.clone());
+    for msg in [&expired, &cancelled, &retained] {
+        assert!(net.anchor_attempt(t.laptop.public(), &msg.id, None));
+    }
+    t.daemon.anchor_flush(&net).unwrap();
+    {
+        let g = t.daemon.inner.lock().unwrap();
+        assert_eq!(g.store.anchor_payload_reads.get(), 2, "only final notices need bodies while offline");
+        assert_eq!(g.store.anchor_pending_meta().unwrap()[0].id, retained.id);
+        for (msg, expected) in [(&expired, "expired"), (&cancelled, "rejected")] {
+            assert_eq!(
+                g.store
+                    .anchor_result(
+                        &t.source.public().to_string(),
+                        &t.laptop.public().to_string(),
+                        &msg.id,
+                        util::now_ms()
+                    )
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+    for _ in 0..120 {
+        t.daemon.anchor_flush(&net).unwrap();
+    }
+    assert_eq!(t.daemon.inner.lock().unwrap().store.anchor_payload_reads.get(), 2);
+    endpoint.close().await;
+}
+
 #[test]
 fn learning_keeps_explicit_permanent_mailboxes_and_ignores_other_sessions_and_anchors() {
     let t = team(true);

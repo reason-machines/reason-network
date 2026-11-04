@@ -23,6 +23,14 @@ pub struct AnchorMail {
     pub cancelled: bool,
 }
 
+pub struct PendingAnchor {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub cancelled: bool,
+    pub expires_at: i64,
+}
+
 impl Store {
     /// A keyed retry must not rebuild an envelope whose outbox payload or custody already exists.
     pub fn retry_remote_send(&self, id: &str) -> Result<Option<crate::proto::Recipient>> {
@@ -148,6 +156,22 @@ impl Store {
             .query_row([], |row| row.get(0))?)
     }
 
+    pub fn anchor_pending_meta(&self) -> Result<Vec<PendingAnchor>> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT id, source, target, cancelled, expires_at FROM anchor_mail WHERE msg IS NOT NULL ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PendingAnchor {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                target: row.get(2)?,
+                cancelled: row.get(3)?,
+                expires_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn anchor_pending(&self) -> Result<Vec<AnchorMail>> {
         let mut statement = self.db.prepare_cached(
             "SELECT source, target, msg, cancelled FROM anchor_mail WHERE msg IS NOT NULL ORDER BY rowid",
@@ -157,6 +181,8 @@ impl Store {
         })?;
         rows.map(|row| {
             let (source, target, encoded, cancelled) = row?;
+            #[cfg(test)]
+            self.anchor_payload_reads.set(self.anchor_payload_reads.get() + 1);
             Ok(AnchorMail { source, target, msg: serde_json::from_str(&encoded)?, cancelled })
         })
         .collect()
@@ -173,6 +199,8 @@ impl Store {
             )
             .optional()?;
         row.map(|(source, encoded, cancelled)| {
+            #[cfg(test)]
+            self.anchor_payload_reads.set(self.anchor_payload_reads.get() + 1);
             Ok(AnchorMail { source, target: target.to_string(), msg: serde_json::from_str(&encoded)?, cancelled })
         })
         .transpose()
@@ -351,6 +379,30 @@ mod tests {
         let store = Store::open(Path::new(":memory:"), inbox).unwrap();
         store.init_anchor().unwrap();
         store
+    }
+
+    #[test]
+    fn metadata_can_outlive_a_payload_released_by_an_ack() {
+        let s = store();
+        let msg = message("released");
+        s.anchor_accept("source", "target", &msg, NOW).unwrap();
+        let pending = s.anchor_pending_meta().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, msg.id);
+        assert_eq!(pending[0].source, "source");
+        assert_eq!(pending[0].target, "target");
+        assert_eq!(pending[0].expires_at, msg.sent_at + TTL_MS);
+        assert!(!pending[0].cancelled);
+        assert_eq!(s.anchor_payload_reads.get(), 0);
+        s.anchor_finish(&msg.id, None).unwrap();
+        assert!(s.anchor_for_ack(&pending[0].id, &pending[0].target).unwrap().is_none());
+        assert!(s.anchor_pending_meta().unwrap().is_empty());
+        s.outbox_add("target", &msg).unwrap();
+        assert_eq!(s.outbox_meta_for("target", NOW).unwrap().0, [(msg.id.clone(), None)]);
+        assert!(s.outbox_message("other-target", &msg.id).unwrap().is_none());
+        assert_eq!(s.outbox_reads.get(), 0);
+        s.outbox_done_from("target", &msg.id, true).unwrap();
+        assert!(s.outbox_message("target", &msg.id).unwrap().is_none());
     }
 
     #[test]

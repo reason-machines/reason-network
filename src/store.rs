@@ -22,6 +22,8 @@ pub struct Store {
     inbox: PathBuf,
     #[cfg(test)]
     pub(crate) outbox_reads: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) anchor_payload_reads: std::cell::Cell<usize>,
 }
 
 /// What the `files` column keeps of a message's files: their folder in the inbox folder, named by an id made here
@@ -52,6 +54,7 @@ const RECEIPT_KEEP_MS: i64 = 7 * 86_400_000;
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
+pub type OutboxMeta = (String, Option<String>);
 
 #[derive(Debug, Clone)]
 pub struct Remembered {
@@ -304,6 +307,8 @@ impl Store {
             inbox,
             #[cfg(test)]
             outbox_reads: Default::default(),
+            #[cfg(test)]
+            anchor_payload_reads: Default::default(),
         };
         store.init_anchor()?;
         Ok(store)
@@ -539,10 +544,35 @@ impl Store {
     pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
         #[cfg(test)]
         self.outbox_reads.set(self.outbox_reads.get() + 1);
-        let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+        let expired = self.outbox_prune(now)?;
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
         Ok((rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect(), expired))
+    }
+
+    fn outbox_prune(&self, now: i64) -> Result<usize> {
+        Ok(self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?)
+    }
+
+    pub fn outbox_meta_for(&self, target: &str, now: i64) -> Result<(Vec<OutboxMeta>, usize)> {
+        let expired = self.outbox_prune(now)?;
+        let mut st = self.db.prepare_cached("SELECT o.id, r.recipient FROM outbox o LEFT JOIN sent_receipts r ON r.id=o.id WHERE o.target = ?1 ORDER BY o.created_at, o.rowid")?;
+        let rows =
+            st.query_map([target], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, expired))
+    }
+
+    pub fn outbox_message(&self, target: &str, id: &str) -> Result<Option<Message>> {
+        let encoded: Option<String> = self
+            .db
+            .prepare_cached("SELECT msg FROM outbox WHERE target = ?1 AND id = ?2")?
+            .query_row(params![target, id], |row| row.get(0))
+            .optional()?;
+        #[cfg(test)]
+        if encoded.is_some() {
+            self.outbox_reads.set(self.outbox_reads.get() + 1);
+        }
+        Ok(encoded.and_then(|s| serde_json::from_str(&s).ok()))
     }
 
     /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
