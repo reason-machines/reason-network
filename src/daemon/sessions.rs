@@ -120,6 +120,9 @@ impl Daemon {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
             }
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
+            if reg.name.is_some() {
+                g.store.mark_named(&key)?;
+            }
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
@@ -262,10 +265,30 @@ impl Daemon {
     }
 
     pub(super) fn set_status(&self, key: &str, doing: Option<String>, name: Option<String>) -> Result<Registered> {
+        self.set_status_as(key, doing, name, false)?.ok_or_else(|| anyhow!("this session is not registered"))
+    }
+
+    /// A session still on its default name goes by `name`, from its conversation's title, unless it was named since
+    /// (checked under the same lock as the rename, so a name someone gives it, or an earlier title's, wins). None when
+    /// it is not renamed for that reason.
+    pub(super) fn name_from_title(&self, key: &str, name: String) -> Result<Option<Registered>> {
+        self.set_status_as(key, None, Some(name), true)
+    }
+
+    fn set_status_as(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        from_title: bool,
+    ) -> Result<Option<Registered>> {
         let now = util::now_ms();
         let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        if from_title && !g.live.get(key).is_some_and(|l| title_may_name(g, key, l).unwrap_or(false)) {
+            return Ok(None);
+        }
         let new_name = name.as_deref().map(util::slug);
         if let Some(n) = new_name.as_deref() {
             if n.is_empty() {
@@ -298,6 +321,9 @@ impl Daemon {
             let d = crate::team::without_tickets(d.trim());
             live.doing = (!d.is_empty()).then(|| d.chars().take(200).collect());
         }
+        if new_name.is_some() {
+            g.store.mark_named(key)?;
+        }
         if let Some(n) = new_name
             && n != live.name
         {
@@ -311,7 +337,7 @@ impl Daemon {
         }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
         let address = self.addr(&live.name);
-        Ok(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address })
+        Ok(Some(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address }))
     }
 
     pub(super) fn unread(&self, key: &str) -> Result<Unread> {
@@ -583,6 +609,17 @@ impl Daemon {
             }
         }
     }
+}
+
+/// Whether a title may still name this session: it is an agent's conversation (not one of the person's mailboxes or a
+/// `cli:` one), on the name it got for asking none, never named (by someone or by an earlier title), and it has sent no
+/// mail lately, since a reply to that would go to the name it sent from.
+pub(super) fn title_may_name(g: &Inner, key: &str, l: &Live) -> Result<bool> {
+    Ok(!l.mailbox
+        && !key.starts_with("cli:")
+        && agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git)
+        && !g.store.is_named(key)?
+        && !g.store.has_sent(key)?)
 }
 
 fn remembered(l: &Live, now: i64) -> Remembered {

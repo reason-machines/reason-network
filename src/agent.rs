@@ -283,11 +283,11 @@ pub fn default_name(agent: &str, cwd: &str, git: &GitInfo) -> String {
 /// Whether `name` is the one a session gets when it asks for none: `default_name`, or it with `-2`, `-3`, ….
 pub fn is_default_name(name: &str, agent: &str, cwd: &str, git: &GitInfo) -> bool {
     let base = default_name(agent, cwd, git);
+    // `-2`, `-3`, … as `pick_name` adds them, which cuts a long base short to fit.
     name == base
-        || name
-            .strip_prefix(base.as_str())
-            .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        || name.rsplit_once('-').is_some_and(|(_, n)| {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && name == util::joined(&base, n)
+        })
 }
 
 /// `<repo-or-dir>-<the first words of its title>`, e.g. `api-fix-the-login-bug`: the folder and what the conversation
@@ -613,6 +613,11 @@ mod tests {
             Some("my-thing-resume-export-pdfs")
         );
         assert_eq!(titled_name(cwd, &git, " … "), None);
+        // In a folder with a long name, `-2` cuts the default short, as `pick_name` does.
+        let long = format!("/tmp/{}", "a".repeat(33));
+        let second = util::joined(&default_name(CLAUDE_CODE, &long, &GitInfo::default()), "2");
+        assert!(second.ends_with("-clau-2"), "{second}");
+        assert!(is_default_name(&second, CLAUDE_CODE, &long, &GitInfo::default()));
     }
 
     #[test]

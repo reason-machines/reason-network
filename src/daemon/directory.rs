@@ -82,16 +82,23 @@ impl Daemon {
                 self.claude_seen(c, git, now);
             }
         }
-        // A Claude Code session someone renamed goes by that name here too.
+        // A Claude Code session someone renamed goes by that name here too, and a title never renames it.
         let renames: Vec<(String, String)> = {
             let g = self.inner.lock().unwrap();
-            g.live
+            let chosen: Vec<(String, String)> = g
+                .live
                 .iter()
                 .filter_map(|(k, l)| {
                     let name = util::slug(claude.iter().find(|c| claude_match(c, &l.reg))?.chosen_name()?);
-                    (!name.is_empty() && name != l.name).then(|| (k.clone(), name))
+                    (!name.is_empty()).then(|| (k.clone(), name))
                 })
-                .collect()
+                .collect();
+            for (key, name) in &chosen {
+                if g.live[key].name == *name {
+                    let _ = g.store.mark_named(key);
+                }
+            }
+            chosen.into_iter().filter(|(k, n)| g.live[k].name != *n).collect()
         };
         for (key, name) in renames {
             let _ = self.set_status(&key, None, Some(name));
@@ -176,21 +183,22 @@ impl Daemon {
     /// its conversation is about once its agent has titled it (`api-fix-the-login-bug`), so the chats in one folder can
     /// be told apart, by the person and by the agents they ask to message one. Once: a name from a title, or one someone
     /// chose (`/rename`, `set_name`), stays. Its mail comes along, as for any rename. `-2`, `-3`, … when the name is
-    /// taken, and the default name is kept when none of those is free.
+    /// taken, and the default name is kept when none of those is free. Not a session that sent mail lately: a reply goes
+    /// to the name it sent from (see `title_may_name`, checked again under the rename's lock).
     fn name_after_titles(&self, titles: &HashMap<String, String>) {
         let renames: Vec<(String, String)> = {
             let g = self.inner.lock().unwrap();
             g.live
                 .iter()
-                .filter(|(k, l)| !l.mailbox && !k.starts_with("cli:"))
-                .filter(|(_, l)| agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git))
+                .filter(|(k, l)| super::sessions::title_may_name(&g, k, l).unwrap_or(false))
                 .filter_map(|(k, l)| Some((k.clone(), agent::titled_name(&l.reg.cwd, &l.git, titles.get(k)?)?)))
                 .collect()
         };
         for (key, base) in renames {
             let names = std::iter::once(base.clone()).chain((2..10).map(|i| util::joined(&base, &i.to_string())));
             for name in names {
-                if self.set_status(&key, None, Some(name)).is_ok() {
+                // Renamed, or no longer to be (named meanwhile): either way, done with it.
+                if self.name_from_title(&key, name).is_ok() {
                     break;
                 }
             }
@@ -649,7 +657,7 @@ mod tests {
         assert_eq!(reg("d", 4), "api-claude-4");
         // Mail for one that is about to be named comes along.
         d.send(
-            "claude-code:a".into(),
+            "claude-code:c".into(),
             "api-claude-2",
             "how is the login fix going?",
             None,
@@ -682,6 +690,31 @@ mod tests {
         titled("b", "Something new");
         d.local_rows(None, false).await.unwrap();
         assert_eq!(name("b"), "api-add-csv-export-to");
+        // A title that reads like a default name (`Claude 7`) is still a title: the next one leaves it alone.
+        assert!(agent::is_default_name(&reg("e", 5), agent::CLAUDE_CODE, "/work/api", &GitInfo::default()));
+        titled("e", "Claude 7");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("e"), "api-claude-7");
+        titled("e", "Something new");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("e"), "api-claude-7");
+        // A name someone chose stays, even one that reads like a default.
+        reg("f", 6);
+        d.set_status("claude-code:f", None, Some("api-claude-3".into())).unwrap();
+        titled("f", "Rename me please");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("f"), "api-claude-3");
+        // So does the name of one that sent mail: a reply goes to the name it sent from.
+        let default = reg("g", 7);
+        d.send("claude-code:g".into(), "review", "done?", None, true, false, None, Vec::new()).await.unwrap();
+        titled("g", "Ship the release notes");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("g"), default);
+        // A title decided before someone named the session never overrides that name (checked under the rename's lock).
+        reg("h", 8);
+        d.set_status("claude-code:h", None, Some("mine".into())).unwrap();
+        assert!(d.name_from_title("claude-code:h", "api-stale-title".into()).unwrap().is_none());
+        assert_eq!(name("h"), "mine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

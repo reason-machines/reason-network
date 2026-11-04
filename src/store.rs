@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     mailbox INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
+CREATE TABLE IF NOT EXISTS named (key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS counts (
     day TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0,
@@ -715,6 +716,22 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Marks a session's name as given, not the default it got for asking none: someone chose it (`/rename`,
+    /// `set_name`, a name it registered with), or it came from the conversation's title. A title never renames it.
+    pub fn mark_named(&self, key: &str) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO named (key) VALUES (?1)", [key])?;
+        Ok(())
+    }
+
+    pub fn is_named(&self, key: &str) -> Result<bool> {
+        Ok(self.db.prepare_cached("SELECT 1 FROM named WHERE key = ?1")?.exists([key])?)
+    }
+
+    /// Whether the session sent mail lately (its receipts are kept a week): a reply to it goes to the name it sent from.
+    pub fn has_sent(&self, key: &str) -> Result<bool> {
+        Ok(self.db.prepare_cached("SELECT 1 FROM sent_receipts WHERE sender_key = ?1")?.exists([key])?)
     }
 
     pub fn session_by_key(&self, key: &str) -> Result<Option<Remembered>> {
