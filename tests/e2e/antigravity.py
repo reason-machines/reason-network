@@ -54,6 +54,7 @@ def main():
             # PreInvocation fires before every model call: the identity notice is said once per conversation, not each time.
             assert hooks(first,'user-prompt-submit') == '', 'identity notice repeated on the next invocation'
             assert hooks(first,'session-start') == '', 'identity notice repeated at a later session start'
+            print('PASS the identity notice is injected once per conversation')
             recipient=next(s['address'] for s in sessions() if s['agent']=='antigravity')
             ids=sent(recipient,'Receive at the next invocation','hook-message')
             assert hooks(first,'post-tool-use') == ''

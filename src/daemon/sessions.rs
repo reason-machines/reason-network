@@ -482,8 +482,8 @@ impl Daemon {
         // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
         let intro = text.is_none()
             && if agent == "antigravity" {
-                let l = g.live.get_mut(&key).expect("looked up above");
-                matches!(event, "start" | "prompt") && !std::mem::replace(&mut l.introduced, true)
+                matches!(event, "start" | "prompt")
+                    && g.live.get_mut(&key).is_some_and(|l| !std::mem::replace(&mut l.introduced, true))
             } else {
                 event == "start"
             };
@@ -953,6 +953,25 @@ mod tests {
             seen.push(d.hook(call(event)).await.unwrap().intro);
         }
         assert_eq!(seen, [Some(true), Some(false), Some(false), Some(false), Some(false), Some(false), Some(false)]);
+        // Mail it is handed is not the introduction, so that doesn't use it up.
+        let call = |event: &str| HookCall { session_id: "c2".into(), ..call(event) };
+        d.hook(call("tool")).await.unwrap();
+        let name = d.inner.lock().unwrap().live["antigravity:c2"].name.clone();
+        mail(&d, "m1", &name);
+        let handed = d.hook(call("prompt")).await.unwrap();
+        assert!(handed.text.is_some());
+        assert_eq!(handed.intro, Some(false));
+        let next = d.hook(call("prompt")).await.unwrap();
+        assert!(next.text.is_none());
+        assert_eq!(next.intro, Some(true));
+        assert_eq!(d.hook(call("prompt")).await.unwrap().intro, Some(false));
+        // Other agents are told at session start, as before.
+        let claude = |event: &str| HookCall { agent: "claude-code".into(), session_id: "c3".into(), ..call(event) };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            seen.push(d.hook(claude(event)).await.unwrap().intro == Some(true));
+        }
+        assert_eq!(seen, [true, false, false, false, true]);
     }
 
     #[tokio::test]
