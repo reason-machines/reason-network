@@ -97,9 +97,7 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    let mail = !off
-        && takes_mail(agent, event)
-        && !(agent == "antigravity" && event == "stop" && v["terminationReason"] != "model_stop");
+    let mail = !off && takes_mail(agent, event) && !(agent == "antigravity" && antigravity_holds_mail(event, &v));
 
     let key = format!("{agent}:{session_id}");
     let native_app =
@@ -112,7 +110,7 @@ async fn handle(
         cwd,
         pid: if native_app { None } else { agent::hook_agent_pid() },
         mail,
-        transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
+        transcript: transcript_of(agent, &v),
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
@@ -136,15 +134,33 @@ async fn handle(
         }
         _ => return None,
     };
-    let text = if agent == "antigravity" {
-        format!(
-            "{text}\nFor Reason Network tools, pass session_id: {}. This identifies this conversation even when other chats use the same project.",
-            key.strip_prefix("antigravity:").unwrap_or(&key)
-        )
-    } else {
-        text
-    };
+    let text = if agent == "antigravity" { antigravity_text(&key, !ids.is_empty(), &text) } else { text };
     Some((format_for(agent, event, ev, &text), key, ids))
+}
+
+/// What Antigravity injects: a step its model would otherwise take as its user's, so mail says whose it is.
+fn antigravity_text(key: &str, mail: bool, text: &str) -> String {
+    let note = if mail { format!("{}\n", crate::antigravity::TEAMMATE_NOTE) } else { String::new() };
+    format!(
+        "{note}{text}\nFor Reason Network tools, pass session_id: {}. This identifies this conversation even when other chats use the same project.",
+        key.strip_prefix("antigravity:").unwrap_or(key)
+    )
+}
+
+/// Antigravity runs Stop however the turn ended, and continuing a turn its user cancelled (or that failed) would undo
+/// that: mail waits for the next one. Only a normal finish continues, which its builds spell differently.
+fn antigravity_holds_mail(event: &str, v: &Value) -> bool {
+    event == "stop"
+        && !v["terminationReason"]
+            .as_str()
+            .is_some_and(|r| r.eq_ignore_ascii_case("NO_TOOL_CALL") || r.eq_ignore_ascii_case("model_stop"))
+}
+
+/// The transcript a hook names. Only Antigravity spells it `transcriptPath`: Copilot's agentStop sends one too, but its
+/// events aren't a transcript the daemon reads.
+fn transcript_of(agent: &str, v: &Value) -> Option<String> {
+    let str_at = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    str_at("transcript_path").or_else(|| if agent == "antigravity" { str_at("transcriptPath") } else { None })
 }
 
 /// Prompt-submit hooks in Cursor, Copilot and grok can't add context, grok drops what SessionStart prints, and
@@ -209,7 +225,9 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_home, format_for, grok_ignores, takes_mail};
+    use super::{
+        antigravity_holds_mail, antigravity_text, codex_home, format_for, grok_ignores, takes_mail, transcript_of,
+    };
     use serde_json::json;
 
     #[test]
@@ -226,6 +244,41 @@ mod tests {
         assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
         assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
+    }
+
+    #[test]
+    fn antigravity_continues_a_turn_with_mail_only_on_a_normal_finish() {
+        let holds = |reason| antigravity_holds_mail("stop", &json!({ "terminationReason": reason }));
+        // Its CLI's own hook docs name NO_TOOL_CALL; its public docs list model_stop. Either spelling, any case.
+        for reason in ["NO_TOOL_CALL", "no_tool_call", "model_stop", "MODEL_STOP"] {
+            assert!(!holds(reason), "{reason}");
+        }
+        for reason in ["USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "TERMINAL_STEP_TYPE"] {
+            assert!(holds(reason), "{reason}");
+        }
+        assert!(antigravity_holds_mail("stop", &json!({})));
+        assert!(!antigravity_holds_mail("user-prompt-submit", &json!({})));
+    }
+
+    #[test]
+    fn only_antigravity_names_its_transcript_in_camel_case() {
+        let camel = json!({ "transcriptPath": "/t/events.jsonl" });
+        assert_eq!(transcript_of("antigravity", &camel).as_deref(), Some("/t/events.jsonl"));
+        // Copilot's agentStop sends it too: its events aren't a transcript the daemon reads.
+        assert_eq!(transcript_of("copilot", &camel), None);
+        let snake = json!({ "transcript_path": "/t/c.jsonl" });
+        assert_eq!(transcript_of("copilot", &snake).as_deref(), Some("/t/c.jsonl"));
+        assert_eq!(transcript_of("antigravity", &snake).as_deref(), Some("/t/c.jsonl"));
+    }
+
+    #[test]
+    fn antigravity_mail_says_it_is_not_from_the_user_and_its_own_notice_does_not() {
+        let mail = antigravity_text("antigravity:c1", true, "hello");
+        assert!(mail.starts_with(crate::antigravity::TEAMMATE_NOTE), "{mail}");
+        assert!(mail.contains("hello") && mail.contains("session_id: c1"), "{mail}");
+        let notice = antigravity_text("antigravity:c1", false, "you are a/b");
+        assert!(!notice.contains(crate::antigravity::TEAMMATE_NOTE), "{notice}");
+        assert!(notice.contains("session_id: c1"), "{notice}");
     }
 
     #[test]
