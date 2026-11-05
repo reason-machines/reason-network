@@ -148,7 +148,8 @@ fn antigravity_text(key: &str, mail: bool, text: &str) -> String {
 }
 
 /// Antigravity runs Stop however the turn ended, and continuing a turn its user cancelled (or that failed) would undo
-/// that: mail waits for the next one. Only a normal finish continues, which its builds spell differently.
+/// that, so only a normal finish continues, which its builds spell differently. This is about Stop alone: the App's
+/// sidecar still hands an idle conversation new mail, as every push channel does, and that can start a turn.
 fn antigravity_holds_mail(event: &str, v: &Value) -> bool {
     event == "stop"
         && !v["terminationReason"]
