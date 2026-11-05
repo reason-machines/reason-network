@@ -1,11 +1,11 @@
 //! Keeps a standalone install up to date: every few hours the daemon looks for a newer release and, if there is one,
 //! installs it over its own binary (with install.sh, or install.ps1 on Windows, checksum verified) and restarts on it.
-//! Off with `auto_update = false`; never for builds run from a source tree, nor for the build the Reason CLI pins
-//! (in `~/.reason/bin`), which updates with the CLI.
+//! Off with `auto_update = false`, and in a state folder that has never been set up (no `config.toml`); never for builds
+//! run from a source tree, nor for the build the Reason CLI pins (in `~/.reason/bin`), which updates with the CLI.
 
 use super::{Daemon, log};
 use anyhow::{Result, bail};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 const EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -29,7 +29,17 @@ impl Daemon {
 
 /// Whether this binary may replace itself.
 pub(super) fn allowed(enabled: bool) -> bool {
-    enabled && !crate::util::from_source() && !crate::managed() && crate::paths::env_var_os("NO_UPDATE").is_none()
+    wanted(enabled, &crate::paths::config())
+        && !crate::util::from_source()
+        && !crate::managed()
+        && crate::paths::env_var_os("NO_UPDATE").is_none()
+}
+
+/// `auto_update` counts only in a folder that has been set up. `init`, `join` and the setup wizard always write its
+/// `config.toml`, so a folder without one (a stray or mistyped `REASON_NETWORK_HOME`) runs on defaults nobody chose for
+/// it, and must not replace the binary that every folder shares.
+fn wanted(enabled: bool, config: &Path) -> bool {
+    enabled && config.exists()
 }
 
 /// Installs the latest release if it is newer than this one; returns its version.
@@ -122,5 +132,19 @@ mod tests {
         assert!(super::newer("1.0.0", "0.99.99"));
         assert!(!super::newer("0.6.3", "0.6.3"));
         assert!(!super::newer("0.6.2", "0.6.10"));
+    }
+
+    #[test]
+    fn only_a_set_up_folder_updates() {
+        let home = std::env::temp_dir().join(format!("reason-network-update-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        // No config.toml: defaults, so `auto_update` is on, but this folder was never set up (#171).
+        assert!(!super::wanted(true, &config));
+        // Set up, with `auto_update` at its default.
+        std::fs::write(&config, "").unwrap();
+        assert!(super::wanted(true, &config));
+        assert!(!super::wanted(false, &config));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }
