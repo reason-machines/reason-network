@@ -136,6 +136,12 @@ try:
     c = claude("one", "session-start", "conv-c")
     check("…a new conversation after the restart gets the next free name", you_are(c) == "lars/proj-claude-3", c)
     check("…and none of the other's mail", "bug report" not in c, c)
+    out = cli("one", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    wait = re.search(r"try again in about (\d+) minutes?\.", out)
+    check("an explicit rename explains how soon to retry or recover the unseen name",
+          "'proj-claude' has not reconnected since the daemon restart" in out
+          and "Resume the original conversation" in out and "end it and retry" in out
+          and wait is not None and 1 <= int(wait[1]) <= 360, out)
     back = claude("one", "session-start", "conv-a")
     check("the first conversation comes back as itself", name_of("one", "conv-a") == "lars/proj-claude", name_of("one", "conv-a"))
     check("…and its mail reaches it", "bug report for conversation A" in back, back)
@@ -144,11 +150,24 @@ try:
     out = cli("one", "who")
     check("who lists each under its own name", all(n in out for n in ("proj-claude ", "proj-claude-2", "proj-claude-3")), out)
 
-    # Renames: never into a name kept for a conversation that is offline.
+    # Only an explicit rename may take a conversation's name and mail.
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-a")
+    check("the original conversation names itself handoff", "You are lars/handoff." in out, out)
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    check("a live owner keeps its name", "taken by a live session" in out, out)
     claude("one", "session-end", "conv-a")
-    out = cli("one", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
-    check("a rename into the offline conversation's name is refused",
-          "'proj-claude' belongs to a session that is offline" in out and "pick another name" in out, out)
+    cli("one", "send", "handoff", "--fyi", "mail for the handoff")
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    check("an explicit rename takes the offline name", "You are lars/handoff." in out, out)
+    got = claude("one", "stop", "conv-c")
+    check("the new owner receives the queued mail", "mail for the handoff" in got, got)
+    back = claude("one", "session-start", "conv-a")
+    check("the former owner resumes under a free name without that mail",
+          name_of("one", "conv-a") == "lars/proj-claude" and "mail for the handoff" not in back, back)
+    cli("one", "send", "proj-claude", "--fyi", "for the resumed conversation")
+    got = claude("one", "stop", "conv-a")
+    check("the resumed conversation receives new mail at its own address", "for the resumed conversation" in got, got)
+    claude("one", "session-end", "conv-a")
     out = cli("one", "status", "--name", "auth", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
     check("…another name is fine", "You are lars/auth." in out, out)
     out = cli("one", "listen", "--as", "proj-claude", "--wait", "0")
@@ -205,6 +224,8 @@ try:
     check("…and when one goes offline", "auth" in out and "proj-claude-2" not in out, out)
     d = claude("two", "session-start", "conv-d")
     check("a new conversation there gets none of the names kept on the first", you_are(d) not in ("lars/proj-claude", "lars/proj-claude-2"), d)
+    out = cli("two", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-d")
+    check("an explicit rename cannot take a name kept on another machine", "another of your machines" in out, out)
     # Each computer has its own terminal, whatever the other's is doing.
     out = cli("one", "listen", "--as", "terminal", "--wait", "0")
     check("the first computer's terminal", "You are lars/terminal." in out, out)

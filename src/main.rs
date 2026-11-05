@@ -166,6 +166,7 @@ enum Cmd {
     /// Set what the current agent session is doing (run from inside the agent's shell)
     Status {
         doing: Vec<String>,
+        /// Rename this session. Taking an offline conversation's name on this computer brings its waiting mail.
         #[arg(long)]
         name: Option<String>,
     },

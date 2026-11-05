@@ -17,15 +17,22 @@ use iroh::EndpointId;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// A hook-only session that hasn't fired a hook for this long is considered gone.
-const HOOK_TTL_MS: i64 = 6 * 3_600_000;
+pub(super) const HOOK_TTL: Duration = Duration::from_secs(6 * 3600);
+const HOOK_TTL_MS: i64 = HOOK_TTL.as_millis() as i64;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
 pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
 const OFF_TURN_MS: i64 = 10 * 60_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rename {
+    Explicit,
+    Automatic,
+}
 
 impl Daemon {
     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
@@ -128,6 +135,9 @@ impl Daemon {
                 crate::usage::Dimensions { source: crate::usage::family(&reg.agent), ..Default::default() },
                 1,
             );
+            if !self.forgetting() && !key.starts_with("proc:") {
+                g.seen_since_start.insert(key.clone());
+            }
             g.live.insert(
                 key.clone(),
                 Live {
@@ -174,7 +184,9 @@ impl Daemon {
     /// it registered now. (Checked as the terminal is used: each command from it comes through here.) A rename that
     /// fails (another session took the name meanwhile) is logged, and the command goes on: it is tried again next time.
     fn recheck_terminal(&self, others: &Elsewhere) {
-        self.recheck_terminal_with(others, |name| self.set_status(TERMINAL, None, Some(name)).map(drop));
+        self.recheck_terminal_with(others, |name| {
+            self.set_status(TERMINAL, None, Some(name), Rename::Automatic).map(drop)
+        });
     }
 
     /// `recheck_terminal`, renaming with `rename`.
@@ -203,13 +215,13 @@ impl Daemon {
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
     /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
     pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
-        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting(now))
+        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting())
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
     /// registered again (each gets the time a hook-only session has to show it is there).
-    fn forgetting(&self, now: i64) -> bool {
-        now - self.started > HOOK_TTL_MS
+    fn forgetting(&self) -> bool {
+        Instant::now() >= self.startup_grace_ends
     }
 
     /// A live session turned out reachable (mail went to it or came from it): from now on its name is kept for it.
@@ -263,12 +275,19 @@ impl Daemon {
         Ok(())
     }
 
-    pub(super) fn set_status(&self, key: &str, doing: Option<String>, name: Option<String>) -> Result<Registered> {
+    pub(super) fn set_status(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        rename: Rename,
+    ) -> Result<Registered> {
         let now = util::now_ms();
         let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let new_name = name.as_deref().map(util::slug);
+        let mut reclaim = false;
         if let Some(n) = new_name.as_deref() {
             if n.is_empty() {
                 bail!("a name needs letters or digits");
@@ -279,41 +298,57 @@ impl Daemon {
             if n == self.person {
                 bail!("'{n}' is your person name; pick another session name");
             }
-            // A name kept for a session that is offline stays its own, with its mail: never renamed into.
-            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
-                bail!(
-                    "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
-                    util::ago(r.last_seen, now)
-                );
-            }
             if others.kept.contains(n) {
                 bail!("'{n}' belongs to a session on another of your machines that is offline; pick another name");
             }
+            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
+                if rename == Rename::Automatic || r.mailbox || key.starts_with("proc:") || key.starts_with("cli:") {
+                    bail!(
+                        "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
+                        util::ago(r.last_seen, now)
+                    );
+                }
+                let remaining = self.startup_grace_ends.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() && !g.seen_since_start.contains(&r.key) {
+                    let minutes = remaining.as_nanos().div_ceil(Duration::from_secs(60).as_nanos());
+                    let unit = if minutes == 1 { "minute" } else { "minutes" };
+                    bail!(
+                        "'{n}' has not reconnected since the daemon restart. Resume the original conversation \
+                         so it reconnects, then end it and retry. Otherwise, try again in about {minutes} {unit}."
+                    );
+                }
+                reclaim = true;
+            }
         }
         if let Some(n) = new_name.as_deref()
+            && !reclaim
             && g.live.get(key).is_some_and(|l| l.name != n)
         {
             self.take_over(g, n, key)?;
         }
         let live = g.live.get_mut(key).ok_or_else(|| anyhow!("this session is not registered"))?;
+        if let Some(n) = new_name
+            && n != live.name
+        {
+            g.store.rename(&self.person, &live.name, &n, reclaim.then_some(key))?;
+            live.attached |= reclaim;
+            live.name = n;
+        }
         if let Some(d) = doing {
             let d = crate::team::without_tickets(d.trim());
             live.doing = (!d.is_empty()).then(|| d.chars().take(200).collect());
         }
-        if let Some(n) = new_name
-            && n != live.name
-        {
-            g.store.rename(
-                &live.name,
-                &n,
-                &format!("{}/{}", self.person, live.name),
-                &format!("{}/{n}", self.person),
-            )?;
-            live.name = n;
-        }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
         let address = self.addr(&live.name);
-        Ok(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address })
+        let name = live.name.clone();
+        let unread = if reclaim {
+            self.arrived.notify_waiters();
+            self.presence_changed();
+            g.pending(&address)?.len() as u32
+        } else {
+            g.store.unread_count(&address)?
+        };
+        Ok(Registered { name, unread, address })
     }
 
     pub(super) fn unread(&self, key: &str) -> Result<Unread> {
@@ -599,7 +634,8 @@ impl Daemon {
             }
         }
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
-        if self.forgetting(now) {
+        if self.forgetting() {
+            g.seen_since_start.clear();
             let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
             let _ = g.store.forget_sessions(now - FORGET_MS, &live, &self.person);
         }
@@ -782,12 +818,14 @@ mod tests {
 
     /// The daemon restarts: nothing is live until sessions register again.
     fn restart(d: &Daemon) {
-        d.inner.lock().unwrap().live.clear();
+        let mut g = d.inner.lock().unwrap();
+        g.live.clear();
+        g.seen_since_start.clear();
     }
 
     /// Long enough after a start that sessions gone a day are forgotten.
     fn settled(d: &mut Daemon) {
-        d.started -= HOOK_TTL_MS + 1;
+        d.startup_grace_ends = Instant::now();
     }
 
     fn mail(d: &Daemon, id: &str, name: &str) {
@@ -855,7 +893,7 @@ mod tests {
         let line = crate::invite_line(&l.url);
         // `status <doing>` from an agent's shell; a `doing` hook; a session kept by a build that stored the line.
         join(&d, claude("a"));
-        d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
+        d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None, Rename::Explicit).unwrap();
         join(&d, claude("b"));
         let doing = HookCall {
             through_reason: Some(false),
@@ -1036,27 +1074,93 @@ mod tests {
     }
 
     #[test]
-    fn renaming_into_a_name_kept_for_an_offline_session_is_refused() {
+    fn explicit_reclaim_keeps_both_inboxes_for_the_new_conversation() {
+        let d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        mail(&d, "before", "api-claude");
+        // A hook-only conversation with a durable id, not previously reachable.
+        let caller = named("gemini:b", "gemini", None);
+        let target = "api-claude";
+        let own = d.register_quiet(None, caller.clone(), GitInfo::default()).unwrap().0;
+        mail(&d, "own", &own.name);
+        let r = d.set_status(&caller.key, None, Some(target.into()), Rename::Explicit).unwrap();
+        assert_eq!((r.name.as_str(), r.unread), (target, 2));
+        leave(&d, &caller.key, 0);
+        let back = join(&d, claude("a"));
+        assert_ne!(back.name, target);
+        assert_eq!(back.unread, 0);
+        let back = join(&d, caller);
+        assert_eq!((back.name.as_str(), back.unread), (target, 2));
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.session_by_name(target).unwrap().unwrap().kept());
+        let msgs = g.store.unread(&r.address).unwrap();
+        assert_eq!(msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["before", "own"]);
+    }
+
+    #[test]
+    fn reclaim_waits_for_an_unseen_owner_after_restart() {
+        let mut d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        restart(&d);
+        join(&d, claude("b"));
+        let rename = |d: &Daemon| d.set_status("claude-code:b", None, Some("api-claude".into()), Rename::Explicit);
+        d.startup_grace_ends = Instant::now() + Duration::from_secs(17 * 60 + 30);
+        let error = rename(&d).unwrap_err().to_string();
+        assert!(error.contains("try again in about 18 minutes"), "{error}");
+        join(&d, claude("a"));
+        assert!(rename(&d).unwrap_err().to_string().contains("live"));
+        leave(&d, "claude-code:a", 0);
+        restart(&d);
+        join(&d, claude("b"));
+        d.startup_grace_ends = Instant::now() + Duration::from_secs(30);
+        let error = rename(&d).unwrap_err().to_string();
+        assert!(error.ends_with("try again in about 1 minute."), "{error}");
+        settled(&mut d);
+        assert_eq!(rename(&d).unwrap().name, "api-claude");
+    }
+
+    #[test]
+    fn only_a_stable_session_can_reclaim_and_permanent_mailboxes_cannot_be_taken() {
+        let d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        join(&d, named("proc:7", "zed", None));
+        assert!(d.set_status("proc:7", None, Some("api-claude".into()), Rename::Explicit).is_err());
+        join(&d, named(TERMINAL, "cli", Some("terminal")));
+        assert!(d.set_status(TERMINAL, None, Some("api-claude".into()), Rename::Explicit).is_err());
+        join(&d, claude("b"));
+        for name in ["terminal", "review"] {
+            let key = format!("cli:{name}");
+            join(&d, named(&key, "cli", Some(name)));
+            leave(&d, &key, 0);
+            assert!(d.set_status("claude-code:b", None, Some(name.into()), Rename::Explicit).is_err());
+        }
+        assert!(d.set_status("claude-code:b", None, Some(d.person.clone()), Rename::Explicit).is_err());
+    }
+
+    #[test]
+    fn automatic_renames_cannot_take_a_held_name() {
         let mut d = super::super::test_daemon(Default::default());
         join(&d, claude("a"));
         leave(&d, "claude-code:a", 3 * 3_600_000);
         mail(&d, "m1", "api-claude");
         join(&d, claude("b"));
-        let e = d.set_status("claude-code:b", None, Some("API Claude".into())).unwrap_err();
+        let e = d.set_status("claude-code:b", None, Some("API Claude".into()), Rename::Automatic).unwrap_err();
         assert_eq!(
             e.to_string(),
             "'api-claude' belongs to a session that is offline (last seen 3h ago); pick another name"
         );
         // A name of its own is fine, and its own mail comes along.
         mail(&d, "m2", "api-claude-2");
-        let r = d.set_status("claude-code:b", None, Some("auth".into())).unwrap();
+        let r = d.set_status("claude-code:b", None, Some("auth".into()), Rename::Explicit).unwrap();
         assert_eq!((r.name.as_str(), r.unread), ("auth", 1));
         // Once the offline one has lapsed, the name can be taken, without that session's mail.
         leave(&d, "claude-code:b", 0);
         join(&d, claude("b"));
         d.inner.lock().unwrap().store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
         settled(&mut d);
-        let r = d.set_status("claude-code:b", None, Some("api-claude".into())).unwrap();
+        let r = d.set_status("claude-code:b", None, Some("api-claude".into()), Rename::Explicit).unwrap();
         assert_eq!(r.name, "api-claude");
         let unread = d.inner.lock().unwrap().store.unread(&r.address).unwrap();
         assert_eq!(unread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
