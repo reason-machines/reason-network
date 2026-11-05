@@ -388,8 +388,10 @@ impl ReasonNetworkMcp {
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
-        if off_here() {
-            anyhow::bail!(crate::config::Config::load().warning().unwrap_or_else(|| OFF_HERE.into()));
+        let cfg = crate::config::Config::load();
+        if cfg.off_in(&agent::cwd()) {
+            let warning = cfg.warning().map(|w| format!("; {w}")).unwrap_or_default();
+            anyhow::bail!("{OFF_HERE}{warning}");
         }
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {

@@ -106,8 +106,13 @@ impl Config {
 
     pub fn warning(&self) -> Option<String> {
         self.unreadable.as_ref().map(|error| {
+            let status = if self.all_folders_off {
+                "Reason Network is paused"
+            } else {
+                "Reason Network could not read some settings"
+            };
             format!(
-                "Reason Network is paused here where settings could not be read: fix {}, then run `reason-network stop` and `reason-network who`: {error}",
+                "{status}: ask your user to fix {}, then run `reason-network stop` and `reason-network who`: {error}",
                 paths::config().display()
             )
         })
@@ -126,6 +131,9 @@ impl Config {
     }
 
     fn read_private(text: &str) -> Self {
+        if let Ok(cfg) = toml::from_str(text) {
+            return cfg;
+        }
         let table = match text.parse::<toml::Table>() {
             Ok(table) => table,
             Err(error) => return Self::paused(error.to_string()),
@@ -186,7 +194,9 @@ impl Config {
                         }
                     } else {
                         errors.push("inbound.people: expected a table".into());
-                        cfg.inbound.default = Policy::Hold;
+                        if cfg.inbound.default != Policy::Refuse {
+                            cfg.inbound.default = Policy::Hold;
+                        }
                     }
                 }
             } else {
@@ -195,6 +205,7 @@ impl Config {
             }
         }
         if !errors.is_empty() {
+            cfg.lan = false;
             cfg.unreadable = Some(errors.join("; "));
         }
         cfg
@@ -415,6 +426,26 @@ mod tests {
 
     fn folders(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn malformed_people_preserves_explicit_refusal() {
+        const CHILD: &str = "REASON_TEST_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(Config::load().policy_for("bob"), Policy::Refuse);
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("reason-refusal-{}", ulid::Ulid::generate()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[inbound]\ndefault = \"refuse\"\npeople = 1\n").unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::malformed_people_preserves_explicit_refusal", "--nocapture"])
+            .env(CHILD, "1")
+            .env("REASON_NETWORK_HOME", &dir)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let output = result.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]

@@ -44,7 +44,10 @@ fn broken_config_keeps_the_daemon_available_and_warns_clients() {
         assert!(home.0.join("network.sock").exists());
         let who = command().arg("who").output().unwrap();
         assert!(who.status.success(), "{}", String::from_utf8_lossy(&who.stderr));
-        assert!(String::from_utf8_lossy(&who.stdout).contains("! Reason Network is paused"));
+        let output = String::from_utf8_lossy(&who.stdout);
+        assert!(output.contains("! Reason Network"));
+        assert!(output.contains("ask your user to fix"));
+        assert_eq!(output.contains("Reason Network is paused"), case == "syntax");
         // Warnings stay on stderr. Hosts may parse stdout as JSON, so it must remain
         // empty when the paused folder produces no hook response.
         for host in [
@@ -98,5 +101,6 @@ fn broken_config_keeps_the_daemon_available_and_warns_clients() {
             }
         }
         assert!(daemon.0.try_wait().unwrap().is_none());
+        assert_eq!(fs::read_to_string(home.0.join("config.toml")).unwrap(), config);
     }
 }
