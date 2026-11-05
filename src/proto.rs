@@ -511,6 +511,9 @@ pub struct HookReply {
     /// Their ids, to acknowledge with `Delivered` once shown.
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Whether the hook should say who the session is on Reason Network. `None` from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intro: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

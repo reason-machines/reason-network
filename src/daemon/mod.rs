@@ -208,6 +208,8 @@ struct Live {
     attached: bool,
     /// The `CODEX_HOME` a Codex session's hooks run with; `None` for the default home (and other agents).
     codex_home: Option<String>,
+    /// Its hooks have already said who it is on Reason Network (Antigravity hooks run before every invocation).
+    introduced: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {

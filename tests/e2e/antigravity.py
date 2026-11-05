@@ -51,6 +51,10 @@ def main():
             first='b984f9b8-e5c6-44f0-85e6-9529cf7d4f77';second='3c4edbfc-5442-486d-a53e-faeecb3f892f'
             intro=json.loads(hooks(first,'user-prompt-submit'))
             assert first in intro['injectSteps'][0]['userMessage']
+            # PreInvocation fires before every model call: the identity notice is said once per conversation, not each time.
+            assert hooks(first,'user-prompt-submit') == '', 'identity notice repeated on the next invocation'
+            assert hooks(first,'session-start') == '', 'identity notice repeated at a later session start'
+            print('PASS the identity notice is injected once per conversation')
             recipient=next(s['address'] for s in sessions() if s['agent']=='antigravity')
             ids=sent(recipient,'Receive at the next invocation','hook-message')
             assert hooks(first,'post-tool-use') == ''
