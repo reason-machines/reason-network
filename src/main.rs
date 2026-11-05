@@ -1,4 +1,5 @@
 mod agent;
+mod antigravity;
 mod bridge;
 mod claude;
 mod client;
@@ -24,6 +25,7 @@ mod setup;
 mod store;
 mod team;
 mod tray;
+mod usage;
 mod util;
 mod wizard;
 
@@ -140,6 +142,9 @@ enum Cmd {
     /// It comes from the agent session whose shell runs it, `--from <session>`, or from a plain terminal,
     /// `<you>/terminal` (read replies with `listen --as terminal`)
     Send {
+        /// Optional self-reported analytics category (review, delegate, status, question, handoff, other).
+        #[arg(long)]
+        purpose: Option<String>,
         to: String,
         /// The message; read from stdin when omitted or `-`
         message: Vec<String>,
@@ -307,6 +312,9 @@ enum Cmd {
     Mcp,
     /// Local JSON-lines transport for native agent adapters
     Bridge,
+    /// Run the App-managed Antigravity delivery sidecar
+    #[command(hide = true)]
+    AntigravitySidecar,
     /// The menu bar icon (macOS; the background service starts it)
     #[command(hide = true)]
     Tray,
@@ -324,6 +332,7 @@ async fn main() -> Result<()> {
             r
         }
         Some(Cmd::Mcp) => mcp::run().await,
+        Some(Cmd::AntigravitySidecar) => antigravity::run().await,
         Some(Cmd::Bridge) => bridge::run().await,
         // Blocks this (the main) thread with AppKit's event loop; its daemon calls run on the runtime's workers.
         Some(Cmd::Tray) => tray::run(),
@@ -374,6 +383,7 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         cwd = terminal_cwd(cwd, here_off(), agent_shell())?;
     }
     let req = Request::Hook(HookCall {
+        through_reason: Some(false),
         agent: "cli".into(),
         event: event.into(),
         session_id: id.into(),
@@ -385,6 +395,7 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         name: Some(id.into()),
         dirs: Vec::new(),
         keep: true,
+        codex_home: None,
     });
     link.call(req).await
 }
@@ -432,7 +443,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 print!("{}", shown(&render::directory(&d, false, render::Paint::terminal())));
             }
         }
-        Cmd::Send { to, message, reply_to, fyi, notify, from, files } => {
+        Cmd::Send { to, message, reply_to, fyi, notify, from, files, purpose } => {
             // An agent in a folder that is off sends nothing, as no session (nor its files).
             if agent_shell() && here_off() {
                 bail!(config::OFF_HERE);
@@ -455,6 +466,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
             // Messages come from agent sessions: `--from`'s, this agent's, or from a plain terminal, `<you>/terminal`.
             // An agent shell Reason Network doesn't know (its tools aren't loaded) counts as a terminal.
             let send = |from: String| Request::Send {
+                idempotency_key: None,
+                purpose: purpose.clone(),
                 from,
                 to: to.clone(),
                 body: body.clone(),
@@ -700,7 +713,13 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 println!("The daemon is not running.");
             }
         }
-        Cmd::Daemon { .. } | Cmd::Mcp | Cmd::Bridge | Cmd::Hook { .. } | Cmd::Tray | Cmd::Endpoint => {
+        Cmd::Daemon { .. }
+        | Cmd::Mcp
+        | Cmd::Bridge
+        | Cmd::AntigravitySidecar
+        | Cmd::Hook { .. }
+        | Cmd::Tray
+        | Cmd::Endpoint => {
             unreachable!("handled in main")
         }
     }

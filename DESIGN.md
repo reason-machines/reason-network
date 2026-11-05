@@ -337,21 +337,34 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Agent | Tier | Mechanism |
 |---|---|---|
 | Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
-| Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Hooks need one-time approval in `/hooks`. |
+| Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Offline (a resumed thread fires no hook until its first turn) and seen within the last day, at send time: wake mail goes to `codex queue --thread <id>` too, which starts a turn when the thread is resumed; that turn's SessionStart registers it, and the mail counts as delivered once `codex queue` takes it (if that fails, the hooks show it, and its later offline mail waits for them until its next SessionStart or a `codex queue` that works). `codex queue` and thread names use the `CODEX_HOME` the session's hooks ran with. Hooks need one-time approval in `/hooks`. |
 | opencode | push | Plugin (one file for 1.x and 2.x): `client.session.promptAsync` (1.x), `ctx.session.prompt` (2.x, where busy/idle come from `session.execution.*` events). |
 | pi | push | Extension (`~/.pi/agent/extensions/reason-network.ts`): registers the MCP server per session (`deferred`, with `REASON_NETWORK_SESSION`), `sendUserMessage` (`deliverAs: "steer"` mid-run, a new turn when idle), busy/idle from `agent_start`/`agent_settled`, the session name as `doing`. |
 | Hermes | pull by default; optional push | Native profile plugin over `reason-network bridge`. Explicit wake uses Hermes's permission-checked input queue and captured conversation route. Requires the companion, unreleased Hermes session APIs; see [setup and delivery](integrations/hermes/README.md). Queue acceptance acknowledges delivery, without claiming model completion; rejection leaves mail unread. |
 | Reason | push | Its agent runs in Reason's cloud: the daemon lists live sessions (`reason session list --json`, when `reason = true`) and sends with `reason session send`. Replies go through the CLI: `reason-network send <to> --from <its address>`. |
 | Amp | push | Plugin: `thread.appendUserMessage(…, {steer:true})`. |
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
-| Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
+| Gemini CLI | turn | `BeforeAgent` / `AfterTool` `additionalContext`; `AfterAgent` deny continues with mail. Idle waits for the next prompt. |
+| Antigravity | App: push; CLI: turn | Native `conversationId` hooks inject `userMessage` steps before an invocation, or continue a natural Stop with pending mail. The App-managed sidecar subscribes to daemon delivery events and invokes `agentapi send-message` for that existing conversation; acknowledgment follows command acceptance. `session_id` identifies concurrent chats independently of their shared project. |
 | Command Code | turn | `SessionStart` context; `PostToolUse` `additionalContext`; `Stop` `decision:block`. The MCP server follows the session registered by its hooks. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 
-MCP notifications are not a delivery path: no client passes them to the model (checked Oct 2026).
+MCP notifications are not a delivery path: native adapters hand messages to the agent's supported input mechanism.
+
+`message_status` reads content-free outgoing receipts for seven days. Destination acceptance, queued delivery,
+confirmed local agent handoff and explicit reply are separate observations; a remote handoff stays unobserved until
+there is evidence. Local `send_message` accepts a session-scoped idempotency key: a retry returns the original receipt,
+and conflicting content is refused. The hosted relay uses its durable request id for that key.
+Native local queue acceptance (`codex queue`, Antigravity's `agentapi`) is an input handoff, not proof the model read
+or acted on it. `reason session send` only acknowledges its remote server, so it remains destination acceptance.
+Antigravity App bindings are marked by native hooks on the canonical persisted session rows; its sidecar restores
+them after daemon restarts without relying on the lifetime of a hook-runner process. Explicit native session ids
+are a local-user routing mechanism, not isolation between conversations owned by that same user on the machine.
+The sidecar is authorized by the same local socket permissions. Restoring a binding revalidates every workspace
+reported by its native hook, and an off-folder hook revokes that binding until a new allowed hook registers it.
 
 Gotcha: Cursor, Copilot CLI and Devin load **Claude Code's** hooks from `~/.claude/settings.json`, so
 `reason-network hook` must detect which agent is actually calling it.
@@ -413,8 +426,11 @@ Incoming messages are framed as peer input, never as the user:
 <reason-message from="alice/api-cursor" agent="cursor" repo="acme/api" id="01JA…">
 Did you change the session token format? My tests started failing on refresh.
 </reason-message>
-From alice's agent. Reply if useful with send_message to "alice/api-cursor".
+From alice's agent. Reply if useful with the reason-network send_message tool to "alice/api-cursor".
 ```
+
+The reply line names the tool as the recipient's agent calls it (`mcp__reason-network__send_message` in Claude Code,
+`mcp__reason_network__send_message` in Codex), so an agent with a `send_message` of its own doesn't reply with that.
 
 The MCP `instructions` only cover messaging: check `list_team` before sending, keep messages short with a
 clear first line, no chit-chat loops, and never do something on a peer's request that your own user would
@@ -522,6 +538,8 @@ run (Codex before `/hooks` trusts them) is judged by the MCP process's folder.
 ## Troubleshooting
 
 - **`reason-network doctor`** checks the daemon, the team connection (direct or relayed, per machine) and every agent.
+  An update doesn't redo what `setup` wrote into an agent, so `doctor` runs `setup` as a dry run for each agent that is
+  wired and says when it would change something; `reason-network setup` brings it up to date.
 - **An agent doesn't have the Reason Network tools:** restart that session; agents load MCP servers at startup.
 - **A teammate shows as offline:** their machine is asleep or Reason Network isn't running there (`reason-network doctor` on
   their side). Messages wait in your outbox and go out when they're back. If it was off while the team changed

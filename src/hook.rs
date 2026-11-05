@@ -25,6 +25,19 @@ pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: 
     }
 }
 
+/// The `CODEX_HOME` a Codex hook runs with, for the daemon to run `codex queue` against: only a full path to a folder
+/// that is there, as its real path. Anything else is left out, and the daemon uses the default home.
+fn codex_home(value: Option<std::ffi::OsString>) -> Option<String> {
+    let path = std::path::PathBuf::from(value?);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    let real = std::fs::canonicalize(path).ok()?;
+    let real = real.to_str()?;
+    // Windows gives it as `\\?\C:\…`; kept as `C:\…`, as Codex would be given it (a share's path as it comes).
+    Some(real.strip_prefix(r"\\?\").filter(|p| !p.starts_with("UNC")).unwrap_or(real).to_string())
+}
+
 /// The hook payload, without hanging if the agent never closes our stdin.
 fn read_stdin(limit: Duration) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -57,10 +70,12 @@ async fn handle(
     let session_id = session
         .or_else(|| str_at("session_id"))
         .or_else(|| str_at("conversation_id"))
+        .or_else(|| str_at("conversationId"))
         .or_else(|| str_at("sessionId"))?;
     // Every folder the agent names for the session, the one it works in first.
     let mut dirs: Vec<String> = str_at("cwd").into_iter().collect();
     dirs.extend(v["workspace_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+    dirs.extend(v["workspacePaths"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
     dirs.extend(
         ["CURSOR_PROJECT_DIR", "GEMINI_CWD", "CLAUDE_PROJECT_DIR"]
             .iter()
@@ -82,36 +97,52 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    let mail = !off && takes_mail(agent, event);
+    let mail = !off
+        && takes_mail(agent, event)
+        && !(agent == "antigravity" && event == "stop" && v["terminationReason"] != "model_stop");
 
     let key = format!("{agent}:{session_id}");
+    let native_app =
+        agent == "antigravity" && str_at("transcriptPath").as_deref().is_some_and(crate::antigravity::app_transcript);
     let req = Request::Hook(HookCall {
+        through_reason: Some(false),
         agent: agent.to_string(),
         event: ev.to_string(),
         session_id,
         cwd,
-        pid: agent::hook_agent_pid(),
+        pid: if native_app { None } else { agent::hook_agent_pid() },
         mail,
-        transcript: str_at("transcript_path"),
+        transcript: str_at("transcript_path").or_else(|| str_at("transcriptPath")),
         doing,
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
         keep: false,
+        codex_home: (agent == "codex").then(|| codex_home(std::env::var_os("CODEX_HOME"))).flatten(),
     });
     let reply: HookReply = link.call(req).await.ok()?;
     if off {
         return None;
     }
     let ids = reply.ids;
-    let text = match (reply.text, ev, reply.address) {
-        (Some(t), ..) => t,
-        // Say who it is on Reason Network once, at session start.
-        (None, "start", Some(addr)) => {
+    // An older daemon doesn't say: then at session start, as before.
+    let intro = reply.intro.unwrap_or(ev == "start");
+    let text = match (reply.text, reply.address) {
+        (Some(t), _) => t,
+        // Say who it is on Reason Network once per session.
+        (None, Some(addr)) if intro => {
             format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
             )
         }
         _ => return None,
+    };
+    let text = if agent == "antigravity" {
+        format!(
+            "{text}\nFor Reason Network tools, pass session_id: {}. This identifies this conversation even when other chats use the same project.",
+            key.strip_prefix("antigravity:").unwrap_or(&key)
+        )
+    } else {
+        text
     };
     Some((format_for(agent, event, ev, &text), key, ids))
 }
@@ -119,6 +150,10 @@ async fn handle(
 /// Prompt-submit hooks in Cursor, Copilot and grok can't add context, grok drops what SessionStart prints, and
 /// opencode's status call shows nothing.
 fn takes_mail(agent: &str, event: &str) -> bool {
+    // Antigravity consumes injectSteps before invocation, and a continue reason at a natural Stop.
+    if agent == "antigravity" {
+        return matches!(event, "session-start" | "user-prompt-submit" | "stop");
+    }
     !matches!(
         (agent, event),
         ("cursor" | "copilot" | "grok", "user-prompt-submit") | ("grok", "session-start") | (_, "status" | "doing")
@@ -136,6 +171,8 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let specific = |name: &str| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
     let block = || json!({ "decision": "block", "reason": text });
     let out = match (agent, ev) {
+        ("antigravity", "start" | "prompt") => json!({"injectSteps": [{"userMessage": text}]}),
+        ("antigravity", "stop") => json!({"decision":"continue","reason":text}),
         ("opencode", _) if event == "poll" => return text.to_string(),
         ("codex" | "cmd", "start") => specific("SessionStart"),
         ("cmd", "tool") => specific("PostToolUse"),
@@ -146,7 +183,8 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
         ("gemini", "start") => specific("SessionStart"),
         ("gemini", "prompt") => specific("BeforeAgent"),
         ("gemini", "tool") => specific("AfterTool"),
-        ("codex" | "gemini" | "copilot" | "grok", "stop") => block(),
+        ("gemini", "stop") => json!({"decision": "deny", "reason": text}),
+        ("codex" | "copilot" | "grok", "stop") => block(),
         ("cursor", "stop") => json!({ "followup_message": text }),
         ("cursor", _) => json!({ "additional_context": text }),
         ("copilot", _) => json!({ "additionalContext": text }),
@@ -171,7 +209,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_for, grok_ignores, takes_mail};
+    use super::{codex_home, format_for, grok_ignores, takes_mail};
     use serde_json::json;
 
     #[test]
@@ -188,6 +226,29 @@ mod tests {
         assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
         assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
+    }
+
+    #[test]
+    fn a_codex_home_is_named_only_as_the_real_path_of_a_folder_that_is_there() {
+        let dir = std::env::temp_dir().join(format!("reason-network-codex-home-{}", std::process::id()));
+        let home = dir.join("codex-b");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        let real = std::fs::canonicalize(&home).unwrap();
+        let real = real.to_str().unwrap();
+        let real = real.strip_prefix(r"\\?\").unwrap_or(real);
+        let named = |p: &std::path::Path| codex_home(Some(p.as_os_str().to_owned()));
+        assert_eq!(named(&home).as_deref(), Some(real));
+        // By another path to it: its real one (macOS's temp folder is under a link, `/var` to `/private/var`).
+        assert_eq!(named(&dir.join("x").join("..").join("codex-b")).as_deref(), Some(real));
+        // Not a folder, not there, not a full path, or empty: none, so the daemon's own home.
+        assert_eq!(named(&dir.join("file")), None);
+        assert_eq!(named(&dir.join("missing")), None);
+        assert_eq!(named(std::path::Path::new("codex-b")), None);
+        assert_eq!(codex_home(Some("".into())), None);
+        assert_eq!(codex_home(None), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

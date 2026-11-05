@@ -135,11 +135,18 @@ impl Daemon {
     }
 
     pub fn outbox_for(&self, id: &EndpointId) -> Vec<Message> {
-        self.inner.lock().unwrap().store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default()
+        let (messages, expired) =
+            self.inner.lock().unwrap().store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default();
+        if expired > 0 {
+            self.usage.count("expired", Default::default(), expired as u64);
+        }
+        messages
     }
 
     pub fn outbox_done(&self, id: &str, taken: bool) {
-        let _ = self.inner.lock().unwrap().store.outbox_done(id, taken);
+        if self.inner.lock().unwrap().store.outbox_done(id, taken).unwrap_or(false) {
+            self.usage.stage(id, if taken { "accepted" } else { "rejected" });
+        }
     }
 
     /// Takes in a teammate's copy of the team state, passing it on if it taught us something.
@@ -260,7 +267,7 @@ impl Daemon {
             person,
             machine: self.machine.clone(),
             machines: Vec::new(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: Vec::new(),
             udp: None,
         })
@@ -378,7 +385,7 @@ impl Daemon {
             person: person.clone(),
             machine: self.machine.clone(),
             machines: Vec::new(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: Vec::new(),
             udp: None,
         };
@@ -505,6 +512,24 @@ impl Daemon {
         let team = self
             .team_state()
             .ok_or_else(|| anyhow!("not in a team yet: `{CLI} init <team>` or `{CLI} join <invite>`"))?;
+        {
+            let g = self.inner.lock().unwrap();
+            let mut dims =
+                crate::usage::Dimensions { bucket: crate::usage::number(g.live.len()).into(), ..Default::default() };
+            self.usage.count("active_sessions", dims.clone(), 1);
+            let families: std::collections::HashSet<_> =
+                g.live.values().map(|l| crate::usage::family(&l.reg.agent)).collect();
+            dims.bucket = crate::usage::number(families.len()).into();
+            self.usage.count("agent_families", dims, 1);
+        }
+        let peers = crate::usage::Dimensions {
+            bucket: crate::usage::number(
+                self.net().map(|n| n.remotes().values().filter(|r| r.online).count()).unwrap_or(0),
+            )
+            .into(),
+            ..Default::default()
+        };
+        self.usage.count("reachable_peers", peers, 1);
         Ok(TeamInfo {
             id: team.id.clone(),
             name: team.whole_name(),
@@ -514,7 +539,7 @@ impl Daemon {
             person: self.person.clone(),
             machine: self.machine.clone(),
             machines: self.machines(),
-            features: vec![crate::files::FEATURE.into()],
+            features: vec![crate::files::FEATURE.into(), "usage-v1".into()],
             messages: self.inner.lock().unwrap().store.counts(util::now_ms()).unwrap_or_default(),
             udp: self.net().map(|n| n.udp()),
         })

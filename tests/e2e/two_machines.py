@@ -14,6 +14,9 @@ BIN = os.path.join(ROOT, "target", "debug", "reason-network")
 D = tempfile.mkdtemp(prefix="reason-network-e2e-")
 H = {"alex": os.path.join(D, "alex"), "alice": os.path.join(D, "alice")}
 MACHINE = {"alex": "laptop", "alice": "desktop"}
+# A stable fixture folder: long worktree names are legitimately shortened by the engine.
+SESSION_REPO = os.path.join(D, "project")
+os.makedirs(SESSION_REPO)
 FAKE_CODEX = os.path.join(D, "fake-codex.sh")
 QUEUE_LOG = os.path.join(D, "codex-queue.log")
 # Stands in for osascript / notify-send, so the test shows nothing on screen: each machine logs what it would show.
@@ -370,13 +373,13 @@ check("…and a folder in it stays off", "sub is still off: it is in" in out, ou
 time.sleep(3)
 
 # --- sessions on both machines ---
-claude = Mcp("alex", "claude-code", strip_claude=False, cwd=ROOT)
+claude = Mcp("alex", "claude-code", strip_claude=False, cwd=SESSION_REPO)
 hidden = Mcp("alex", "claude-code", strip_claude=True, cwd=PRIVATE)
 codex = Mcp("alice", "codex-mcp-client", strip_claude=True, cwd=os.path.join(D, "work"))
 meta = {"sessionId": "11111111-aaaa", "threadId": "11111111-aaaa"}
 time.sleep(7)  # Claude's session registers after 3s; presence propagates every 2s
 out = codex.tool("list_team", {}, meta)
-claude_name = os.path.basename(ROOT).lower() + "-claude"
+claude_name = "project-claude"
 check("alice's agent sees alex's session across machines", claude_name in out and "alex (verified) · laptop" in out, out)
 check("list_team gives no team link, and says who invites people", "rn1-" not in out and "your user runs `reason-network invite`" in out, out)
 check("…but not the one in alex's folder that is off", "private-claude" not in out, out)
@@ -573,8 +576,8 @@ out = codex.tool("check_inbox", {}, meta)
 check("…the 39 arrive", out.count("quota ") == 39 and "one more" not in out, out[-500:])
 
 # --- Codex hooks: session via hooks, delivery via codex queue ---
-start = hook("alice", "codex", "session-start", {"session_id": "22222222-bbbb", "cwd": ROOT, "hook_event_name": "SessionStart"})
-codex_name = os.path.basename(ROOT).lower() + "-codex"
+start = hook("alice", "codex", "session-start", {"session_id": "22222222-bbbb", "cwd": SESSION_REPO, "hook_event_name": "SessionStart"})
+codex_name = "project-codex"
 check("codex SessionStart hook introduces the session", "SessionStart" in start and f"alice/{codex_name}" in start, start)
 time.sleep(3)
 out = cli("alex", "send", f"alice/{codex_name}", "please rebase on main")
@@ -582,7 +585,7 @@ check("message to a hooked codex session goes to codex queue", "queued into the 
 time.sleep(1.5)
 log = open(QUEUE_LOG).read() if os.path.exists(QUEUE_LOG) else ""
 check("codex queue got the thread and the message", "queue --thread 22222222-bbbb --message" in log and "please rebase on main" in log, log)
-out = hook("alice", "codex", "post-tool-use", {"session_id": "22222222-bbbb", "cwd": ROOT, "hook_event_name": "PostToolUse"})
+out = hook("alice", "codex", "post-tool-use", {"session_id": "22222222-bbbb", "cwd": SESSION_REPO, "hook_event_name": "PostToolUse"})
 check("a message delivered by codex queue isn't injected again by the hook", out == "", out)
 
 # --- hold policy ---

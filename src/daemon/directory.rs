@@ -107,11 +107,21 @@ impl Daemon {
             let live = g.live.iter().map(|(k, l)| {
                 let session = claude.iter().find(|c| claude_match(c, &l.reg)).and_then(|c| c.session_id.clone());
                 let session = session.or_else(|| l.reg.agent_session_id.clone());
-                (k.clone(), doing::Source { agent: l.reg.agent.clone(), session, transcript: l.transcript.clone() })
+                let source = doing::Source {
+                    agent: l.reg.agent.clone(),
+                    session,
+                    transcript: l.transcript.clone(),
+                    codex_home: l.codex_home.clone().map(Into::into),
+                };
+                (k.clone(), source)
             });
             let unmanaged = claude.iter().map(|c| {
-                let source =
-                    doing::Source { agent: agent::CLAUDE_CODE.into(), session: c.session_id.clone(), transcript: None };
+                let source = doing::Source {
+                    agent: agent::CLAUDE_CODE.into(),
+                    session: c.session_id.clone(),
+                    transcript: None,
+                    codex_home: None,
+                };
                 (format!("pid:{}", c.pid), source)
             });
             live.chain(unmanaged).collect()

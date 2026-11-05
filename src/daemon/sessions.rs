@@ -66,6 +66,13 @@ impl Daemon {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
+        if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push {
+            let allowed =
+                g.store.native_app_roots(&key)?.is_some_and(|roots| roots.iter().all(|root| !self.cfg.off_in(root)));
+            if !allowed {
+                bail!("Antigravity App binding is unavailable or includes a disabled workspace");
+            }
+        }
         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
         if g.off.contains_key(&key) {
             bail!(OFF_HERE);
@@ -117,9 +124,15 @@ impl Daemon {
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+            self.usage.count(
+                "registered",
+                crate::usage::Dimensions { source: crate::usage::family(&reg.agent), ..Default::default() },
+                1,
+            );
             g.live.insert(
                 key.clone(),
                 Live {
+                    through_reason: Some(conn.is_none() && reg.agent == "reason"),
                     reg,
                     name,
                     conn,
@@ -135,6 +148,8 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    codex_home: None,
+                    introduced: false,
                 },
             );
             self.presence_changed();
@@ -318,13 +333,31 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep } = h;
+        let HookCall {
+            agent,
+            event,
+            session_id,
+            cwd,
+            pid,
+            mail,
+            transcript,
+            doing,
+            name,
+            dirs,
+            keep,
+            through_reason,
+            codex_home,
+        } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
+        let mut native_dirs: Vec<String> = cwd.iter().chain(&dirs).cloned().collect();
         // In a folder that is off, by any folder the agent names: never a session here, only noted as off.
         if cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d)) {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None, &[])?;
+            }
             if let Some(l) = g.live.remove(&key) {
                 let _ = g.store.touch_session(&l.name, now);
                 self.presence_changed();
@@ -345,8 +378,13 @@ impl Daemon {
         self.inner.lock().unwrap().off.remove(&key);
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None, &[])?;
+            }
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
-            if g.live.get(&key).is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent))
+            if g.live
+                .get(&key)
+                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
@@ -388,9 +426,18 @@ impl Daemon {
         }
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        // A Codex thread that starts again gets another try at `codex queue` once it is offline again.
+        if event == "start" {
+            g.codex_failed.remove(&key);
+        }
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {
             l.transcript = Some(t.into());
+        }
+        // Kept with the session too: mail reaches it through that home while it is offline.
+        if agent == "codex" && l.codex_home != codex_home {
+            l.codex_home = codex_home;
+            g.store.remember_codex_home(&key, l.codex_home.as_deref())?;
         }
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
@@ -400,6 +447,7 @@ impl Daemon {
             }
             return Ok(HookReply::default());
         }
+        l.through_reason = through_reason;
         l.last_hook = Some(now);
         l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
         if pid.is_some() {
@@ -411,6 +459,15 @@ impl Daemon {
         }
         let address = self.addr(&l.name);
         let agent_kind = l.reg.agent.clone();
+        let native_app = agent == "antigravity"
+            && l.transcript.as_ref().is_some_and(|p| crate::antigravity::app_transcript(&p.to_string_lossy()));
+        if native_app {
+            l.reg.pid = None;
+            if !native_dirs.contains(&l.reg.cwd) {
+                native_dirs.push(l.reg.cwd.clone());
+            }
+            g.store.remember_native_app(&key, Some(now), &native_dirs)?;
+        }
         // Mid-turn, only what should interrupt; at a pause, everything.
         let msgs: Vec<Message> = if mail {
             g.pending(&address)?.into_iter().filter(|m| event != "tool" || m.wake).collect()
@@ -428,7 +485,15 @@ impl Daemon {
             self.reached(g, &key);
         }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
+        let intro = text.is_none()
+            && if agent == "antigravity" {
+                matches!(event, "start" | "prompt")
+                    && g.live.get_mut(&key).is_some_and(|l| !std::mem::replace(&mut l.introduced, true))
+            } else {
+                event == "start"
+            };
+        Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -489,12 +554,24 @@ impl Daemon {
         let now = util::now_ms();
         let mut g = self.inner.lock().unwrap();
         g.conns.remove(&conn);
+        if g.antigravity_conn == Some(conn) {
+            g.antigravity_conn = None;
+        }
         let mine: Vec<String> = g.live.iter().filter(|(_, l)| l.conn == Some(conn)).map(|(k, _)| k.clone()).collect();
         for key in mine {
             let l = g.live.get_mut(&key).expect("listed above");
             // Hooks still vouch for it: keep it, reachable through them.
-            if l.last_hook.is_some() && l.reg.pid.is_some_and(util::pid_alive) {
+            if l.last_hook.is_some()
+                && (l.reg.pid.is_some_and(util::pid_alive)
+                    || l.reg.agent == "antigravity"
+                        && l.reg.pid.is_none()
+                        && l.last_hook.is_some_and(|at| now - at < HOOK_TTL_MS))
+            {
                 l.conn = None;
+                if l.reg.agent == "antigravity" {
+                    l.reg.tier = Tier::Turn;
+                    l.mcp_push = false;
+                }
                 continue;
             }
             if let Some(l) = g.live.remove(&key) {
@@ -785,6 +862,7 @@ mod tests {
         d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
         join(&d, claude("b"));
         let doing = HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "doing".into(),
             session_id: "b".into(),
@@ -796,6 +874,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         d.hook(doing).await.unwrap();
         let old = Remembered {
@@ -833,6 +912,7 @@ mod tests {
     async fn a_conversation_coming_back_through_its_hooks_gets_its_name_too() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str| HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "start".into(),
             session_id: id.into(),
@@ -844,6 +924,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
@@ -858,12 +939,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_antigravity_conversation_hears_who_it_is_once_not_before_every_invocation() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "antigravity".into(),
+            event: event.into(),
+            session_id: "c1".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            codex_home: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "prompt", "stop", "prompt", "start"] {
+            seen.push(d.hook(call(event)).await.unwrap().intro);
+        }
+        assert_eq!(seen, [Some(true), Some(false), Some(false), Some(false), Some(false), Some(false), Some(false)]);
+        // Mail it is handed is not the introduction, so that doesn't use it up.
+        let call = |event: &str| HookCall { session_id: "c2".into(), ..call(event) };
+        d.hook(call("tool")).await.unwrap();
+        let name = d.inner.lock().unwrap().live["antigravity:c2"].name.clone();
+        mail(&d, "m1", &name);
+        let handed = d.hook(call("prompt")).await.unwrap();
+        assert!(handed.text.is_some());
+        assert_eq!(handed.intro, Some(false));
+        let next = d.hook(call("prompt")).await.unwrap();
+        assert!(next.text.is_none());
+        assert_eq!(next.intro, Some(true));
+        assert_eq!(d.hook(call("prompt")).await.unwrap().intro, Some(false));
+        // Other agents are told at session start, as before.
+        let claude = |event: &str| HookCall { agent: "claude-code".into(), session_id: "c3".into(), ..call(event) };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            seen.push(d.hook(claude(event)).await.unwrap().intro == Some(true));
+        }
+        assert_eq!(seen, [true, false, false, false, true]);
+    }
+
+    #[tokio::test]
     async fn a_hermes_conversations_hooks_never_promise_delivery_at_its_next_turn() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         // Its plugin registers it pull (wake off), and calls hooks only for activity: they never carry mail.
         join(&d, named("hermes:p:1", "hermes", None));
         for event in ["prompt", "tool", "stop"] {
             d.hook(HookCall {
+                through_reason: Some(false),
                 agent: "hermes".into(),
                 event: event.into(),
                 session_id: "p:1".into(),
@@ -875,6 +1001,7 @@ mod tests {
                 name: None,
                 dirs: Vec::new(),
                 keep: false,
+                codex_home: None,
             })
             .await
             .unwrap();
@@ -959,6 +1086,7 @@ mod tests {
         settled(&mut d);
         let d = Arc::new(d);
         let cli = |id: &str, keep: bool| HookCall {
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: id.into(),
@@ -970,6 +1098,7 @@ mod tests {
             name: Some(id.into()),
             dirs: Vec::new(),
             keep,
+            codex_home: None,
         };
         // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
         d.hook(cli("ask-1a2b3c", false)).await.unwrap();
@@ -1116,6 +1245,7 @@ mod tests {
     async fn a_run_only_its_hooks_ever_saw_keeps_no_name() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str, event: &str| HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1127,6 +1257,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
         assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
@@ -1148,6 +1279,7 @@ mod tests {
 
     fn gemini(id: &str, event: &str) -> HookCall {
         HookCall {
+            through_reason: Some(false),
             agent: "gemini".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1159,6 +1291,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         }
     }
 
@@ -1486,6 +1619,7 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // The terminal's commands go on as before.
         let call = HookCall {
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: "terminal".into(),
@@ -1497,6 +1631,7 @@ mod tests {
             name: Some("terminal".into()),
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
@@ -1663,6 +1798,7 @@ mod tests {
         };
         let d = Arc::new(super::super::test_daemon(cfg));
         let call = |id: &str, event: &str, dirs: &[&str]| HookCall {
+            through_reason: Some(false),
             agent: "cursor".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1674,6 +1810,7 @@ mod tests {
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
             keep: false,
+            codex_home: None,
         };
         // Working in /work/api, with /work/private open too.
         let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();
