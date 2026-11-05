@@ -1166,6 +1166,26 @@ mod tests {
         assert_eq!(unread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
     }
 
+    #[tokio::test]
+    async fn a_relay_rename_without_reclaim_leaves_the_offline_owners_mail_alone() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let owner = SessionReg { name: Some("cursor".into()), ..claude("a") };
+        join(&d, owner.clone());
+        leave(&d, &owner.key, 0);
+        mail(&d, "queued", "cursor");
+
+        let key = "reason:hosted";
+        assert_eq!(join(&d, named(key, "reason", Some("cursor"))).name, "cursor-2");
+        // The Reason relay periodically retries its preferred name with this request.
+        let req =
+            serde_json::from_value(serde_json::json!({"op": "set_status", "key": key, "name": "cursor"})).unwrap();
+        let error = d.handle(conn_of(key), req).await.unwrap_err();
+        assert!(error.to_string().contains("belongs to a session that is offline"), "{error}");
+        assert!(d.inbox(key.into(), 0, true).await.unwrap().messages.is_empty());
+        let back = join(&d, owner);
+        assert_eq!((back.name.as_str(), back.unread), ("cursor", 1));
+    }
+
     #[test]
     fn the_persons_own_mailboxes_keep_their_names_for_good() {
         let mut d = super::super::test_daemon(Default::default());

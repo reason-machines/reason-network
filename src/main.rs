@@ -507,7 +507,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 bail!("run this from inside an agent session's shell");
             };
             let doing = (!doing.is_empty()).then(|| doing.join(" "));
-            let r: Registered = link.call(Request::SetStatus { key, doing, name }).await?;
+            let reclaim = name.is_some();
+            let r: Registered = link.call(Request::SetStatus { key, doing, name, reclaim }).await?;
             println!("You are {}.", r.address);
         }
         Cmd::Init { team, person, no_setup: false, relay: None, proof: None, json: false } if wizard::interactive() => {

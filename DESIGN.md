@@ -70,7 +70,9 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 - While it is offline, its name is **kept**: a new session, on this machine or another of the person's, gets the next
   free name, including when it asks for that one (`listen --as` or a Claude Code title).
 - From an identified session, `reason-network status --name <name>` can take an ordinary offline conversation's name on
-  this computer. Both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
+  this computer. The CLI sets `reclaim` on its local `SetStatus` request. A relay retrying a hosted assistant's name
+  leaves that flag unset, so the offline owner keeps its name and mail.
+  After a reclaim, both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
   The former owner gets a free name if it resumes. Live names, names kept on other machines, and permanent mailboxes
   cannot be reclaimed. During the first six hours after daemon startup, the old owner must have been seen live by
   this daemon and gone offline again. Startup grace uses the daemon's monotonic clock so changing the system time

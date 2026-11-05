@@ -384,8 +384,9 @@ impl Daemon {
                 let git = self.git(&session.cwd).await;
                 json!(self.register(Some(conn), session, git)?)
             }
-            Request::SetStatus { key, doing, name } => {
-                json!(self.set_status(&key, doing, name, sessions::Rename::Explicit)?)
+            Request::SetStatus { key, doing, name, reclaim } => {
+                let rename = if reclaim { sessions::Rename::Explicit } else { sessions::Rename::Automatic };
+                json!(self.set_status(&key, doing, name, rename)?)
             }
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
             Request::Send { from, to, body, reply_to, wake, notify, files, purpose, idempotency_key } => {

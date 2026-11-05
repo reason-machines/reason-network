@@ -105,6 +105,9 @@ pub enum Request {
         doing: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        /// Only an explicit rename may take an offline conversation's name and waiting mail.
+        #[serde(default)]
+        reclaim: bool,
     },
     Who {
         #[serde(default)]
