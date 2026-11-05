@@ -133,26 +133,42 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let home = paths::user_home();
-    #[cfg(unix)]
-    let extra = [
-        home.join(".local/bin"),
-        home.join(".bun/bin"),
-        home.join(".npm-global/bin"),
-        home.join(".cargo/bin"),
-        home.join(".opencode/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-    ];
-    #[cfg(windows)]
-    let extra = [home.join(r".local\bin"), home.join(r"AppData\Roaming\npm"), home.join(r".bun\bin")];
-    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
     let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(extra)
+    find_in(name, &path, &paths::user_home())
+}
+
+/// [`find_bin`] with `PATH` and the home folder given: the folders on `path`, then [`install_dirs`] under `home`.
+fn find_in(name: &str, path: &std::ffi::OsStr, home: &Path) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
+    std::env::split_paths(path)
+        .chain(install_dirs(home, cfg!(windows)))
         .flat_map(|d| exts.iter().map(move |ext| d.join(format!("{name}{ext}"))))
         .find(|p| executable(p))
+}
+
+/// Where programs usually are when a daemon's `PATH` doesn't say (launchd, systemd, or a Windows daemon started by a
+/// program with a bare `PATH`, such as the Reason app's CLI). On Windows that includes `%LOCALAPPDATA%\Reason\bin`,
+/// where the Reason CLI's installer puts `reason.exe`: without it the daemon can't start `reason network __relay`,
+/// and Reason's hosted tools see none of this computer's agents (`agent_network_offline`).
+fn install_dirs(home: &Path, windows: bool) -> Vec<PathBuf> {
+    let under = |parts: &[&str]| parts.iter().fold(home.to_path_buf(), |d, p| d.join(p));
+    if windows {
+        return [
+            &[".local", "bin"][..],
+            &["AppData", "Roaming", "npm"],
+            &[".bun", "bin"],
+            &["AppData", "Local", "Reason", "bin"],
+        ]
+        .into_iter()
+        .map(under)
+        .collect();
+    }
+    let mut dirs: Vec<PathBuf> = [".local/bin", ".bun/bin", ".npm-global/bin", ".cargo/bin", ".opencode/bin"]
+        .iter()
+        .map(|d| home.join(d))
+        .collect();
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    dirs
 }
 
 /// How to run `name`, for the caller to add its arguments to. On Windows the `<name>.cmd` npm (or pnpm) installs runs
@@ -617,6 +633,29 @@ mod tests {
         }
         assert_eq!(node_shim(&format!("@SETLOCAL\r\nIF 1==1 (SET X=1)\r\n{plain}"), &sub), None);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A Windows daemon the Reason app's CLI started has only System32 on its `PATH`; it still finds the Reason CLI
+    /// where the CLI's installer puts it, so it can keep `reason network __relay` (Reason's hosted tools) running.
+    #[test]
+    fn a_windows_daemon_looks_where_the_reason_cli_is_installed() {
+        let home = PathBuf::from("home");
+        let reason = ["AppData", "Local", "Reason", "bin"].iter().fold(home.clone(), |d, p| d.join(p));
+        assert!(install_dirs(&home, true).contains(&reason));
+        assert!(!install_dirs(&home, false).contains(&reason));
+    }
+
+    /// The same on Windows itself: `reason.exe` in `%LOCALAPPDATA%\Reason\bin` is found with a bare `PATH`.
+    #[cfg(windows)]
+    #[test]
+    fn the_reason_cli_is_found_with_a_bare_path_on_windows() {
+        let home = std::env::temp_dir().join(format!("reason-network-find-{}", ulid::Ulid::generate()));
+        let bin = home.join("AppData").join("Local").join("Reason").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("reason.exe"), b"").unwrap();
+        let system32 = std::ffi::OsString::from(r"C:\Windows\System32");
+        assert_eq!(find_in("reason", &system32, &home), Some(bin.join("reason.exe")));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
