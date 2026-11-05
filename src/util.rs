@@ -4,9 +4,11 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Short machine name: `Sams-MacBook-Pro.local` -> `sams-macbook-pro`. `REASON_NETWORK_MACHINE` overrides it.
-pub fn hostname() -> String {
-    if let Some(name) = crate::paths::env_var("MACHINE").ok().map(|n| slug(&n)).filter(|n| !n.is_empty()) {
+/// Short machine name: `Sams-MacBook-Pro.local` -> `sams-macbook-pro`. `REASON_NETWORK_MACHINE` overrides it, then
+/// `configured` (the config file's `machine`).
+pub fn hostname(configured: Option<&str>) -> String {
+    let given = crate::paths::env_var("MACHINE").ok().map(|n| slug(&n)).filter(|n| !n.is_empty());
+    if let Some(name) = given.or_else(|| configured.map(slug).filter(|n| !n.is_empty())) {
         return name;
     }
     let raw = system_hostname();
