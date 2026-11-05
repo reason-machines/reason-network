@@ -34,13 +34,17 @@ const LOOP_WINDOW: Duration = Duration::from_secs(600);
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
 /// How often a Codex session's rollout is checked while mail waits for a hook of its turn.
 const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
+/// An offline Codex thread seen within this long gets its wake mail through `codex queue`, so the first message starts
+/// a turn when the thread is resumed (Codex runs no hook before then). One gone longer waits for its next turn.
+const CODEX_RESUME_MS: i64 = 24 * 3_600_000;
 
 /// How a session on this machine gets a message into its conversation.
 enum Channel {
     /// Its `reason network mcp` posts into Claude Code's session socket.
     ClaudeSocket(u64),
-    /// The agent's own CLI: `codex queue --thread <id> --message`, `reason session send <id> --message`.
-    Command(&'static str, Vec<String>),
+    /// The agent's own CLI: `codex queue --thread <id> --message`, `reason session send <id> --message`. With the
+    /// `CODEX_HOME` the session's hooks run with, if not the default.
+    Command(&'static str, Vec<String>, Option<String>),
     /// Straight into a Claude Code session's messaging socket (one without Reason Network's tools: it replies with the CLI).
     ClaudeDirect(agent::ClaudeSocket),
     /// Hooks inject it at the next tool call or turn end.
@@ -55,6 +59,16 @@ impl Inner {
         self.in_flight.retain(|_, at| at.elapsed() < IN_FLIGHT_TTL);
         let msgs = self.store.unread(address)?;
         Ok(msgs.into_iter().filter(|m| !self.in_flight.contains_key(&m.id)).collect())
+    }
+
+    /// The Codex thread an offline session's wake mail is queued into, with the `CODEX_HOME` its hooks named: only a
+    /// Codex thread seen within [`CODEX_RESUME_MS`], checked when the mail is sent.
+    fn resumable_codex(&self, r: &Remembered, wake: bool, now: i64) -> Option<(String, Option<String>)> {
+        let thread = r.key.strip_prefix("codex:").filter(|t| !t.is_empty())?;
+        if !wake || r.agent != "codex" || now - r.last_seen > CODEX_RESUME_MS {
+            return None;
+        }
+        Some((thread.to_string(), self.store.codex_home(&r.key).ok().flatten()))
     }
 
     /// Records an agent-to-agent message; false if this pair has been talking suspiciously much.
@@ -76,6 +90,22 @@ impl Inner {
     }
 }
 
+/// The command that hands `text` to `program` (`args` end with its message flag). With `codex_home`, it talks to that
+/// home's Codex app-server, not the one of the daemon's own `CODEX_HOME`.
+fn handoff_command(
+    program: std::process::Command,
+    args: &[String],
+    text: &str,
+    codex_home: Option<&str>,
+) -> tokio::process::Command {
+    let mut command = crate::util::no_window(tokio::process::Command::from(program));
+    command.args(args).arg(text).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    if let Some(home) = codex_home {
+        command.env("CODEX_HOME", home);
+    }
+    command
+}
+
 /// A message to send to a teammate's machine now: where its result goes, the machine, its name, whether it is
 /// connected, and the message.
 type RemoteJob = (usize, EndpointId, String, bool, Message);
@@ -85,6 +115,11 @@ const UPGRADE: &str =
 
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
+
+/// `codex queue`'s arguments for `thread`, up to its message flag.
+fn codex_queue(thread: &str) -> Vec<String> {
+    vec!["queue".into(), "--thread".into(), thread.into(), "--message".into()]
+}
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
 /// it was last seen, unless it is one of the person's own mailboxes (`terminal`, `listen --as`), which are kept. Until then it waits for
@@ -120,6 +155,62 @@ impl Daemon {
         approval: Option<Box<Signed<Approval>>>,
         files: Vec<Attachment>,
     ) -> Result<SendResult> {
+        self.send_idempotent(from, to, body, reply_to, wake, notify, approval, files, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn send_idempotent(
+        self: &Arc<Self>,
+        from: String,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+        wake: bool,
+        notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
+        files: Vec<Attachment>,
+        idempotency_key: Option<String>,
+    ) -> Result<SendResult> {
+        // A key may name an earlier send, even if this attempt fails before looking up its receipt.
+        // Only a successful begin_send that inserted a fresh key can prove otherwise: neither a
+        // missing receipt for an existing key nor a failed lookup proves that it never reached a recipient.
+        let mut may_have_dispatched = idempotency_key.is_some();
+        self.send_inner(
+            from,
+            to,
+            body,
+            reply_to,
+            wake,
+            notify,
+            approval,
+            files,
+            idempotency_key,
+            &mut may_have_dispatched,
+        )
+        .await
+        .map_err(|cause| SendError { cause, not_dispatched: !may_have_dispatched }.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_inner(
+        self: &Arc<Self>,
+        from: String,
+        to: &str,
+        body: &str,
+        reply_to: Option<String>,
+        wake: bool,
+        notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
+        files: Vec<Attachment>,
+        idempotency_key: Option<String>,
+        may_have_dispatched: &mut bool,
+    ) -> Result<SendResult> {
+        if idempotency_key.as_ref().is_some_and(|key| key.is_empty() || key.len() > 200) {
+            bail!("idempotency key must be 1 to 200 bytes");
+        }
+        if idempotency_key.is_some() && (is_group(to.trim()) || notify && to.trim() == self.person) {
+            bail!("idempotency keys are for one agent session");
+        }
         let (body, to) = (body.trim(), to.trim());
         if body.is_empty() {
             bail!("empty message");
@@ -135,6 +226,8 @@ impl Daemon {
 
         let mut res = SendResult { ids: Vec::new(), recipients: Vec::new() };
         let mut remote_jobs = Vec::new();
+        let mut send_key = None;
+        let mut send_nonce = String::new();
         {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
@@ -154,6 +247,22 @@ impl Daemon {
                 None => "unknown",
             };
             let exclude = sender.reg.key.clone();
+            if let Some(key) = &idempotency_key {
+                let key = blake3::hash(serde_json::to_string(&(&self.person, &exclude, key))?.as_bytes())
+                    .to_hex()
+                    .to_string();
+                let fingerprint =
+                    blake3::hash(serde_json::to_string(&(to, body, &reply_to, wake, notify, &files))?.as_bytes())
+                        .to_hex()
+                        .to_string();
+                let (nonce, receipt, fresh) = g.store.begin_send(&key, &fingerprint, now)?;
+                if let Some(receipt) = receipt {
+                    return Ok(receipt);
+                }
+                *may_have_dispatched = !fresh;
+                send_nonce = nonce;
+                send_key = Some(key);
+            }
             // It talks to teammates: its name stays its own.
             self.reached(&mut g, &exclude);
             // A person at a terminal may message a group; an agent picks the one session it needs.
@@ -182,6 +291,7 @@ impl Daemon {
                     approval: None,
                     files: Vec::new(),
                 };
+                *may_have_dispatched = true;
                 let (sent, note) = self.notify(&msg);
                 let state = if sent { "notified" } else { "not notified" };
                 res.recipients.push(Recipient { address: format!("{to}@{}", self.machine), state: state.into(), note });
@@ -202,8 +312,29 @@ impl Daemon {
             }
             let targets = if own { Vec::new() } else { self.resolve(&g, &remotes, to, Some(&exclude))? };
             for t in targets {
+                // A crash between queuing and saving the receipt retries the same peer id, never a new message.
+                let id = if let Some(key) = &send_key {
+                    let generation = if send_nonce.is_empty() { key.clone() } else { format!("{key}:{send_nonce}") };
+                    let hash = blake3::hash(format!("{generation}:{}", t.shown_address()).as_bytes());
+                    Ulid::from(u128::from_be_bytes(hash.as_bytes()[..16].try_into().expect("16 bytes"))).to_string()
+                } else {
+                    Ulid::generate().to_string()
+                };
+                if let Some(old) = g.store.message(&id)? {
+                    *may_have_dispatched = true;
+                    res.ids.push(id);
+                    res.recipients.push(Recipient {
+                        address: t.shown_address(),
+                        state: "accepted".into(),
+                        note: format!(
+                            "already accepted for {}; the original message is retained without resending",
+                            old.to
+                        ),
+                    });
+                    continue;
+                }
                 let mut msg = Message {
-                    id: Ulid::generate().to_string(),
+                    id,
                     from: from_addr.clone(),
                     from_agent: from_agent.clone(),
                     from_repo: from_repo.clone(),
@@ -267,6 +398,9 @@ impl Daemon {
                 let mut attachment_size = dims.clone();
                 attachment_size.bucket = crate::usage::size(files.iter().map(|f| f.content.len()).sum()).into();
                 self.usage.count("attachment_bytes", attachment_size, 1);
+                // Set before the first durable write: any later failure must not authorize a reroute.
+                *may_have_dispatched = true;
+                g.store.record_sent(&exclude, &msg, &shown, "queued")?;
                 let (state, mut note): (String, String) = match t {
                     _ if !matches!(t, Target::Remote { .. }) && !g.loop_ok(&msg.from, &msg.to) => {
                         ("refused".into(), LOOP_NOTE.into())
@@ -277,9 +411,9 @@ impl Daemon {
                     }
                     Target::Session { key: None, address } => {
                         let name = address.split_once('/').map_or("", |(_, n)| n);
-                        let note = offline_note(g.store.session_by_name(name)?.as_ref(), now);
+                        let r = g.store.session_by_name(name)?;
                         g.store.insert(&mut msg, false)?;
-                        ("queued".into(), note)
+                        self.deliver_offline(&mut g, r.as_ref(), vec![msg.clone()], wake)
                     }
                     Target::Remote { machine, .. } => {
                         let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE));
@@ -310,6 +444,11 @@ impl Daemon {
                     note = format!("{note}; {}", self.notify(&msg).1);
                 }
                 res.recipients.push(Recipient { address: shown, state, note });
+                let _ = g.store.send_outcome(&msg.id, &res.recipients.last().expect("just added").state);
+            }
+            // The durable outbox now owns remote retries. A lost API response returns this same receipt.
+            if let Some(key) = &send_key {
+                g.store.finish_send(key, &res)?;
             }
         }
         self.arrived.notify_waiters();
@@ -337,6 +476,9 @@ impl Daemon {
                     None => r.note = format!("queued: no answer from {name} yet; it will be retried"),
                 }
             }
+        }
+        if let Some(key) = &send_key {
+            self.inner.lock().unwrap().store.finish_send(key, &res)?;
         }
         Ok(res)
     }
@@ -366,8 +508,8 @@ impl Daemon {
         wake: bool,
     ) -> (String, String) {
         if !g.live.contains_key(key) {
-            let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
-            return ("queued".into(), note);
+            let r = g.store.session_by_key(key).ok().flatten();
+            return self.deliver_offline(g, r.as_ref(), msgs, wake);
         }
         // Mail reached it: it is a session teammates talk to, whose name stays its own.
         self.reached(g, key);
@@ -382,7 +524,7 @@ impl Daemon {
         if l.reg.agent == "reason" && l.retry.is_some_and(|(at, _)| Instant::now() < at) {
             return ("queued".into(), "queued: Reason didn't take the last delivery; it is retried shortly".into());
         }
-        let has = |bin: &str| !l.push_failed && agent::find_bin(bin).is_some();
+        let has = |bin: &str| !l.push_failed && self.agent_bin(bin).is_some();
         // A Codex turn is running (and `codex queue` is there for when it ends).
         let codex_turn = l.reg.agent == "codex"
             && has("codex")
@@ -391,17 +533,17 @@ impl Daemon {
             // These adapters take Deliver events on this connection. Codex and Reason still
             // use their native channels below, even when their MCP client registers as push.
             (Tier::Push, Some(conn), _)
-                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes") =>
+                if l.mcp_push && matches!(l.reg.agent.as_str(), agent::CLAUDE_CODE | "hermes" | "antigravity") =>
             {
                 Channel::ClaudeSocket(conn)
             }
             // In a turn, its next PostToolUse (or Stop) shows it; `codex queue` would hold it until the turn ends.
             (Tier::Push, _, Some(_)) if codex_turn => Channel::Hook,
             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
-                Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
+                Channel::Command("codex", codex_queue(id), l.codex_home.clone())
             }
             (Tier::Push, _, Some(id)) if l.reg.agent == "reason" && has("reason") => {
-                Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()])
+                Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()], None)
             }
             (Tier::Push, _, id) if l.reg.agent == agent::CLAUDE_CODE && !l.push_failed => {
                 match claude::socket_for(id.as_deref(), l.reg.pid) {
@@ -433,16 +575,13 @@ impl Daemon {
                 for id in ids {
                     g.in_flight.insert(id, Instant::now());
                 }
-                (
-                    "pushed".into(),
-                    "delivered into the session: it reads it between tool calls, or wakes up if idle".into(),
-                )
+                ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
             }
-            Channel::Command(bin, args) => {
+            Channel::Command(bin, args, codex_home) => {
                 for id in &ids {
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
-                self.send_with(bin, args, key.to_string(), ids, text);
+                self.send_with(bin, args, codex_home, key.to_string(), ids, text);
                 (
                     "pushed".into(),
                     format!(
@@ -468,6 +607,42 @@ impl Daemon {
             }
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
         }
+    }
+
+    /// Mail for a session here that is offline waits for it, except wake mail for a Codex thread seen within the last
+    /// day: that goes to `codex queue`, which holds it until the thread is resumed and then starts a turn with it. In
+    /// flight meanwhile, so the hooks of that turn don't show it again; if `codex queue` fails, they show it instead,
+    /// and that thread's mail waits for them until its next SessionStart or a `codex queue` that works. Never for a
+    /// thread in a folder that is off.
+    fn deliver_offline(
+        self: &Arc<Self>,
+        g: &mut Inner,
+        r: Option<&Remembered>,
+        msgs: Vec<Message>,
+        wake: bool,
+    ) -> (String, String) {
+        let now = util::now_ms();
+        let resumable = r
+            .filter(|r| !g.codex_failed.contains(&r.key))
+            .filter(|r| !self.cfg.off_in(&r.cwd) && !g.off.contains_key(&r.key))
+            .and_then(|r| Some((r, g.resumable_codex(r, wake, now)?)));
+        let Some((r, (thread, codex_home))) = resumable.filter(|_| self.agent_bin("codex").is_some()) else {
+            return ("queued".into(), offline_note(r, now));
+        };
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        for id in &ids {
+            g.in_flight.insert(id.clone(), Instant::now());
+        }
+        let text = render::for_agent(&msgs, Some(&r.agent), false);
+        self.send_with("codex", codex_queue(&thread), codex_home, r.key.clone(), ids, text);
+        let seen = util::ago(r.last_seen, now);
+        (
+            "pushed".into(),
+            format!(
+                "queued into the Codex thread, which is offline (last seen {seen} ago): it starts a turn when the \
+                 thread is resumed"
+            ),
+        )
     }
 
     /// Codex runs no Stop hook when a turn is interrupted or fails: until the turn `key` is in ends, checks its
@@ -515,12 +690,20 @@ impl Daemon {
             self.usage.stage(id, "push_failed");
         }
         let mut g = self.inner.lock().unwrap();
+        let _ = g.store.queue_again(ids);
         for id in ids {
             g.in_flight.remove(id);
         }
         if let Some(l) = g.live.get_mut(key) {
             l.mcp_push = false;
             l.reg.tier = l.reg.tier.max(Tier::Pull);
+            if l.reg.agent == "antigravity" {
+                let wait = l.retry.map_or(Duration::from_secs(10), |(_, wait)| (wait * 2).min(Duration::from_secs(60)));
+                l.retry = Some((Instant::now() + wait, wait));
+                if l.last_hook.is_some() {
+                    l.reg.tier = Tier::Turn;
+                }
+            }
         }
         log(&format!("pushing to {}: its MCP server knows no inbox; left unread", self.logged(&g, key)));
         drop(g);
@@ -539,6 +722,7 @@ impl Daemon {
             match res {
                 Ok(Ok(())) => {
                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
+                    let _ = g.store.handoff(&changed, util::now_ms());
                     for id in &changed {
                         this.usage.stage(id, "delivered");
                     }
@@ -570,18 +754,22 @@ impl Daemon {
         }
     }
 
-    /// Hands `text` to the agent's own CLI (`args` end with its message flag).
-    fn send_with(self: &Arc<Self>, bin: &'static str, args: Vec<String>, key: String, ids: Vec<String>, text: String) {
+    /// Hands `text` to the agent's own CLI (`args` end with its message flag), against `codex_home` if set.
+    fn send_with(
+        self: &Arc<Self>,
+        bin: &'static str,
+        args: Vec<String>,
+        codex_home: Option<String>,
+        key: String,
+        ids: Vec<String>,
+        text: String,
+    ) {
         let this = self.clone();
         tokio::spawn(async move {
             let run = async {
-                let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
-                let out = crate::util::no_window(tokio::process::Command::from(program))
-                    .args(&args)
-                    .arg(&text)
-                    .stdin(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .output();
+                let program =
+                    this.agent_bin(bin).map(|b| agent::command_at(&b)).ok_or_else(|| format!("{bin} not found"))?;
+                let out = handoff_command(program, &args, &text, codex_home.as_deref()).output();
                 match tokio::time::timeout(Duration::from_secs(30), out).await {
                     Ok(Ok(o)) if o.status.success() => Ok(()),
                     Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
@@ -590,42 +778,55 @@ impl Daemon {
                 }
             };
             let res = run.await;
-            let mut g = this.inner.lock().unwrap();
-            for id in &ids {
-                g.in_flight.remove(id);
-            }
-            match res {
-                Ok(()) => {
-                    let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
-                    for id in &changed {
-                        this.usage.stage(id, "delivered");
-                    }
-                    if let Some(l) = g.live.get_mut(&key) {
-                        l.retry = None;
-                    }
-                }
-                // Reason has no hooks to fall back on: its sync pushes again, backing off (15 s doubling to 30 min).
-                Err(why) if bin == "reason" => {
-                    let who = this.logged(&g, &key);
-                    if let Some(l) = g.live.get_mut(&key) {
-                        if l.retry.is_none() {
-                            log(&format!("{bin} delivery to {who} failed ({why}); retrying with backoff"));
-                        }
-                        let wait =
-                            l.retry.map_or(Duration::from_secs(15), |(_, w)| (w * 2).min(Duration::from_secs(1800)));
-                        l.retry = Some((Instant::now() + wait, wait));
-                    }
-                }
-                Err(why) => {
-                    log(&format!("{bin} delivery to {} failed ({why}); falling back to hooks", this.logged(&g, &key)));
-                    // Hooks (or check_inbox) show it instead; tell senders the truth from now on.
-                    if let Some(l) = g.live.get_mut(&key) {
-                        l.push_failed = true;
-                        l.reg.tier = Tier::Turn;
-                    }
-                }
-            }
+            this.handed(bin, &key, &ids, res);
         });
+    }
+
+    /// What came of handing `ids` to `bin` for `key`: read once it took them, else unread again for its hooks to show.
+    fn handed(&self, bin: &str, key: &str, ids: &[String], res: std::result::Result<(), String>) {
+        let mut g = self.inner.lock().unwrap();
+        for id in ids {
+            g.in_flight.remove(id);
+        }
+        if bin == "codex" && res.is_ok() {
+            g.codex_failed.remove(key);
+        } else if bin == "codex" {
+            g.codex_failed.insert(key.to_string());
+        }
+        match res {
+            Ok(()) => {
+                let changed = g.store.mark_read(ids, util::now_ms()).unwrap_or_default();
+                // A local native queue is an agent input handoff; the cloud command only acknowledges its server.
+                if bin != "reason" {
+                    let _ = g.store.handoff(&changed, util::now_ms());
+                    for id in &changed {
+                        self.usage.stage(id, "delivered");
+                    }
+                }
+                if let Some(l) = g.live.get_mut(key) {
+                    l.retry = None;
+                }
+            }
+            // Reason has no hooks to fall back on: its sync pushes again, backing off (15 s doubling to 30 min).
+            Err(why) if bin == "reason" => {
+                let who = self.logged(&g, key);
+                if let Some(l) = g.live.get_mut(key) {
+                    if l.retry.is_none() {
+                        log(&format!("{bin} delivery to {who} failed ({why}); retrying with backoff"));
+                    }
+                    let wait = l.retry.map_or(Duration::from_secs(15), |(_, w)| (w * 2).min(Duration::from_secs(1800)));
+                    l.retry = Some((Instant::now() + wait, wait));
+                }
+            }
+            Err(why) => {
+                log(&format!("{bin} delivery to {} failed ({why}); falling back to hooks", self.logged(&g, key)));
+                // Hooks (or check_inbox) show it instead; tell senders the truth from now on.
+                if let Some(l) = g.live.get_mut(key) {
+                    l.push_failed = true;
+                    l.reg.tier = Tier::Turn;
+                }
+            }
+        }
     }
 
     /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
@@ -722,7 +923,7 @@ impl Daemon {
                 ),
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
-                None => ("queued".into(), offline_note(remembered.as_ref(), util::now_ms())),
+                None => self.deliver_offline(&mut g, remembered.as_ref(), vec![msg.clone()], msg.wake),
             };
             if msg.notify { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
         };
@@ -750,10 +951,10 @@ impl Daemon {
     /// A session's unread messages. Waits up to `wait_secs` for one. Marks
     /// them read unless `peek`, in which case the client confirms with `Delivered`.
     pub(super) async fn inbox(&self, key: String, wait_secs: u64, peek: bool) -> Result<Inbox> {
-        let (address, agent, stop) = {
+        let (agent, stop) = {
             let g = self.inner.lock().unwrap();
             let l = g.live.get(&key).ok_or_else(unregistered)?;
-            (self.addr(&l.name), Some(l.reg.agent.clone()), l.stop_gen)
+            (Some(l.reg.agent.clone()), l.stop_gen)
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
         let _polling = (wait_secs > 0).then(|| Polling::start(self, &key));
@@ -765,14 +966,17 @@ impl Daemon {
             let messages = {
                 let mut g = self.inner.lock().unwrap();
                 // The client gave up on this wait (or the session is gone): end it with nothing.
-                if g.live.get(&key).is_none_or(|l| l.stop_gen != stop) {
+                let Some(l) = g.live.get(&key).filter(|l| l.stop_gen == stop) else {
                     return Ok(Inbox { messages: Vec::new(), text: String::new() });
-                }
+                };
+                // By its current name: a rename while waiting frees the old one for another session.
+                let address = self.addr(&l.name);
                 let messages = g.pending(&address)?;
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     let changed = g.store.mark_read(&ids, util::now_ms())?;
                     if g.live.get(&key).is_some_and(|l| l.through_reason == Some(false)) {
+                        g.store.handoff(&changed, util::now_ms())?;
                         for id in &changed {
                             self.usage.stage(id, "delivered");
                         }
@@ -977,12 +1181,499 @@ mod tests {
         }
     }
 
+    /// Not Codex: mail for it while it is offline only waits (see `deliver_offline`).
+    fn gemini(key: &str) -> SessionReg {
+        SessionReg { agent: "gemini".into(), ..codex(key) }
+    }
+
+    fn disk_daemon() -> (Arc<Daemon>, rusqlite::Connection, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!("reason-network-send-{}", Ulid::generate()));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("network.db");
+        let store = crate::store::Store::open(&path, home.join("inbox")).unwrap();
+        let d = Arc::new(Daemon::with(crate::config::Config::default(), store, SecretKey::generate()).unwrap());
+        (d, rusqlite::Connection::open(path).unwrap(), home)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_send_refused_before_dispatch_has_a_typed_code() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let error = d.send("missing".into(), "alex/api", "hello", None, true, false, None, vec![]).await.unwrap_err();
+        let reply = serde_json::to_value(Reply::err(7, error)).unwrap();
+        assert_eq!(reply["error"], unregistered().to_string());
+        assert_eq!(reply["code"], "send_not_dispatched");
+        let error = d.send("missing".into(), "alex/api", "", None, true, false, None, vec![]).await.unwrap_err();
+        let reply = serde_json::to_value(Reply::err(8, error)).unwrap();
+        assert_eq!(reply["error"], "empty message");
+        assert_eq!(reply["code"], "send_not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_key_can_report_a_recipient_refusal_but_a_pending_key_or_failed_lookup_cannot() {
+        let (d, db, home) = disk_daemon();
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let send = |key: &str| {
+            d.send_idempotent(
+                "codex:1".into(),
+                "no-such-recipient",
+                "hello",
+                None,
+                true,
+                false,
+                None,
+                vec![],
+                Some(key.into()),
+            )
+        };
+        let fresh = Reply::err(7, send("job-1").await.unwrap_err());
+        assert!(fresh.error.as_deref().unwrap().starts_with("no session called 'no-such-recipient'"));
+        assert_eq!(fresh.code.as_deref(), Some("send_not_dispatched"));
+        // The failed resolution left a pending key. A retry cannot assume what happened on that attempt.
+        let pending = Reply::err(8, send("job-1").await.unwrap_err());
+        assert_eq!(pending.error, fresh.error);
+        assert_eq!(pending.code, None);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM send_keys WHERE receipt IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        // A different job is independently proven fresh.
+        assert_eq!(Reply::err(9, send("job-2").await.unwrap_err()).code.as_deref(), Some("send_not_dispatched"));
+        // Even an actual insertion is not enough if the following receipt read cannot complete.
+        db.execute_batch(
+            "CREATE TRIGGER corrupt_receipt AFTER INSERT ON send_keys
+             BEGIN UPDATE send_keys SET receipt='invalid JSON' WHERE key=NEW.key; END;",
+        )
+        .unwrap();
+        let failed_lookup = Reply::err(10, send("job-3").await.unwrap_err());
+        assert!(failed_lookup.error.unwrap().contains("expected value"));
+        assert_eq!(failed_lookup.code, None);
+        for table in ["messages", "outbox", "sent_receipts"] {
+            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        drop(db);
+        drop(d);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_receipt_failure_after_push_never_says_not_dispatched_and_retries_do_not_push_again() {
+        // Fail either finish_send: the first saves the queued result, the second the peer result.
+        for condition in ["1", "OLD.receipt IS NOT NULL"] {
+            let (d, db, home) = disk_daemon();
+            d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            d.inner.lock().unwrap().conns.insert(7, tx);
+            let to = d
+                .register(
+                    Some(7),
+                    SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex("claude-code:2") },
+                    crate::git::GitInfo::default(),
+                )
+                .unwrap()
+                .address;
+            db.execute_batch(&format!(
+                "CREATE TRIGGER fail_receipt BEFORE UPDATE OF receipt ON send_keys WHEN {condition}
+                 BEGIN SELECT RAISE(FAIL, 'receipt persistence failed'); END;"
+            ))
+            .unwrap();
+            let send = || {
+                d.send_idempotent("codex:1".into(), &to, "hello", None, true, false, None, vec![], Some("job-1".into()))
+            };
+            let reply = serde_json::to_value(Reply::err(7, send().await.unwrap_err())).unwrap();
+            assert!(reply["error"].as_str().unwrap().contains("receipt persistence failed"));
+            assert_eq!(reply.get("code"), None);
+            // The push happened, not merely an attempted database write.
+            let Event::Deliver { ids, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+            db.execute_batch("DROP TRIGGER fail_receipt;").unwrap();
+            let receipt = send().await.unwrap();
+            assert_eq!(receipt.ids, ids);
+            let cached = send().await.unwrap();
+            assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(receipt).unwrap());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+            drop(db);
+            drop(d);
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyed_retry_cannot_claim_no_dispatch_when_its_receipt_or_sender_is_unavailable() {
+        let (d, db, home) = disk_daemon();
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+        let send =
+            || d.send_idempotent("codex:1".into(), &to, "hello", None, true, false, None, vec![], Some("job-1".into()));
+        let receipt = send().await.unwrap();
+        db.execute_batch("UPDATE send_keys SET receipt='invalid JSON';").unwrap();
+        let reply = Reply::err(7, send().await.unwrap_err());
+        assert!(reply.error.unwrap().contains("expected value"));
+        assert_eq!(reply.code, None);
+        // SQLite lookup itself can fail too, with the earlier message still present.
+        db.execute_batch("ALTER TABLE send_keys RENAME TO saved_send_keys;").unwrap();
+        let reply = Reply::err(8, send().await.unwrap_err());
+        assert!(reply.error.unwrap().contains("no such table"));
+        assert_eq!(reply.code, None);
+        d.inner.lock().unwrap().live.remove("codex:1");
+        let reply = Reply::err(9, send().await.unwrap_err());
+        assert_eq!(reply.error.as_deref(), Some(unregistered().to_string().as_str()));
+        assert_eq!(reply.code, None);
+        let messages = d.inner.lock().unwrap().store.unread(&to).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, receipt.ids[0]);
+        drop(db);
+        drop(d);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_send_stops_classifying_errors_before_its_first_durable_attempt() {
+        for table in ["sent_receipts", "messages"] {
+            let (d, db, home) = disk_daemon();
+            d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+            let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
+            db.execute_batch(&format!(
+                "CREATE TRIGGER fail_write BEFORE INSERT ON {table}
+                 BEGIN SELECT RAISE(FAIL, 'durable write failed'); END;"
+            ))
+            .unwrap();
+            let error = d.send("codex:1".into(), &to, "hello", None, true, false, None, vec![]).await.unwrap_err();
+            let reply = Reply::err(7, error);
+            assert!(reply.error.unwrap().contains("durable write failed"));
+            assert_eq!(reply.code, None);
+            assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+            drop(db);
+            drop(d);
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
     /// Takes a session here offline, last seen `ago` before now. Returns its name.
     fn gone(d: &Daemon, key: &str, ago: i64) -> String {
         let mut g = d.inner.lock().unwrap();
         let name = g.live.remove(key).unwrap().name;
         g.store.touch_session(&name, util::now_ms() - ago).unwrap();
         name
+    }
+
+    /// A Codex thread's hook, run with `CODEX_HOME` set to `home`.
+    fn codex_hook(thread: &str, event: &str, home: Option<&str>) -> HookCall {
+        HookCall {
+            through_reason: Some(false),
+            agent: "codex".into(),
+            event: event.into(),
+            session_id: thread.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            keep: false,
+            name: None,
+            dirs: Vec::new(),
+            codex_home: home.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_codex_queue_command_runs_against_the_home_the_sessions_hooks_named() {
+        let args = |c: &tokio::process::Command| c.as_std().get_args().map(|a| a.to_owned()).collect::<Vec<_>>();
+        let env = |c: &tokio::process::Command| {
+            c.as_std().get_envs().find(|(k, _)| *k == "CODEX_HOME").and_then(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        let program = || std::process::Command::new("codex");
+        let theirs = handoff_command(program(), &codex_queue("t1"), "hi", Some("/work/.codex-b"));
+        assert_eq!(args(&theirs), ["queue", "--thread", "t1", "--message", "hi"]);
+        assert_eq!(env(&theirs).as_deref(), Some(std::ffi::OsStr::new("/work/.codex-b")));
+        // Unset: the command gets the daemon's own environment, as before.
+        let default = handoff_command(program(), &codex_queue("t1"), "hi", None);
+        assert_eq!(args(&default), args(&theirs));
+        assert_eq!(default.as_std().get_envs().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_offline_codex_thread_seen_within_a_day_takes_wake_mail_through_codex_queue_in_its_home() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let home = "/work/.codex-b";
+        d.hook(codex_hook("t1", "start", Some(home))).await.unwrap();
+        // A thread from the default home: `codex queue` runs as before.
+        d.hook(codex_hook("t2", "start", None)).await.unwrap();
+        assert_eq!(d.inner.lock().unwrap().live["codex:t1"].codex_home.as_deref(), Some(home));
+        let (name, default) = (gone(&d, "codex:t1", 3 * HOUR), gone(&d, "codex:t2", HOUR));
+        let g = d.inner.lock().unwrap();
+        let r = g.store.session_by_name(&name).unwrap().unwrap();
+        let now = util::now_ms();
+        assert_eq!(g.resumable_codex(&r, true, now), Some(("t1".into(), Some(home.into()))));
+        let r2 = g.store.session_by_name(&default).unwrap().unwrap();
+        assert_eq!(g.resumable_codex(&r2, true, now), Some(("t2".into(), None)));
+        // An FYI waits for the thread's next turn: it starts none.
+        assert_eq!(g.resumable_codex(&r, false, now), None);
+        // Seen longer ago than a day, at the time the mail is sent: it waits.
+        assert_eq!(g.resumable_codex(&r, true, r.last_seen + CODEX_RESUME_MS + 1), None);
+        // Only a Codex thread its agent named.
+        let by_process = Remembered { key: "proc:7".into(), ..r.clone() };
+        assert_eq!(g.resumable_codex(&by_process, true, now), None);
+        let other = Remembered { agent: "gemini".into(), key: "gemini:t1".into(), ..r.clone() };
+        assert_eq!(g.resumable_codex(&other, true, now), None);
+    }
+
+    #[tokio::test]
+    async fn mail_for_a_codex_thread_offline_for_over_a_day_waits_with_the_offline_note() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        let name = gone(&d, "codex:t1", 25 * HOUR);
+        let res = d.send("gemini:1".into(), &name, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        let note = &res.recipients[0].note;
+        assert!(note.starts_with("queued: last seen 1d ago; unread mail may be dropped any time"), "{note}");
+        let to = d.addr(&name);
+        assert!(d.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+        // Back at its next turn, its hook shows it.
+        let shown = d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        assert!(shown.text.unwrap().contains("hi"));
+    }
+
+    /// An offline Codex thread with mail handed to `codex queue` and not answered yet, as `deliver_offline` leaves it.
+    async fn codex_queue_in_flight() -> (Arc<Daemon>, String, Vec<String>) {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let mut msg = Message {
+            id: Ulid::generate().to_string(),
+            from: format!("{}/web", d.person),
+            from_agent: Some("claude-code".into()),
+            from_repo: None,
+            to: to.clone(),
+            via: None,
+            reply_to: None,
+            body: "please look at the failing test".into(),
+            wake: true,
+            notify: false,
+            sent_at: util::now_ms(),
+            approval: None,
+            files: Vec::new(),
+        };
+        let mut g = d.inner.lock().unwrap();
+        g.store.insert(&mut msg, false).unwrap();
+        g.in_flight.insert(msg.id.clone(), Instant::now());
+        drop(g);
+        (d, to, vec![msg.id])
+    }
+
+    #[tokio::test]
+    async fn mail_codex_queue_took_is_never_shown_again_by_the_hooks_of_the_turn_it_starts() {
+        let (d, to, ids) = codex_queue_in_flight().await;
+        // Resumed while `codex queue` still runs: SessionStart doesn't show it too.
+        let start = d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert_eq!((start.text, start.ids), (None, Vec::<String>::new()));
+        d.handed("codex", "codex:t1", &ids, Ok(()));
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        for event in ["prompt", "tool", "stop"] {
+            assert_eq!(d.hook(codex_hook("t1", event, None)).await.unwrap().text, None, "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_codex_queue_failed_to_take_stays_unread_and_its_hooks_show_it_once() {
+        let (d, to, ids) = codex_queue_in_flight().await;
+        d.handed("codex", "codex:t1", &ids, Err("no app-server".into()));
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+        let start = d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert!(start.text.unwrap().contains("please look at the failing test"));
+        assert_eq!(start.ids, ids);
+        // Shown, and waiting for the hook to confirm it: no other hook shows it meanwhile.
+        assert_eq!(d.hook(codex_hook("t1", "stop", None)).await.unwrap().text, None);
+    }
+
+    #[tokio::test]
+    async fn a_codex_threads_session_start_clears_its_failed_codex_queue() {
+        let (d, _, ids) = codex_queue_in_flight().await;
+        d.handed("codex", "codex:t1", &ids, Err("no app-server".into()));
+        let failed = || d.inner.lock().unwrap().codex_failed.contains("codex:t1");
+        assert!(failed());
+        // Its other hooks leave the mark: its offline mail keeps waiting for its hooks.
+        for event in ["prompt", "tool", "stop"] {
+            d.hook(codex_hook("t1", event, None)).await.unwrap();
+            assert!(failed(), "{event}");
+        }
+        // Started again: its offline wake mail gets another try at `codex queue`.
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert!(!failed());
+    }
+
+    /// A fake `codex` for `d` to run: it records each command, as `CODEX_HOME|arguments`, in a file of its own in the
+    /// folder returned, and fails if `fails`, as `codex queue` does when it can't reach an app-server.
+    #[cfg(unix)]
+    fn fake_codex(d: &Daemon, fails: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-fake-codex-{}", Ulid::generate()));
+        let log = dir.join("commands");
+        std::fs::create_dir_all(&log).unwrap();
+        let bin = dir.join("codex");
+        let end = if fails { "echo 'no app-server' >&2; exit 1" } else { "exit 0" };
+        let script =
+            format!("#!/bin/sh\nprintf '%s|%s' \"${{CODEX_HOME:-default}}\" \"$*\" > '{}/'$$\n{end}\n", log.display());
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d.fake_bins.lock().unwrap().insert("codex", bin);
+        log
+    }
+
+    /// The `codex queue` commands for `thread` the fake recorded in `log`, each as `CODEX_HOME|message`, once every one
+    /// started has finished.
+    #[cfg(unix)]
+    async fn codex_queued(d: &Daemon, log: &std::path::Path, thread: &str) -> Vec<String> {
+        for _ in 0..1000 {
+            if d.inner.lock().unwrap().in_flight.is_empty() {
+                let start = format!("|queue --thread {thread} --message ");
+                let commands =
+                    std::fs::read_dir(log).unwrap().map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap());
+                return commands.filter_map(|c| c.split_once(&start).map(|(home, m)| format!("{home}|{m}"))).collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("codex queue never finished");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wake_mail_from_here_and_from_a_teammate_goes_into_a_codex_thread_offline_since_today() {
+        let (d, bob, _) = with_teammate();
+        let log = fake_codex(&d, false);
+        d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let res = d.send("codex:1".into(), &name, "from a session here", None, true, false, None, Vec::new());
+        let sent = res.await.unwrap().recipients.remove(0);
+        let mut msg = from_bob(&to, "from bob's agent".into(), Vec::new());
+        msg.wake = true;
+        let received = d.receive(bob.public(), msg).unwrap();
+        for (state, note) in [(sent.state, sent.note), received] {
+            assert_eq!(state, "pushed");
+            assert!(note.starts_with("queued into the Codex thread, which is offline (last seen 1h ago)"), "{note}");
+        }
+        let queued = codex_queued(&d, &log, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued.iter().any(|q| q.contains("from a session here")) && queued.iter().any(|q| q.contains("bob")));
+        // Against the home its hooks named, and with the reply tool named as Codex has it.
+        assert!(queued.iter().all(|q| q.starts_with("/work/.codex-b|<reason-message ")), "{queued:?}");
+        assert!(queued.iter().all(|q| q.contains("mcp__reason_network__send_message")), "{queued:?}");
+        // Taken: read, and the turn it starts doesn't show it again.
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        assert_eq!(d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap().text, None);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn once_codex_queue_fails_for_an_offline_codex_thread_its_mail_waits_for_its_hooks() {
+        let (d, bob, _) = with_teammate();
+        let log = fake_codex(&d, true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let send = |body: &'static str| {
+            let (d, name) = (d.clone(), name.clone());
+            async move {
+                let res = d.send("codex:1".into(), &name, body, None, true, false, None, Vec::new()).await;
+                res.unwrap().recipients.remove(0)
+            }
+        };
+        assert_eq!(send("first try").await.state, "pushed");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        // No second process for it, and the sender hears the truth: it waits.
+        let second = send("second try").await;
+        assert_eq!(second.state, "queued");
+        assert!(second.note.starts_with("queued: last seen 1h ago"), "{}", second.note);
+        let mut msg = from_bob(&to, "from bob's agent".into(), Vec::new());
+        msg.wake = true;
+        let (state, note) = d.receive(bob.public(), msg).unwrap();
+        assert!(state == "queued" && note.starts_with("queued: last seen 1h ago"), "{state}: {note}");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        // Its hooks show all of it when it is back.
+        let shown = d.hook(codex_hook("t1", "start", None)).await.unwrap().text.unwrap();
+        assert!(["first try", "second try", "from bob's agent"].iter().all(|b| shown.contains(b)), "{shown}");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn once_codex_queue_takes_a_threads_mail_again_its_offline_mail_goes_through_it_again() {
+        let (d, _, _) = with_teammate();
+        let failing = fake_codex(&d, true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let send = |body: &'static str| {
+            let (d, name) = (d.clone(), name.clone());
+            async move {
+                let res = d.send("codex:1".into(), &name, body, None, true, false, None, Vec::new()).await;
+                res.unwrap().recipients.remove(0)
+            }
+        };
+        assert_eq!(send("first try").await.state, "pushed");
+        assert_eq!(codex_queued(&d, &failing, "t1").await.len(), 1);
+        assert!(d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Back at a prompt (no SessionStart, which clears the mark too), with `codex queue` working again: its hook
+        // shows what failed, and it takes mail through `codex queue`, as with `codex` on PATH.
+        let working = fake_codex(&d, false);
+        let shown = d.hook(codex_hook("t1", "prompt", None)).await.unwrap();
+        assert!(shown.text.unwrap().contains("first try"));
+        d.handle(0, Request::Delivered { key: "codex:t1".into(), ids: shown.ids }).await.unwrap();
+        d.inner.lock().unwrap().live.get_mut("codex:t1").unwrap().reg.tier = Tier::Push;
+        let live = send("while it is here").await;
+        assert!(live.state == "pushed" && live.note.starts_with("queued into the Codex session"), "{}", live.note);
+        assert_eq!(codex_queued(&d, &working, "t1").await.len(), 1);
+        assert!(!d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Offline again: its next wake mail goes through `codex queue` again, which takes it once.
+        gone(&d, "codex:t1", HOUR);
+        let later = send("once it is gone again").await;
+        assert!(later.state == "pushed" && later.note.starts_with("queued into the Codex thread"), "{}", later.note);
+        let queued = codex_queued(&d, &working, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued.iter().filter(|q| q.contains("once it is gone again")).count(), 1, "{queued:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // Read: the turn it starts doesn't show it again.
+        assert_eq!(d.hook(codex_hook("t1", "start", None)).await.unwrap().text, None);
+        for log in [failing, working] {
+            let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_codex_queue_for_an_offline_codex_thread_in_a_folder_that_is_off() {
+        let folders = std::collections::BTreeMap::from([("/work/personal".to_string(), "off".to_string())]);
+        let d = Arc::new(super::super::test_daemon(crate::config::Config { folders, ..Default::default() }));
+        let log = fake_codex(&d, false);
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        // Its hooks last said it is in a folder that is off: it was in one that is on when it was here.
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let off = HookCall { cwd: Some("/work/personal".into()), ..codex_hook("t1", "prompt", None) };
+        assert!(d.hook(off).await.is_err());
+        let res = d.send("gemini:1".into(), &name, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued", "{}", res.recipients[0].note);
+        // Remembered in a folder that is off (turned off since). In a folder of its own: never the first one's name.
+        d.hook(HookCall { cwd: Some("/work/web".into()), ..codex_hook("t2", "start", None) }).await.unwrap();
+        let other = gone(&d, "codex:t2", HOUR);
+        {
+            let mut g = d.inner.lock().unwrap();
+            let mut r = g.store.session_by_name(&other).unwrap().unwrap();
+            r.cwd = "/work/personal/notes".into();
+            let mut msg = from_bob(&d.addr(&other), "hi".into(), Vec::new());
+            msg.wake = true;
+            g.store.insert(&mut msg, false).unwrap();
+            assert_eq!(d.deliver_offline(&mut g, Some(&r), vec![msg], true).0, "queued");
+        }
+        assert!(codex_queued(&d, &log, "t2").await.is_empty());
+        assert_eq!(std::fs::read_dir(&log).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
     #[test]
@@ -1025,8 +1716,8 @@ mod tests {
     async fn sending_to_an_offline_session_here_says_when_its_mail_may_be_dropped() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
-        let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
-        gone(&d, "codex:2", 3 * HOUR);
+        let to = d.register(Some(2), gemini("gemini:2"), crate::git::GitInfo::default()).unwrap().address;
+        gone(&d, "gemini:2", 3 * HOUR);
         let res = d.send("codex:1".into(), &to, "hi", None, true, false, None, Vec::new()).await.unwrap();
         assert_eq!(res.recipients[0].state, "queued");
         let note = &res.recipients[0].note;
@@ -1041,8 +1732,8 @@ mod tests {
         let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
         team.put_member(&d.key, bob.public(), "bob", "xps", true);
         d.inner.lock().unwrap().team = Some(team);
-        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
-        let name = gone(&d, "codex:1", 3 * HOUR);
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        let name = gone(&d, "gemini:1", 3 * HOUR);
         let msg = Message {
             id: Ulid::generate().to_string(),
             from: "bob/web".into(),
@@ -1093,7 +1784,7 @@ mod tests {
         assert_eq!(got[0].from, "bob/terminal@xps");
         let text = render::for_agent(&got, Some("codex"), false);
         assert!(
-            text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
+            text.contains("From bob, typed in a terminal.") && text.contains("send_message) to \"bob/terminal@xps\""),
             "{text}"
         );
         // Asked the other way: a message to `bob/terminal` names it in its receipt as Bob's answer will show here, so a
@@ -1124,6 +1815,73 @@ mod tests {
         )]);
         let targets = d.resolve(&g, &remotes, "bob/web-codex", None).unwrap();
         assert_eq!(targets.iter().map(|t| t.shown_address()).collect::<Vec<_>>(), ["bob/web-codex"]);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_inbox_follows_its_session_through_a_rename() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..codex(key) };
+        let old = d.register(Some(1), named("codex:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.inbox("codex:a".into(), 5, true).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let new = d.set_status("codex:a", None, Some("new".into())).unwrap().address;
+        // Another session takes the name it gave up; its mail is its own.
+        d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
+        for (to, body) in [(&old, "for b"), (&new, "for a")] {
+            d.send("codex:s".into(), to, body, None, true, false, None, Vec::new()).await.unwrap();
+        }
+        let got: Vec<String> = waiting.await.unwrap().messages.into_iter().map(|m| m.body).collect();
+        assert_eq!(got, ["for a"]);
+        let b: Vec<String> = d.inner.lock().unwrap().pending(&old).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(b, ["for b"]);
+    }
+
+    #[tokio::test]
+    async fn a_reading_wait_never_marks_the_new_owners_mail_read() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..codex(key) };
+        let old = d.register(Some(1), named("codex:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.inbox("codex:a".into(), 5, false).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let new = d.set_status("codex:a", None, Some("new".into())).unwrap().address;
+        d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
+        for (to, body) in [(&old, "for b"), (&new, "for a")] {
+            d.send("codex:s".into(), to, body, None, true, false, None, Vec::new()).await.unwrap();
+        }
+        let got: Vec<String> = waiting.await.unwrap().messages.into_iter().map(|m| m.body).collect();
+        assert_eq!(got, ["for a"]);
+        let b: Vec<String> = d.inner.lock().unwrap().store.unread(&old).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(b, ["for b"]);
+        assert!(d.inner.lock().unwrap().store.unread(&new).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wait_whose_session_leaves_ends_empty_and_leaves_the_mail() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..gemini(key) };
+        let old = d.register(Some(1), named("gemini:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        let waiting = tokio::spawn({
+            let d = d.clone();
+            async move { d.inbox("gemini:a".into(), 5, false).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        d.drop_conn(1);
+        d.register(Some(3), named("gemini:b", "old"), crate::git::GitInfo::default()).unwrap();
+        let t0 = std::time::Instant::now();
+        d.send("codex:s".into(), &old, "for b", None, true, false, None, Vec::new()).await.unwrap();
+        let got = waiting.await.unwrap().messages;
+        assert!(got.is_empty());
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(d.inner.lock().unwrap().store.unread(&old).unwrap().len(), 1);
     }
 
     #[tokio::test]

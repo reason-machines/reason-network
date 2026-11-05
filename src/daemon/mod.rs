@@ -2,7 +2,9 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod antigravity;
 mod ask;
+mod diagnostics;
 mod directory;
 mod mail;
 mod notify;
@@ -143,12 +145,16 @@ pub struct Daemon {
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
+    /// Agent CLIs a test runs in place of the ones on this machine.
+    #[cfg(test)]
+    fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
 }
 
 struct Inner {
     store: Store,
     live: HashMap<String, Live>,
     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
+    antigravity_conn: Option<u64>,
     next_conn: u64,
     team: Option<TeamState>,
     /// Messages handed to a push channel or a hook and not yet confirmed; hidden from inbox and hooks meanwhile.
@@ -165,6 +171,9 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
+    /// their next SessionStart or a `codex queue` that works.
+    codex_failed: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -197,6 +206,8 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// The `CODEX_HOME` a Codex session's hooks run with; `None` for the default home (and other agents).
+    codex_home: Option<String>,
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -245,6 +256,7 @@ impl Daemon {
                 store,
                 live: HashMap::new(),
                 conns: HashMap::new(),
+                antigravity_conn: None,
                 next_conn: 0,
                 team,
                 in_flight: HashMap::new(),
@@ -254,6 +266,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                codex_failed: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -265,7 +278,18 @@ impl Daemon {
             started: util::now_ms(),
             plain_until: Mutex::new(None),
             capped: Default::default(),
+            #[cfg(test)]
+            fake_bins: Default::default(),
         })
+    }
+
+    /// The agent's own CLI `bin` on this machine (in a test, its fake).
+    fn agent_bin(&self, bin: &str) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_bins.lock().unwrap().get(bin) {
+            return Some(fake.clone());
+        }
+        crate::agent::find_bin(bin)
     }
 
     fn addr(&self, name: &str) -> String {
@@ -357,13 +381,16 @@ impl Daemon {
             }
             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
-            Request::Send { from, to, body, reply_to, wake, notify, files, purpose } => {
+            Request::Send { from, to, body, reply_to, wake, notify, files, purpose, idempotency_key } => {
                 let dims = crate::usage::Dimensions {
                     bucket: purpose.unwrap_or_else(|| "unknown".into()),
                     ..Default::default()
                 };
                 self.usage.count("purpose", dims, 1);
-                json!(self.send(from, &to, &body, reply_to, wake, notify, None, files).await?)
+                json!(
+                    self.send_idempotent(from, &to, &body, reply_to, wake, notify, None, files, idempotency_key)
+                        .await?
+                )
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
@@ -385,6 +412,12 @@ impl Daemon {
                 for id in &ids {
                     g.in_flight.remove(id);
                 }
+                if handed_to_agent {
+                    g.store.handoff(&changed, util::now_ms())?;
+                }
+                if let Some(l) = g.live.get_mut(&key) {
+                    l.retry = None;
+                }
                 Value::Null
             }
             Request::PushFailed { key, ids } => {
@@ -401,7 +434,24 @@ impl Daemon {
             Request::Proof { jws } => json!(self.attach_proof(&jws)?),
             Request::Invite { me, hours } => json!(self.invite(me, hours).await?),
             Request::Team => json!(self.team_info()?),
-            Request::Usage => json!(self.usage.snapshot()),
+            Request::Usage => {
+                let mut report = json!(self.usage.snapshot());
+                if report.is_object() {
+                    report["health"] = self.diagnostics()?;
+                }
+                report
+            }
+            Request::Diagnostics => self.diagnostics()?,
+            Request::DeliveryStatus { from, ids } => {
+                json!(self.inner.lock().unwrap().store.delivery_status(&from, &ids)?)
+            }
+            Request::AntigravityAttach => json!(self.attach_antigravity(conn)?),
+            Request::AntigravitySession { conversation_id } => {
+                let mut g = self.inner.lock().unwrap();
+                self.prune(&mut g);
+                let key = format!("antigravity:{conversation_id}");
+                json!(g.live.get(&key).filter(|l| l.last_hook.is_some()).map(|_| key))
+            }
             Request::Link { new } => json!(self.link(new).await?),
             Request::Remove { who } => json!(self.remove(&who)?),
             Request::Leave { force } => json!(self.leave(force).await?),

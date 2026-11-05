@@ -87,6 +87,10 @@ pub struct HookCall {
     /// Every folder the agent says the session is in (besides `cwd`): one turned off keeps it off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirs: Vec<String>,
+    /// The `CODEX_HOME` a Codex session's hooks run with, for `codex queue` and its thread names to use that home's
+    /// app-server and files. Unset: the default home. Older hooks leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +116,9 @@ pub enum Request {
     },
     /// From an agent session: its key (or, for agents that reply through the CLI, its address or name).
     Send {
+        /// Reuse for the same logical send, including after a lost response. Scoped to the sending session.
+        #[serde(default)]
+        idempotency_key: Option<String>,
         /// Local analytics only; never included in the peer message.
         #[serde(default, deserialize_with = "crate::usage::purpose")]
         purpose: Option<String>,
@@ -208,6 +215,19 @@ pub enum Request {
     Team,
     /// Local aggregate counters, read only by clients that opt into usage reporting.
     Usage,
+    /// App-managed Antigravity sidecar subscribes to native delivery events on this connection.
+    AntigravityAttach,
+    /// Resolve an explicit native conversation only after its hook registered it.
+    AntigravitySession {
+        conversation_id: String,
+    },
+    /// Local delivery health, without message contents.
+    Diagnostics,
+    /// Delivery progress for this session's own outgoing messages; never returns their bodies.
+    DeliveryStatus {
+        from: String,
+        ids: Vec<String>,
+    },
     /// The team link, which anyone can use to join; `new` replaces it.
     Link {
         #[serde(default)]
@@ -265,7 +285,7 @@ pub struct Reply {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// For a failure the Reason CLI handles: `name_taken` or `same_account_needs_owner` (see [`error_code`]).
+    /// A proven pre-dispatch send refusal, or a team failure (see [error_code]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
@@ -277,7 +297,31 @@ impl Reply {
 
     pub fn err(id: u64, e: anyhow::Error) -> Self {
         let error = format!("{e:#}");
-        Reply { id, ok: false, result: None, code: error_code(&error).map(String::from), error: Some(error) }
+        let code = match e.downcast_ref::<SendError>() {
+            Some(send) => send.not_dispatched.then_some("send_not_dispatched"),
+            None => error_code(&error),
+        };
+        Reply { id, ok: false, result: None, code: code.map(String::from), error: Some(error) }
+    }
+}
+
+/// A send's failure phase comes from its side effects, never from its error text.
+#[derive(Debug)]
+pub struct SendError {
+    pub cause: anyhow::Error,
+    pub not_dispatched: bool,
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.cause)
+    }
+}
+
+impl std::error::Error for SendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Display already carries the cause's first message; keep the remaining chain without repeating it.
+        self.cause.source()
     }
 }
 
@@ -521,6 +565,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_hook_names_its_codex_home_and_an_older_hook_leaves_it_out() {
+        let old = serde_json::json!({"op": "hook", "agent": "codex", "event": "start", "session_id": "t1"});
+        let Request::Hook(h) = serde_json::from_value(old).unwrap() else { panic!("a hook") };
+        assert_eq!(h.codex_home, None);
+        let new = serde_json::json!({"op": "hook", "agent": "codex", "event": "start", "session_id": "t1",
+            "codex_home": "/work/.codex-b"});
+        let Request::Hook(h) = serde_json::from_value(new).unwrap() else { panic!("a hook") };
+        assert_eq!(h.codex_home.as_deref(), Some("/work/.codex-b"));
+        // Without one, nothing new goes to an older daemon.
+        let v = serde_json::to_value(Request::Hook(HookCall { codex_home: None, ..h })).unwrap();
+        assert!(v.get("codex_home").is_none());
+    }
+
+    #[test]
     fn the_team_reply_names_the_team_by_id_and_name() {
         let t = TeamInfo {
             id: "00112233445566778899aabbccddeeff".into(),
@@ -563,5 +621,26 @@ mod tests {
         // Anything else, and every success, has none.
         assert_eq!(reply("this sign-in proof expired; sign in again").get("code"), None);
         assert_eq!(serde_json::to_value(Reply::ok(7, serde_json::json!(1))).unwrap().get("code"), None);
+    }
+
+    #[test]
+    fn send_codes_follow_the_typed_phase_and_preserve_the_error_chain() {
+        for not_dispatched in [true, false] {
+            let cause = anyhow::anyhow!("disk full").context("saving receipt");
+            let text = format!("{cause:#}");
+            let error: anyhow::Error = SendError { cause, not_dispatched }.into();
+            assert_eq!(format!("{error:#}"), text);
+            let reply = serde_json::to_value(Reply::err(7, error)).unwrap();
+            assert_eq!(reply["error"], text);
+            assert_eq!(reply.get("code").and_then(Value::as_str), not_dispatched.then_some("send_not_dispatched"));
+        }
+        // A send failure cannot acquire a team or retry code from text in an underlying error.
+        for text in ["send_not_dispatched", "alex is already in this team", crate::team::SAME_ACCOUNT] {
+            let error = SendError { cause: anyhow::anyhow!(text), not_dispatched: false };
+            let reply = serde_json::to_value(Reply::err(7, error.into())).unwrap();
+            assert_eq!(reply["error"], text);
+            assert_eq!(reply.get("code"), None);
+        }
+        assert_eq!(Reply::err(7, anyhow::anyhow!("send_not_dispatched")).code, None);
     }
 }

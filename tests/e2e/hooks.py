@@ -2,7 +2,7 @@
 
     cargo build && python3 tests/e2e/hooks.py
 """
-import base64, json, os, re, socket, subprocess, tempfile, threading, time
+import base64, json, os, re, socket, sqlite3, subprocess, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BIN = os.path.join(ROOT, "target", "debug", "reason-network")
@@ -132,7 +132,14 @@ hook("gemini", "session-start", gem)
 gem_name = next(w for w in run("who").split() if w.endswith("-gemini"))
 run("send", gem_name, "gemini: run the tests")
 out = hook("gemini", "stop", gem)
-check("gemini stop → decision block with the message", '"decision":"block"' in out and "run the tests" in out, out)
+try:
+    gem_stop = json.loads(out)
+except ValueError:
+    gem_stop = {}
+if not isinstance(gem_stop, dict):
+    gem_stop = {}
+# AfterAgent continues with a deny, the mail as its reason.
+check("gemini stop → decision deny with the message", gem_stop.get("decision") == "deny" and "run the tests" in str(gem_stop.get("reason")), out)
 
 # Copilot: camelCase sessionId
 cop = {"sessionId": "p-1", "cwd": proj, "timestamp": 1}
@@ -433,7 +440,20 @@ claude_proc.kill()
 
 # Pushing through Claude Code's MCP server, whenever Claude Code lists its inbox in its registry: before the server
 # starts, after its first tool call, or right after `tools/list` (the call at once, or 3 s later). Every message is
-# either put into the inbox or left unread, and the sender is told which.
+# either put into the inbox or left unread, and the sender is told which. The adapter taking a message is not its
+# handoff: that is confirmed once its server has put it in the inbox (`Request::Delivered`), which marks the receipt.
+PENDING = "accepted by the delivery adapter; waiting for its handoff acknowledgment"
+def handed_off(out, secs=0):
+    m = re.search(r"message id (\S+)", out)
+    deadline = time.time() + secs
+    while True:
+        db = sqlite3.connect(f"file:{os.path.join(env['REASON_NETWORK_HOME'], 'network.db')}?mode=ro", uri=True, timeout=10)
+        row = m and db.execute("SELECT stage FROM sent_receipts WHERE id = ?", (m.group(1),)).fetchone()
+        db.close()
+        if (row and row[0] == "handed_to_agent") or time.time() >= deadline:
+            return bool(row and row[0] == "handed_to_agent")
+        time.sleep(0.2)
+
 def push_case(name, when):
     proj = os.path.join(D, f"push-{name}")
     os.makedirs(proj)
@@ -477,20 +497,26 @@ def push_case(name, when):
         time.sleep(3)
     time.sleep(2)
     got = "".join(frames)
+    # Read before check_inbox: reading unread mail through the tool hands it to the agent too.
+    before = {body: handed_off(out, 5 if body in got else 0) for body, out in sent.items()}
     rpc(p, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "check_inbox", "arguments": {}}})
     unread = json.dumps(reply(p, 4))
     for body, out in sent.items():
-        # Told it was delivered, it is in the inbox. Told it was queued, it is unread, or went in once the inbox was
-        # known: never lost, never claimed.
-        told_delivered = "delivered into the session" in out
-        check(f"push, inbox listed {when}: '{body}' reached the session as the sender was told ({'delivered' if told_delivered else 'queued'})",
-              (body in got) if told_delivered else ("queued" in out and (body in unread) != (body in got)),
-              f"send said: {out}\ninbox got: {got[-400:]}\nunread: {unread[-400:]}")
-    # Once Claude Code has listed it, the inbox is used.
+        # Told it was delivered, it is in the inbox. Told the adapter took it, or that it was queued, it is in the inbox
+        # or unread: never lost. And its receipt says handed to the agent only once the inbox or check_inbox has it.
+        told = ("delivered" if "delivered into the session" in out else "handoff pending" if PENDING in out
+                else "queued" if "queued" in out else "unknown")
+        handed = handed_off(out)
+        check(f"push, inbox listed {when}: '{body}' reached the session as the sender was told ({told})",
+              told != "unknown" and ((body in got) if told == "delivered" else (body in unread) != (body in got))
+              and before[body] == (body in got) and handed == ((body in got) or (body in unread)),
+              f"send said: {out}\nhanded to agent: {before[body]}, after check_inbox: {handed}\ninbox got: {got[-400:]}\nunread: {unread[-400:]}")
+    # Once Claude Code has listed it, the inbox is used, and the handoff is confirmed.
     body = f"push {name} last"
     out = run("send", to, body)
     time.sleep(2)
-    check(f"push, inbox listed {when}: once listed, mail goes into it", "delivered into the session" in out and body in "".join(frames),
+    check(f"push, inbox listed {when}: once listed, mail goes into it",
+          ("delivered into the session" in out or PENDING in out) and body in "".join(frames) and handed_off(out, 5),
           out + "".join(frames)[-300:])
     p.kill()
     proc.kill()
