@@ -445,7 +445,7 @@ mod tests {
             .output();
         let _ = std::fs::remove_dir_all(&dir);
         let output = result.unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]
