@@ -54,15 +54,25 @@ impl Daemon {
     fn register_quiet(
         &self,
         conn: Option<u64>,
+        reg: SessionReg,
+        git: GitInfo,
+    ) -> Result<(Registered, (String, Vec<Message>))> {
+        self.register_among(conn, reg, git, self.my_names_elsewhere(util::now_ms()))
+    }
+
+    /// `register_quiet`, with `others`, my session names on my other machines.
+    fn register_among(
+        &self,
+        conn: Option<u64>,
         mut reg: SessionReg,
         git: GitInfo,
+        others: Elsewhere,
     ) -> Result<(Registered, (String, Vec<Message>))> {
         // Every session comes in here: one in a folder that is off never does.
         if self.cfg.off_in(&reg.cwd) {
             bail!(OFF_HERE);
         }
         let now = util::now_ms();
-        let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
@@ -127,17 +137,15 @@ impl Daemon {
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
             // Its title named it before this daemon started (an update restarts it), or before it went offline: the
             // default name it went by is still its own (see `Live::former`), unless another session has taken it since.
-            let former = match g.store.session_by_key(&key)? {
-                Some(r) if r.name == name => match g.store.former(&key)? {
+            // By its key: also when it comes back under another name (its own was taken on another of my machines).
+            let former = match g.store.former(&key)? {
+                Some((f, told))
+                    if f != name
+                        && g.live_called(&f).is_none()
+                        && g.store.session_by_name(&f)?.is_some_and(|o| o.key == key) =>
+                {
                     Some((f, told))
-                        if f != name
-                            && g.live_called(&f).is_none()
-                            && g.store.session_by_name(&f)?.is_some_and(|o| o.key == key) =>
-                    {
-                        Some((f, told))
-                    }
-                    _ => None,
-                },
+                }
                 _ => None,
             };
             if reg.name.is_some() {
@@ -1821,6 +1829,57 @@ mod tests {
         // Without word of where it went, a reply from another of Bob's chats is not the one it waits for.
         d.receive(bob.public(), reply(other, "bob/web-fix")).unwrap();
         assert_ne!(stage(other), "replied");
+        // The word comes after the reply (Bob's machine flushed its outbox first on a reconnect): the reply counts then.
+        d.readdressed(&bob.public(), other, "bob/web-fix");
+        assert_eq!(stage(other), "replied");
+        // A reply from elsewhere doesn't, whenever the word comes.
+        let late = "01JA0000000000000000000003";
+        d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(late), "bob/web-claude", "queued").unwrap();
+        d.receive(bob.public(), reply(late, "bob/web-other")).unwrap();
+        d.readdressed(&bob.public(), late, "bob/web-fix");
+        assert_ne!(stage(late), "replied");
+    }
+
+    #[test]
+    fn mail_to_an_old_name_that_is_to_be_tried_again_says_nothing_of_where_it_went() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        // Bob has sent all the files this machine takes from him in an hour.
+        let hour = crate::files::QUOTA_SENDER_HOUR;
+        d.inner.lock().unwrap().quota.admit("bob", hour, 0, 0, std::time::Instant::now()).unwrap();
+        let file = crate::proto::Attachment { name: "log.txt".into(), content: "x".into(), path: None };
+        let msg = Message { files: vec![file], ..from_bob(&d, "api-claude") };
+        let (state, note, to) = d.receive_readdressed(bob.public(), msg).unwrap();
+        // Tried again later, when the name may be another chat's: Bob's receipt keeps the name it was sent to.
+        assert_eq!((state.as_str(), to), ("retry", None), "{note}");
+    }
+
+    #[test]
+    fn a_titled_chat_back_under_another_name_keeps_its_old_one() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        restart(&d);
+        // Its name now is live on another of my machines: it comes back with a suffix, asking for that name.
+        let others = Elsewhere { live: HashSet::from([TITLED.to_string()]), ..Default::default() };
+        let reg = SessionReg { name: Some(TITLED.into()), ..claude("a") };
+        let suffixed = format!("{TITLED}-2");
+        let name = d.register_among(Some(conn_of(&reg.key)), reg, GitInfo::default(), others).unwrap().0.name;
+        assert_eq!(name, suffixed);
+        // Its old name is still its own, live as remembered.
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude"));
+        assert_eq!(
+            d.inner.lock().unwrap().store.former("claude-code:a").unwrap().map(|f| f.0).as_deref(),
+            Some("api-claude")
+        );
+        // Bob's mail to it is taken as mail to the live chat is.
+        let (state, note, to) = d.receive_readdressed(bob.public(), from_bob(&d, "api-claude")).unwrap();
+        assert_eq!(to, Some(d.addr(&suffixed)), "{note}");
+        assert_eq!(d.receive(bob.public(), from_bob(&d, &suffixed)).unwrap().0, state);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr(&suffixed)).unwrap(), 2);
     }
 
     #[tokio::test]

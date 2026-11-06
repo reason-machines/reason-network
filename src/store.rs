@@ -400,11 +400,23 @@ impl Store {
 
     /// The machine that took message `id` delivered it to `to`, the name the session it was sent to (at `from`, the
     /// default name it went by before its title named it) goes by now: a reply from there is the one it waits for.
+    /// A reply from there that came before this (its machine sent it first, as it flushed its outbox on a reconnect)
+    /// counts now, checked as `observe_reply` checks one.
     pub fn readdress_receipt(&self, id: &str, from: &str, to: &str) -> Result<()> {
-        self.db.execute(
+        let transaction = self.db.unchecked_transaction()?;
+        let n = transaction.execute(
             "UPDATE sent_receipts SET recipient = ?3 WHERE id = ?1 AND recipient = ?2",
             params![id, from, to],
         )?;
+        if n > 0 {
+            transaction.execute(
+                "UPDATE sent_receipts SET stage = 'replied', updated_at = ?2 WHERE id = ?1 AND stage <> 'replied' \
+                 AND EXISTS (SELECT 1 FROM messages m WHERE m.reply_to = ?1 AND m.held = 0 \
+                 AND m.sender = sent_receipts.recipient AND m.recipient = sent_receipts.sender)",
+                params![id, crate::util::now_ms()],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 

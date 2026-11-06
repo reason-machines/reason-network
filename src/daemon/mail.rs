@@ -924,13 +924,13 @@ impl Daemon {
                 _ => name,
             };
             let name = name.as_str();
-            if msg.to != asked {
-                *to = Some(msg.to.clone());
-            }
+            // Where it went, said only once it is taken (or was already): not for a refusal or a "retry".
+            let went = (msg.to != asked).then(|| msg.to.clone());
             if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }
             if g.store.has(&msg.id)? {
+                *to = went;
                 return Ok(("queued".into(), "already delivered".into()));
             }
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
@@ -953,6 +953,7 @@ impl Daemon {
                 let note = format!("refused: agents message one of {}'s sessions, not a group", self.person);
                 return Ok(("refused".into(), note));
             }
+            *to = went;
             // Each machine has its own terminal: replies go back to the one this came from.
             msg.from = render::shown_from(&msg.from, &machine);
             // A held message's files are saved only once the person approves it.

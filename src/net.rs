@@ -1151,7 +1151,8 @@ impl Net {
                 let _ = tx.send(Wire::Ack { id, state, note, to });
             }
             Wire::Ack { id, state, note, to } => {
-                if let Some(to) = to.filter(|_| state != "refused") {
+                // Only once it was taken: a "retry" may go elsewhere next time, or nowhere.
+                if let Some(to) = to.filter(|_| state != "refused" && state != "retry") {
                     daemon.readdressed(&peer, &id, &to);
                 }
                 // "retry": the other side is busy; keep it in the outbox for the next flush.
