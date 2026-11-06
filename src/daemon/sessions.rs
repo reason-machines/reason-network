@@ -282,6 +282,18 @@ impl Daemon {
         name: Option<String>,
         rename: Rename,
     ) -> Result<Registered> {
+        self.set_status_quiet(key, doing, name, rename).map(|(r, _)| r)
+    }
+
+    /// Also tells the caller to deliver pending mail after a reclaim, as registering does.
+    /// A push session may never check an inbox or run another hook.
+    pub(super) fn set_status_quiet(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        rename: Rename,
+    ) -> Result<(Registered, bool)> {
         let now = util::now_ms();
         let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
@@ -348,7 +360,7 @@ impl Daemon {
         } else {
             g.store.unread_count(&address)?
         };
-        Ok(Registered { name, unread, address })
+        Ok((Registered { name, unread, address }, reclaim))
     }
 
     pub(super) fn unread(&self, key: &str) -> Result<Unread> {

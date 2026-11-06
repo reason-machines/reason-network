@@ -73,6 +73,7 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
   this computer. The CLI sets `reclaim` on its local `SetStatus` request. A relay retrying a hosted assistant's name
   leaves that flag unset, so the offline owner keeps its name and mail.
   After a reclaim, both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
+  Wake mail is delivered as on registration. FYI mail waits for its next natural pause.
   The former owner gets a free name if it resumes. Live names, names kept on other machines, and permanent mailboxes
   cannot be reclaimed. During the first six hours after daemon startup, the old owner must have been seen live by
   this daemon and gone offline again. Startup grace uses the daemon's monotonic clock so changing the system time

@@ -6,7 +6,7 @@
 Needs internet for the other machines (iroh relays/discovery). With an older build, it also checks terminals with an
 older engine in the team.
 """
-import json, os, re, subprocess, sys, tempfile, time
+import json, os, re, socket, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofs import TRUST, proof, serve_relay_lists
 
@@ -222,6 +222,45 @@ try:
     out = zed.tool("check_inbox", {})
     check("…and one does", "for whoever runs zed here" in out, out)
     zed.close()
+
+    # A push session gets reclaimed mail through its MCP server without calling an inbox or running a hook.
+    old = Mcp("one", "claude-code", CLAUDE_CODE_SESSION_ID="push-old")
+    try:
+        old.tool("list_team", {})
+        out = cli("one", "status", "--name", "push-handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="push-old")
+        check("the former push owner names itself", "You are lars/push-handoff." in out, out)
+    finally:
+        old.close()
+    until(lambda: cli("one", "who"), lambda o: "push-handoff" not in o)
+    out = cli("one", "send", "push-handoff", "waiting for the push replacement")
+    check("the message waits for the offline push owner", "it reaches that session when it's back" in out, out)
+    with socket.socket(socket.AF_UNIX) as inbox:
+        path = os.path.join(D, "push.sock")
+        inbox.bind(path)
+        inbox.listen(1)
+        inbox.settimeout(5)
+        replacement = Mcp("one", "claude-code", CLAUDE_CODE_SESSION_ID="push-new",
+                          CLAUDE_CODE_MESSAGING_SOCKET=path)
+        try:
+            replacement.tool("list_team", {})
+            out = cli("one", "status", "--name", "push-handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="push-new")
+            check("the push session reclaims the name", "You are lars/push-handoff." in out, out)
+            try:
+                connection, _ = inbox.accept()
+                with connection:
+                    connection.settimeout(5)
+                    with connection.makefile() as frames:
+                        pushed = frames.read()
+            except socket.timeout:
+                pushed = ""
+            check("the MCP server pushes reclaimed mail into the session without an inbox check",
+                  "waiting for the push replacement" in pushed, pushed)
+            replacement.tool("send_message", {"to": "lars/terminal", "message": "answer from the push replacement"})
+            out = cli("one", "listen", "--as", "terminal", "--wait", "5")
+            check("the sender receives the replacement's reply from its reclaimed address",
+                  "answer from the push replacement" in out and "lars/push-handoff" in out, out)
+        finally:
+            replacement.close()
 
     # --- two machines of the same person ---
     link = re.search(r"https://\S+/join/#\S+", cli("one", "link")).group(0)

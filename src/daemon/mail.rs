@@ -1485,8 +1485,11 @@ mod tests {
             let (d, address, ids) = codex_queue_in_flight().await;
             d.register(Some(2), gemini("gemini:new"), crate::git::GitInfo::default()).unwrap();
             let name = address.split_once('/').unwrap().1;
-            let new = d.set_status("gemini:new", None, Some(name.into()), Rename::Explicit).unwrap();
-            assert_eq!((new.address, new.unread), (address, 0));
+            let req =
+                Request::SetStatus { key: "gemini:new".into(), doing: None, name: Some(name.into()), reclaim: true };
+            let new = d.handle(2, req).await.unwrap();
+            assert_eq!(new["address"], address);
+            assert_eq!(new["unread"], 0);
             assert!(d.inbox("gemini:new".into(), 0, false).await.unwrap().messages.is_empty());
             let mut waiting = Box::pin(d.inbox("gemini:new".into(), 10, false));
             assert!(futures_lite::future::poll_once(&mut waiting).await.is_none());
@@ -1921,6 +1924,43 @@ mod tests {
         assert!(got.is_empty());
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(d.inner.lock().unwrap().store.unread(&old).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaim_pushes_waiting_mail_to_the_replacements_connection() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+        let old = SessionReg { name: Some("handoff".into()), ..gemini("gemini:old") };
+        let address = d.register(Some(2), old, crate::git::GitInfo::default()).unwrap().address;
+        d.drop_conn(2);
+        let sent =
+            d.send("codex:sender".into(), &address, "waiting message", None, true, false, None, vec![]).await.unwrap();
+        assert_eq!(sent.recipients[0].state, "queued");
+        let fyi = d
+            .send("codex:sender".into(), &address, "for a natural pause", None, false, false, None, vec![])
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let key = "claude-code:new";
+        let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex(key) };
+        d.register(Some(7), reg, crate::git::GitInfo::default()).unwrap();
+        let rename =
+            || Request::SetStatus { key: key.into(), doing: None, name: Some("handoff".into()), reclaim: true };
+        // The CLI uses a different connection from the session's MCP server.
+        let reply = d.handle(9, rename()).await.unwrap();
+        assert_eq!(reply["address"], address);
+        assert_eq!(reply["unread"], 2);
+        let Event::Deliver { key: recipient, ids, text } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(recipient, key);
+        assert_eq!(ids, sent.ids);
+        assert!(text.contains("waiting message") && !text.contains("for a natural pause"));
+        d.handle(9, rename()).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        d.handle(7, Request::Delivered { key: key.into(), ids }).await.unwrap();
+        let inbox = d.inbox(key.into(), 0, false).await.unwrap();
+        assert_eq!(inbox.messages.into_iter().map(|m| m.id).collect::<Vec<_>>(), fyi.ids);
     }
 
     #[tokio::test]
