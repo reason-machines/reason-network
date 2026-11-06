@@ -119,6 +119,7 @@ impl Daemon {
                 l.git = git;
             }
             l.reg.pid = reg.pid.or(l.reg.pid);
+            l.reg.claude_dir = reg.claude_dir.or(l.reg.claude_dir.take());
         } else {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
@@ -154,6 +155,8 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
+                    codex_home: None,
+                    introduced: false,
                 },
             );
             self.presence_changed();
@@ -360,8 +363,21 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
-            h;
+        let HookCall {
+            agent,
+            event,
+            session_id,
+            cwd,
+            pid,
+            mail,
+            transcript,
+            doing,
+            name,
+            dirs,
+            keep,
+            through_reason,
+            codex_home,
+        } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
@@ -423,6 +439,7 @@ impl Daemon {
                 pid,
                 tier: Tier::Pull,
                 name,
+                claude_dir: None,
             };
             self.register_quiet(None, reg, git)?;
         }
@@ -439,9 +456,18 @@ impl Daemon {
         }
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        // A Codex thread that starts again gets another try at `codex queue` once it is offline again.
+        if event == "start" {
+            g.codex_failed.remove(&key);
+        }
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {
             l.transcript = Some(t.into());
+        }
+        // Kept with the session too: mail reaches it through that home while it is offline.
+        if agent == "codex" && l.codex_home != codex_home {
+            l.codex_home = codex_home;
+            g.store.remember_codex_home(&key, l.codex_home.as_deref())?;
         }
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
@@ -489,7 +515,15 @@ impl Daemon {
             self.reached(g, &key);
         }
         let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
+        let intro = text.is_none()
+            && if agent == "antigravity" {
+                matches!(event, "start" | "prompt")
+                    && g.live.get_mut(&key).is_some_and(|l| !std::mem::replace(&mut l.introduced, true))
+            } else {
+                event == "start"
+            };
+        Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -750,6 +784,7 @@ mod tests {
             pid: None,
             tier: Tier::Push,
             name: None,
+            claude_dir: None,
         }
     }
 
@@ -762,7 +797,19 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: name.map(str::to_string),
+            claude_dir: None,
         }
+    }
+
+    #[test]
+    fn registering_again_without_a_claude_dir_keeps_the_one_it_had() {
+        let d = super::super::test_daemon(Default::default());
+        let b = SessionReg { claude_dir: Some("/home/u/.claude-b".into()), ..claude("b") };
+        d.register_quiet(Some(1), b, GitInfo::default()).unwrap();
+        // A hook or the scan registers it again, knowing nothing of its Claude directory.
+        d.register_quiet(None, claude("b"), GitInfo::default()).unwrap();
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live["claude-code:b"].reg.claude_dir.as_deref(), Some("/home/u/.claude-b"));
     }
 
     /// Registers a session through an MCP server of its own, as Claude Code runs one per session; a `cli` one as
@@ -878,6 +925,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         d.hook(doing).await.unwrap();
         let old = Remembered {
@@ -927,6 +975,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
@@ -938,6 +987,50 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    #[tokio::test]
+    async fn an_antigravity_conversation_hears_who_it_is_once_not_before_every_invocation() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "antigravity".into(),
+            event: event.into(),
+            session_id: "c1".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            codex_home: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "prompt", "stop", "prompt", "start"] {
+            seen.push(d.hook(call(event)).await.unwrap().intro);
+        }
+        assert_eq!(seen, [Some(true), Some(false), Some(false), Some(false), Some(false), Some(false), Some(false)]);
+        // Mail it is handed is not the introduction, so that doesn't use it up.
+        let call = |event: &str| HookCall { session_id: "c2".into(), ..call(event) };
+        d.hook(call("tool")).await.unwrap();
+        let name = d.inner.lock().unwrap().live["antigravity:c2"].name.clone();
+        mail(&d, "m1", &name);
+        let handed = d.hook(call("prompt")).await.unwrap();
+        assert!(handed.text.is_some());
+        assert_eq!(handed.intro, Some(false));
+        let next = d.hook(call("prompt")).await.unwrap();
+        assert!(next.text.is_none());
+        assert_eq!(next.intro, Some(true));
+        assert_eq!(d.hook(call("prompt")).await.unwrap().intro, Some(false));
+        // Other agents are told at session start, as before.
+        let claude = |event: &str| HookCall { agent: "claude-code".into(), session_id: "c3".into(), ..call(event) };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            seen.push(d.hook(claude(event)).await.unwrap().intro == Some(true));
+        }
+        assert_eq!(seen, [true, false, false, false, true]);
     }
 
     #[tokio::test]
@@ -959,6 +1052,7 @@ mod tests {
                 name: None,
                 dirs: Vec::new(),
                 keep: false,
+                codex_home: None,
             })
             .await
             .unwrap();
@@ -1055,6 +1149,7 @@ mod tests {
             name: Some(id.into()),
             dirs: Vec::new(),
             keep,
+            codex_home: None,
         };
         // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
         d.hook(cli("ask-1a2b3c", false)).await.unwrap();
@@ -1213,6 +1308,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
         assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
@@ -1246,6 +1342,7 @@ mod tests {
             name: None,
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         }
     }
 
@@ -1585,6 +1682,7 @@ mod tests {
             name: Some("terminal".into()),
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
@@ -1684,6 +1782,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         let err = d.register_quiet(None, reg("codex:1", "/work/private/notes"), GitInfo::default()).unwrap_err();
         assert_eq!(err.to_string(), OFF_HERE);
@@ -1705,6 +1804,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         // Claude Code's `/clear`: its MCP server now registers the new conversation.
         assert_eq!(
@@ -1761,6 +1861,7 @@ mod tests {
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
             keep: false,
+            codex_home: None,
         };
         // Working in /work/api, with /work/private open too.
         let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();
@@ -1775,6 +1876,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
         // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.

@@ -296,6 +296,8 @@ impl Store {
             ("native_app", "INTEGER NOT NULL DEFAULT 0"),
             ("native_hook_at", "INTEGER"),
             ("native_dirs", "TEXT NOT NULL DEFAULT '[]'"),
+            // The `CODEX_HOME` a Codex session's hooks named, for mail to reach it while it is offline.
+            ("codex_home", "TEXT"),
         ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
@@ -674,7 +676,8 @@ impl Store {
                  mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
                  native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
                  native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
-                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END"
+                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
+                 codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END"
             ),
             params![
                 s.name,
@@ -763,6 +766,17 @@ impl Store {
         let mut st = self.db.prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY name"))?;
         let rows = st.query_map([], remembered)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `CODEX_HOME` the hooks of the Codex session `key` run with (`None`: the default home).
+    pub fn remember_codex_home(&self, key: &str, home: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE sessions SET codex_home=?2 WHERE key=?1 AND agent='codex'", params![key, home])?;
+        Ok(())
+    }
+
+    pub fn codex_home(&self, key: &str) -> Result<Option<String>> {
+        let sql = "SELECT codex_home FROM sessions WHERE key=?1 AND agent='codex' ORDER BY last_seen DESC LIMIT 1";
+        Ok(self.db.query_row(sql, [key], |r| r.get(0)).optional()?.flatten())
     }
 
     pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>, dirs: &[String]) -> Result<()> {
@@ -1084,6 +1098,31 @@ mod tests {
         store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
         assert_eq!(totals(&store), (1, 1));
         std::fs::remove_dir_all(&inbox).unwrap();
+    }
+
+    #[test]
+    fn a_codex_sessions_home_stays_with_it_and_never_goes_to_the_next_session_with_its_name() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = |key: &str| Remembered {
+            name: "api-codex".into(),
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen: 1,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&session("codex:t1"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap(), None);
+        store.remember_codex_home("codex:t1", Some("/work/.codex-b")).unwrap();
+        store.upsert_session(&Remembered { last_seen: 2, ..session("codex:t1") }, "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap().as_deref(), Some("/work/.codex-b"));
+        store.upsert_session(&session("codex:t2"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t2").unwrap(), None);
     }
 
     #[test]

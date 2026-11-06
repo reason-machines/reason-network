@@ -145,6 +145,9 @@ pub struct Daemon {
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
+    /// Agent CLIs a test runs in place of the ones on this machine.
+    #[cfg(test)]
+    fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
 }
 
 struct Inner {
@@ -168,6 +171,9 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
+    /// their next SessionStart or a `codex queue` that works.
+    codex_failed: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -200,6 +206,10 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// The `CODEX_HOME` a Codex session's hooks run with; `None` for the default home (and other agents).
+    codex_home: Option<String>,
+    /// Its hooks have already said who it is on Reason Network (Antigravity hooks run before every invocation).
+    introduced: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -258,6 +268,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                codex_failed: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -269,7 +280,18 @@ impl Daemon {
             started: util::now_ms(),
             plain_until: Mutex::new(None),
             capped: Default::default(),
+            #[cfg(test)]
+            fake_bins: Default::default(),
         })
+    }
+
+    /// The agent's own CLI `bin` on this machine (in a test, its fake).
+    fn agent_bin(&self, bin: &str) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_bins.lock().unwrap().get(bin) {
+            return Some(fake.clone());
+        }
+        crate::agent::find_bin(bin)
     }
 
     fn addr(&self, name: &str) -> String {

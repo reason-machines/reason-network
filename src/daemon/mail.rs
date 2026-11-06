@@ -34,13 +34,17 @@ const LOOP_WINDOW: Duration = Duration::from_secs(600);
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
 /// How often a Codex session's rollout is checked while mail waits for a hook of its turn.
 const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
+/// An offline Codex thread seen within this long gets its wake mail through `codex queue`, so the first message starts
+/// a turn when the thread is resumed (Codex runs no hook before then). One gone longer waits for its next turn.
+const CODEX_RESUME_MS: i64 = 24 * 3_600_000;
 
 /// How a session on this machine gets a message into its conversation.
 enum Channel {
     /// Its `reason network mcp` posts into Claude Code's session socket.
     ClaudeSocket(u64),
-    /// The agent's own CLI: `codex queue --thread <id> --message`, `reason session send <id> --message`.
-    Command(&'static str, Vec<String>),
+    /// The agent's own CLI: `codex queue --thread <id> --message`, `reason session send <id> --message`. With the
+    /// `CODEX_HOME` the session's hooks run with, if not the default.
+    Command(&'static str, Vec<String>, Option<String>),
     /// Straight into a Claude Code session's messaging socket (one without Reason Network's tools: it replies with the CLI).
     ClaudeDirect(agent::ClaudeSocket),
     /// Hooks inject it at the next tool call or turn end.
@@ -55,6 +59,16 @@ impl Inner {
         self.in_flight.retain(|_, at| at.elapsed() < IN_FLIGHT_TTL);
         let msgs = self.store.unread(address)?;
         Ok(msgs.into_iter().filter(|m| !self.in_flight.contains_key(&m.id)).collect())
+    }
+
+    /// The Codex thread an offline session's wake mail is queued into, with the `CODEX_HOME` its hooks named: only a
+    /// Codex thread seen within [`CODEX_RESUME_MS`], checked when the mail is sent.
+    fn resumable_codex(&self, r: &Remembered, wake: bool, now: i64) -> Option<(String, Option<String>)> {
+        let thread = r.key.strip_prefix("codex:").filter(|t| !t.is_empty())?;
+        if !wake || r.agent != "codex" || now - r.last_seen > CODEX_RESUME_MS {
+            return None;
+        }
+        Some((thread.to_string(), self.store.codex_home(&r.key).ok().flatten()))
     }
 
     /// Records an agent-to-agent message; false if this pair has been talking suspiciously much.
@@ -76,6 +90,22 @@ impl Inner {
     }
 }
 
+/// The command that hands `text` to `program` (`args` end with its message flag). With `codex_home`, it talks to that
+/// home's Codex app-server, not the one of the daemon's own `CODEX_HOME`.
+fn handoff_command(
+    program: std::process::Command,
+    args: &[String],
+    text: &str,
+    codex_home: Option<&str>,
+) -> tokio::process::Command {
+    let mut command = crate::util::no_window(tokio::process::Command::from(program));
+    command.args(args).arg(text).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    if let Some(home) = codex_home {
+        command.env("CODEX_HOME", home);
+    }
+    command
+}
+
 /// A message to send to a teammate's machine now: where its result goes, the machine, its name, whether it is
 /// connected, and the message.
 type RemoteJob = (usize, EndpointId, String, bool, Message);
@@ -85,6 +115,11 @@ const UPGRADE: &str =
 
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
+
+/// `codex queue`'s arguments for `thread`, up to its message flag.
+fn codex_queue(thread: &str) -> Vec<String> {
+    vec!["queue".into(), "--thread".into(), thread.into(), "--message".into()]
+}
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
 /// it was last seen, unless it is one of the person's own mailboxes (`terminal`, `listen --as`), which are kept. Until then it waits for
@@ -376,9 +411,9 @@ impl Daemon {
                     }
                     Target::Session { key: None, address } => {
                         let name = address.split_once('/').map_or("", |(_, n)| n);
-                        let note = offline_note(g.store.session_by_name(name)?.as_ref(), now);
+                        let r = g.store.session_by_name(name)?;
                         g.store.insert(&mut msg, false)?;
-                        ("queued".into(), note)
+                        self.deliver_offline(&mut g, r.as_ref(), vec![msg.clone()], wake)
                     }
                     Target::Remote { machine, .. } => {
                         let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE));
@@ -473,8 +508,8 @@ impl Daemon {
         wake: bool,
     ) -> (String, String) {
         if !g.live.contains_key(key) {
-            let note = offline_note(g.store.session_by_key(key).ok().flatten().as_ref(), util::now_ms());
-            return ("queued".into(), note);
+            let r = g.store.session_by_key(key).ok().flatten();
+            return self.deliver_offline(g, r.as_ref(), msgs, wake);
         }
         // Mail reached it: it is a session teammates talk to, whose name stays its own.
         self.reached(g, key);
@@ -489,7 +524,7 @@ impl Daemon {
         if l.reg.agent == "reason" && l.retry.is_some_and(|(at, _)| Instant::now() < at) {
             return ("queued".into(), "queued: Reason didn't take the last delivery; it is retried shortly".into());
         }
-        let has = |bin: &str| !l.push_failed && agent::find_bin(bin).is_some();
+        let has = |bin: &str| !l.push_failed && self.agent_bin(bin).is_some();
         // A Codex turn is running (and `codex queue` is there for when it ends).
         let codex_turn = l.reg.agent == "codex"
             && has("codex")
@@ -505,10 +540,10 @@ impl Daemon {
             // In a turn, its next PostToolUse (or Stop) shows it; `codex queue` would hold it until the turn ends.
             (Tier::Push, _, Some(_)) if codex_turn => Channel::Hook,
             (Tier::Push, _, Some(id)) if l.reg.agent == "codex" && has("codex") => {
-                Channel::Command("codex", vec!["queue".into(), "--thread".into(), id.clone(), "--message".into()])
+                Channel::Command("codex", codex_queue(id), l.codex_home.clone())
             }
             (Tier::Push, _, Some(id)) if l.reg.agent == "reason" && has("reason") => {
-                Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()])
+                Channel::Command("reason", vec!["session".into(), "send".into(), id.clone(), "--message".into()], None)
             }
             (Tier::Push, _, id) if l.reg.agent == agent::CLAUDE_CODE && !l.push_failed => {
                 match claude::socket_for(id.as_deref(), l.reg.pid) {
@@ -542,11 +577,11 @@ impl Daemon {
                 }
                 ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
             }
-            Channel::Command(bin, args) => {
+            Channel::Command(bin, args, codex_home) => {
                 for id in &ids {
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
-                self.send_with(bin, args, key.to_string(), ids, text);
+                self.send_with(bin, args, codex_home, key.to_string(), ids, text);
                 (
                     "pushed".into(),
                     format!(
@@ -572,6 +607,42 @@ impl Daemon {
             }
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
         }
+    }
+
+    /// Mail for a session here that is offline waits for it, except wake mail for a Codex thread seen within the last
+    /// day: that goes to `codex queue`, which holds it until the thread is resumed and then starts a turn with it. In
+    /// flight meanwhile, so the hooks of that turn don't show it again; if `codex queue` fails, they show it instead,
+    /// and that thread's mail waits for them until its next SessionStart or a `codex queue` that works. Never for a
+    /// thread in a folder that is off.
+    fn deliver_offline(
+        self: &Arc<Self>,
+        g: &mut Inner,
+        r: Option<&Remembered>,
+        msgs: Vec<Message>,
+        wake: bool,
+    ) -> (String, String) {
+        let now = util::now_ms();
+        let resumable = r
+            .filter(|r| !g.codex_failed.contains(&r.key))
+            .filter(|r| !self.cfg.off_in(&r.cwd) && !g.off.contains_key(&r.key))
+            .and_then(|r| Some((r, g.resumable_codex(r, wake, now)?)));
+        let Some((r, (thread, codex_home))) = resumable.filter(|_| self.agent_bin("codex").is_some()) else {
+            return ("queued".into(), offline_note(r, now));
+        };
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        for id in &ids {
+            g.in_flight.insert(id.clone(), Instant::now());
+        }
+        let text = render::for_agent(&msgs, Some(&r.agent), false);
+        self.send_with("codex", codex_queue(&thread), codex_home, r.key.clone(), ids, text);
+        let seen = util::ago(r.last_seen, now);
+        (
+            "pushed".into(),
+            format!(
+                "queued into the Codex thread, which is offline (last seen {seen} ago): it starts a turn when the \
+                 thread is resumed"
+            ),
+        )
     }
 
     /// Codex runs no Stop hook when a turn is interrupted or fails: until the turn `key` is in ends, checks its
@@ -683,18 +754,22 @@ impl Daemon {
         }
     }
 
-    /// Hands `text` to the agent's own CLI (`args` end with its message flag).
-    fn send_with(self: &Arc<Self>, bin: &'static str, args: Vec<String>, key: String, ids: Vec<String>, text: String) {
+    /// Hands `text` to the agent's own CLI (`args` end with its message flag), against `codex_home` if set.
+    fn send_with(
+        self: &Arc<Self>,
+        bin: &'static str,
+        args: Vec<String>,
+        codex_home: Option<String>,
+        key: String,
+        ids: Vec<String>,
+        text: String,
+    ) {
         let this = self.clone();
         tokio::spawn(async move {
             let run = async {
-                let program = agent::command_for(bin).ok_or_else(|| format!("{bin} not found"))?;
-                let out = crate::util::no_window(tokio::process::Command::from(program))
-                    .args(&args)
-                    .arg(&text)
-                    .stdin(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .output();
+                let program =
+                    this.agent_bin(bin).map(|b| agent::command_at(&b)).ok_or_else(|| format!("{bin} not found"))?;
+                let out = handoff_command(program, &args, &text, codex_home.as_deref()).output();
                 match tokio::time::timeout(Duration::from_secs(30), out).await {
                     Ok(Ok(o)) if o.status.success() => Ok(()),
                     Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
@@ -703,46 +778,55 @@ impl Daemon {
                 }
             };
             let res = run.await;
-            let mut g = this.inner.lock().unwrap();
-            for id in &ids {
-                g.in_flight.remove(id);
-            }
-            match res {
-                Ok(()) => {
-                    let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
-                    // A local native queue is an agent input handoff; the cloud command only acknowledges its server.
-                    if bin != "reason" {
-                        let _ = g.store.handoff(&changed, util::now_ms());
-                        for id in &changed {
-                            this.usage.stage(id, "delivered");
-                        }
-                    }
-                    if let Some(l) = g.live.get_mut(&key) {
-                        l.retry = None;
-                    }
-                }
-                // Reason has no hooks to fall back on: its sync pushes again, backing off (15 s doubling to 30 min).
-                Err(why) if bin == "reason" => {
-                    let who = this.logged(&g, &key);
-                    if let Some(l) = g.live.get_mut(&key) {
-                        if l.retry.is_none() {
-                            log(&format!("{bin} delivery to {who} failed ({why}); retrying with backoff"));
-                        }
-                        let wait =
-                            l.retry.map_or(Duration::from_secs(15), |(_, w)| (w * 2).min(Duration::from_secs(1800)));
-                        l.retry = Some((Instant::now() + wait, wait));
-                    }
-                }
-                Err(why) => {
-                    log(&format!("{bin} delivery to {} failed ({why}); falling back to hooks", this.logged(&g, &key)));
-                    // Hooks (or check_inbox) show it instead; tell senders the truth from now on.
-                    if let Some(l) = g.live.get_mut(&key) {
-                        l.push_failed = true;
-                        l.reg.tier = Tier::Turn;
-                    }
-                }
-            }
+            this.handed(bin, &key, &ids, res);
         });
+    }
+
+    /// What came of handing `ids` to `bin` for `key`: read once it took them, else unread again for its hooks to show.
+    fn handed(&self, bin: &str, key: &str, ids: &[String], res: std::result::Result<(), String>) {
+        let mut g = self.inner.lock().unwrap();
+        for id in ids {
+            g.in_flight.remove(id);
+        }
+        if bin == "codex" && res.is_ok() {
+            g.codex_failed.remove(key);
+        } else if bin == "codex" {
+            g.codex_failed.insert(key.to_string());
+        }
+        match res {
+            Ok(()) => {
+                let changed = g.store.mark_read(ids, util::now_ms()).unwrap_or_default();
+                // A local native queue is an agent input handoff; the cloud command only acknowledges its server.
+                if bin != "reason" {
+                    let _ = g.store.handoff(&changed, util::now_ms());
+                    for id in &changed {
+                        self.usage.stage(id, "delivered");
+                    }
+                }
+                if let Some(l) = g.live.get_mut(key) {
+                    l.retry = None;
+                }
+            }
+            // Reason has no hooks to fall back on: its sync pushes again, backing off (15 s doubling to 30 min).
+            Err(why) if bin == "reason" => {
+                let who = self.logged(&g, key);
+                if let Some(l) = g.live.get_mut(key) {
+                    if l.retry.is_none() {
+                        log(&format!("{bin} delivery to {who} failed ({why}); retrying with backoff"));
+                    }
+                    let wait = l.retry.map_or(Duration::from_secs(15), |(_, w)| (w * 2).min(Duration::from_secs(1800)));
+                    l.retry = Some((Instant::now() + wait, wait));
+                }
+            }
+            Err(why) => {
+                log(&format!("{bin} delivery to {} failed ({why}); falling back to hooks", self.logged(&g, key)));
+                // Hooks (or check_inbox) show it instead; tell senders the truth from now on.
+                if let Some(l) = g.live.get_mut(key) {
+                    l.push_failed = true;
+                    l.reg.tier = Tier::Turn;
+                }
+            }
+        }
     }
 
     /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
@@ -839,7 +923,7 @@ impl Daemon {
                 ),
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
-                None => ("queued".into(), offline_note(remembered.as_ref(), util::now_ms())),
+                None => self.deliver_offline(&mut g, remembered.as_ref(), vec![msg.clone()], msg.wake),
             };
             if msg.notify { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
         };
@@ -1074,6 +1158,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         d.register(Some(1), reg("codex:1", "/work/api"), crate::git::GitInfo::default()).unwrap();
         let to = d.register(Some(2), reg("codex:2", "/work/web"), crate::git::GitInfo::default()).unwrap().address;
@@ -1094,7 +1179,13 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         }
+    }
+
+    /// Not Codex: mail for it while it is offline only waits (see `deliver_offline`).
+    fn gemini(key: &str) -> SessionReg {
+        SessionReg { agent: "gemini".into(), ..codex(key) }
     }
 
     fn disk_daemon() -> (Arc<Daemon>, rusqlite::Connection, std::path::PathBuf) {
@@ -1269,6 +1360,324 @@ mod tests {
         name
     }
 
+    /// A Codex thread's hook, run with `CODEX_HOME` set to `home`.
+    fn codex_hook(thread: &str, event: &str, home: Option<&str>) -> HookCall {
+        HookCall {
+            through_reason: Some(false),
+            agent: "codex".into(),
+            event: event.into(),
+            session_id: thread.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            keep: false,
+            name: None,
+            dirs: Vec::new(),
+            codex_home: home.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_codex_queue_command_runs_against_the_home_the_sessions_hooks_named() {
+        let args = |c: &tokio::process::Command| c.as_std().get_args().map(|a| a.to_owned()).collect::<Vec<_>>();
+        let env = |c: &tokio::process::Command| {
+            c.as_std().get_envs().find(|(k, _)| *k == "CODEX_HOME").and_then(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        let program = || std::process::Command::new("codex");
+        let theirs = handoff_command(program(), &codex_queue("t1"), "hi", Some("/work/.codex-b"));
+        assert_eq!(args(&theirs), ["queue", "--thread", "t1", "--message", "hi"]);
+        assert_eq!(env(&theirs).as_deref(), Some(std::ffi::OsStr::new("/work/.codex-b")));
+        // Unset: the command gets the daemon's own environment, as before.
+        let default = handoff_command(program(), &codex_queue("t1"), "hi", None);
+        assert_eq!(args(&default), args(&theirs));
+        assert_eq!(default.as_std().get_envs().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_offline_codex_thread_seen_within_a_day_takes_wake_mail_through_codex_queue_in_its_home() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let home = "/work/.codex-b";
+        d.hook(codex_hook("t1", "start", Some(home))).await.unwrap();
+        // A thread from the default home: `codex queue` runs as before.
+        d.hook(codex_hook("t2", "start", None)).await.unwrap();
+        assert_eq!(d.inner.lock().unwrap().live["codex:t1"].codex_home.as_deref(), Some(home));
+        let (name, default) = (gone(&d, "codex:t1", 3 * HOUR), gone(&d, "codex:t2", HOUR));
+        let g = d.inner.lock().unwrap();
+        let r = g.store.session_by_name(&name).unwrap().unwrap();
+        let now = util::now_ms();
+        assert_eq!(g.resumable_codex(&r, true, now), Some(("t1".into(), Some(home.into()))));
+        let r2 = g.store.session_by_name(&default).unwrap().unwrap();
+        assert_eq!(g.resumable_codex(&r2, true, now), Some(("t2".into(), None)));
+        // An FYI waits for the thread's next turn: it starts none.
+        assert_eq!(g.resumable_codex(&r, false, now), None);
+        // Seen longer ago than a day, at the time the mail is sent: it waits.
+        assert_eq!(g.resumable_codex(&r, true, r.last_seen + CODEX_RESUME_MS + 1), None);
+        // Only a Codex thread its agent named.
+        let by_process = Remembered { key: "proc:7".into(), ..r.clone() };
+        assert_eq!(g.resumable_codex(&by_process, true, now), None);
+        let other = Remembered { agent: "gemini".into(), key: "gemini:t1".into(), ..r.clone() };
+        assert_eq!(g.resumable_codex(&other, true, now), None);
+    }
+
+    #[tokio::test]
+    async fn mail_for_a_codex_thread_offline_for_over_a_day_waits_with_the_offline_note() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        let name = gone(&d, "codex:t1", 25 * HOUR);
+        let res = d.send("gemini:1".into(), &name, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        let note = &res.recipients[0].note;
+        assert!(note.starts_with("queued: last seen 1d ago; unread mail may be dropped any time"), "{note}");
+        let to = d.addr(&name);
+        assert!(d.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+        // Back at its next turn, its hook shows it.
+        let shown = d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        assert!(shown.text.unwrap().contains("hi"));
+    }
+
+    /// An offline Codex thread with mail handed to `codex queue` and not answered yet, as `deliver_offline` leaves it.
+    async fn codex_queue_in_flight() -> (Arc<Daemon>, String, Vec<String>) {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let mut msg = Message {
+            id: Ulid::generate().to_string(),
+            from: format!("{}/web", d.person),
+            from_agent: Some("claude-code".into()),
+            from_repo: None,
+            to: to.clone(),
+            via: None,
+            reply_to: None,
+            body: "please look at the failing test".into(),
+            wake: true,
+            notify: false,
+            sent_at: util::now_ms(),
+            approval: None,
+            files: Vec::new(),
+        };
+        let mut g = d.inner.lock().unwrap();
+        g.store.insert(&mut msg, false).unwrap();
+        g.in_flight.insert(msg.id.clone(), Instant::now());
+        drop(g);
+        (d, to, vec![msg.id])
+    }
+
+    #[tokio::test]
+    async fn mail_codex_queue_took_is_never_shown_again_by_the_hooks_of_the_turn_it_starts() {
+        let (d, to, ids) = codex_queue_in_flight().await;
+        // Resumed while `codex queue` still runs: SessionStart doesn't show it too.
+        let start = d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert_eq!((start.text, start.ids), (None, Vec::<String>::new()));
+        d.handed("codex", "codex:t1", &ids, Ok(()));
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        for event in ["prompt", "tool", "stop"] {
+            assert_eq!(d.hook(codex_hook("t1", event, None)).await.unwrap().text, None, "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_codex_queue_failed_to_take_stays_unread_and_its_hooks_show_it_once() {
+        let (d, to, ids) = codex_queue_in_flight().await;
+        d.handed("codex", "codex:t1", &ids, Err("no app-server".into()));
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+        let start = d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert!(start.text.unwrap().contains("please look at the failing test"));
+        assert_eq!(start.ids, ids);
+        // Shown, and waiting for the hook to confirm it: no other hook shows it meanwhile.
+        assert_eq!(d.hook(codex_hook("t1", "stop", None)).await.unwrap().text, None);
+    }
+
+    #[tokio::test]
+    async fn a_codex_threads_session_start_clears_its_failed_codex_queue() {
+        let (d, _, ids) = codex_queue_in_flight().await;
+        d.handed("codex", "codex:t1", &ids, Err("no app-server".into()));
+        let failed = || d.inner.lock().unwrap().codex_failed.contains("codex:t1");
+        assert!(failed());
+        // Its other hooks leave the mark: its offline mail keeps waiting for its hooks.
+        for event in ["prompt", "tool", "stop"] {
+            d.hook(codex_hook("t1", event, None)).await.unwrap();
+            assert!(failed(), "{event}");
+        }
+        // Started again: its offline wake mail gets another try at `codex queue`.
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        assert!(!failed());
+    }
+
+    /// A fake `codex` for `d` to run: it records each command, as `CODEX_HOME|arguments`, in a file of its own in the
+    /// folder returned, and fails if `fails`, as `codex queue` does when it can't reach an app-server.
+    #[cfg(unix)]
+    fn fake_codex(d: &Daemon, fails: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-fake-codex-{}", Ulid::generate()));
+        let log = dir.join("commands");
+        std::fs::create_dir_all(&log).unwrap();
+        let bin = dir.join("codex");
+        let end = if fails { "echo 'no app-server' >&2; exit 1" } else { "exit 0" };
+        let script =
+            format!("#!/bin/sh\nprintf '%s|%s' \"${{CODEX_HOME:-default}}\" \"$*\" > '{}/'$$\n{end}\n", log.display());
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d.fake_bins.lock().unwrap().insert("codex", bin);
+        log
+    }
+
+    /// The `codex queue` commands for `thread` the fake recorded in `log`, each as `CODEX_HOME|message`, once every one
+    /// started has finished.
+    #[cfg(unix)]
+    async fn codex_queued(d: &Daemon, log: &std::path::Path, thread: &str) -> Vec<String> {
+        for _ in 0..1000 {
+            if d.inner.lock().unwrap().in_flight.is_empty() {
+                let start = format!("|queue --thread {thread} --message ");
+                let commands =
+                    std::fs::read_dir(log).unwrap().map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap());
+                return commands.filter_map(|c| c.split_once(&start).map(|(home, m)| format!("{home}|{m}"))).collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("codex queue never finished");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wake_mail_from_here_and_from_a_teammate_goes_into_a_codex_thread_offline_since_today() {
+        let (d, bob, _) = with_teammate();
+        let log = fake_codex(&d, false);
+        d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let res = d.send("codex:1".into(), &name, "from a session here", None, true, false, None, Vec::new());
+        let sent = res.await.unwrap().recipients.remove(0);
+        let mut msg = from_bob(&to, "from bob's agent".into(), Vec::new());
+        msg.wake = true;
+        let received = d.receive(bob.public(), msg).unwrap();
+        for (state, note) in [(sent.state, sent.note), received] {
+            assert_eq!(state, "pushed");
+            assert!(note.starts_with("queued into the Codex thread, which is offline (last seen 1h ago)"), "{note}");
+        }
+        let queued = codex_queued(&d, &log, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued.iter().any(|q| q.contains("from a session here")) && queued.iter().any(|q| q.contains("bob")));
+        // Against the home its hooks named, and with the reply tool named as Codex has it.
+        assert!(queued.iter().all(|q| q.starts_with("/work/.codex-b|<reason-message ")), "{queued:?}");
+        assert!(queued.iter().all(|q| q.contains("mcp__reason_network__send_message")), "{queued:?}");
+        // Taken: read, and the turn it starts doesn't show it again.
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        assert_eq!(d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap().text, None);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn once_codex_queue_fails_for_an_offline_codex_thread_its_mail_waits_for_its_hooks() {
+        let (d, bob, _) = with_teammate();
+        let log = fake_codex(&d, true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let send = |body: &'static str| {
+            let (d, name) = (d.clone(), name.clone());
+            async move {
+                let res = d.send("codex:1".into(), &name, body, None, true, false, None, Vec::new()).await;
+                res.unwrap().recipients.remove(0)
+            }
+        };
+        assert_eq!(send("first try").await.state, "pushed");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        // No second process for it, and the sender hears the truth: it waits.
+        let second = send("second try").await;
+        assert_eq!(second.state, "queued");
+        assert!(second.note.starts_with("queued: last seen 1h ago"), "{}", second.note);
+        let mut msg = from_bob(&to, "from bob's agent".into(), Vec::new());
+        msg.wake = true;
+        let (state, note) = d.receive(bob.public(), msg).unwrap();
+        assert!(state == "queued" && note.starts_with("queued: last seen 1h ago"), "{state}: {note}");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        // Its hooks show all of it when it is back.
+        let shown = d.hook(codex_hook("t1", "start", None)).await.unwrap().text.unwrap();
+        assert!(["first try", "second try", "from bob's agent"].iter().all(|b| shown.contains(b)), "{shown}");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn once_codex_queue_takes_a_threads_mail_again_its_offline_mail_goes_through_it_again() {
+        let (d, _, _) = with_teammate();
+        let failing = fake_codex(&d, true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let send = |body: &'static str| {
+            let (d, name) = (d.clone(), name.clone());
+            async move {
+                let res = d.send("codex:1".into(), &name, body, None, true, false, None, Vec::new()).await;
+                res.unwrap().recipients.remove(0)
+            }
+        };
+        assert_eq!(send("first try").await.state, "pushed");
+        assert_eq!(codex_queued(&d, &failing, "t1").await.len(), 1);
+        assert!(d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Back at a prompt (no SessionStart, which clears the mark too), with `codex queue` working again: its hook
+        // shows what failed, and it takes mail through `codex queue`, as with `codex` on PATH.
+        let working = fake_codex(&d, false);
+        let shown = d.hook(codex_hook("t1", "prompt", None)).await.unwrap();
+        assert!(shown.text.unwrap().contains("first try"));
+        d.handle(0, Request::Delivered { key: "codex:t1".into(), ids: shown.ids }).await.unwrap();
+        d.inner.lock().unwrap().live.get_mut("codex:t1").unwrap().reg.tier = Tier::Push;
+        let live = send("while it is here").await;
+        assert!(live.state == "pushed" && live.note.starts_with("queued into the Codex session"), "{}", live.note);
+        assert_eq!(codex_queued(&d, &working, "t1").await.len(), 1);
+        assert!(!d.inner.lock().unwrap().codex_failed.contains("codex:t1"));
+        // Offline again: its next wake mail goes through `codex queue` again, which takes it once.
+        gone(&d, "codex:t1", HOUR);
+        let later = send("once it is gone again").await;
+        assert!(later.state == "pushed" && later.note.starts_with("queued into the Codex thread"), "{}", later.note);
+        let queued = codex_queued(&d, &working, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued.iter().filter(|q| q.contains("once it is gone again")).count(), 1, "{queued:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // Read: the turn it starts doesn't show it again.
+        assert_eq!(d.hook(codex_hook("t1", "start", None)).await.unwrap().text, None);
+        for log in [failing, working] {
+            let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_codex_queue_for_an_offline_codex_thread_in_a_folder_that_is_off() {
+        let folders = std::collections::BTreeMap::from([("/work/personal".to_string(), "off".to_string())]);
+        let d = Arc::new(super::super::test_daemon(crate::config::Config { folders, ..Default::default() }));
+        let log = fake_codex(&d, false);
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        // Its hooks last said it is in a folder that is off: it was in one that is on when it was here.
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let off = HookCall { cwd: Some("/work/personal".into()), ..codex_hook("t1", "prompt", None) };
+        assert!(d.hook(off).await.is_err());
+        let res = d.send("gemini:1".into(), &name, "hi", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued", "{}", res.recipients[0].note);
+        // Remembered in a folder that is off (turned off since). In a folder of its own: never the first one's name.
+        d.hook(HookCall { cwd: Some("/work/web".into()), ..codex_hook("t2", "start", None) }).await.unwrap();
+        let other = gone(&d, "codex:t2", HOUR);
+        {
+            let mut g = d.inner.lock().unwrap();
+            let mut r = g.store.session_by_name(&other).unwrap().unwrap();
+            r.cwd = "/work/personal/notes".into();
+            let mut msg = from_bob(&d.addr(&other), "hi".into(), Vec::new());
+            msg.wake = true;
+            g.store.insert(&mut msg, false).unwrap();
+            assert_eq!(d.deliver_offline(&mut g, Some(&r), vec![msg], true).0, "queued");
+        }
+        assert!(codex_queued(&d, &log, "t2").await.is_empty());
+        assert_eq!(std::fs::read_dir(&log).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
     #[test]
     fn queued_mail_says_when_it_may_be_dropped_and_who_gets_it() {
         let seen = |key: &str, agent: &str| Remembered {
@@ -1309,8 +1718,8 @@ mod tests {
     async fn sending_to_an_offline_session_here_says_when_its_mail_may_be_dropped() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
-        let to = d.register(Some(2), codex("codex:2"), crate::git::GitInfo::default()).unwrap().address;
-        gone(&d, "codex:2", 3 * HOUR);
+        let to = d.register(Some(2), gemini("gemini:2"), crate::git::GitInfo::default()).unwrap().address;
+        gone(&d, "gemini:2", 3 * HOUR);
         let res = d.send("codex:1".into(), &to, "hi", None, true, false, None, Vec::new()).await.unwrap();
         assert_eq!(res.recipients[0].state, "queued");
         let note = &res.recipients[0].note;
@@ -1325,8 +1734,8 @@ mod tests {
         let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
         team.put_member(&d.key, bob.public(), "bob", "xps", true);
         d.inner.lock().unwrap().team = Some(team);
-        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
-        let name = gone(&d, "codex:1", 3 * HOUR);
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        let name = gone(&d, "gemini:1", 3 * HOUR);
         let msg = Message {
             id: Ulid::generate().to_string(),
             from: "bob/web".into(),
@@ -1377,7 +1786,7 @@ mod tests {
         assert_eq!(got[0].from, "bob/terminal@xps");
         let text = render::for_agent(&got, Some("codex"), false);
         assert!(
-            text.contains("From bob, typed in a terminal.") && text.contains("send_message to \"bob/terminal@xps\""),
+            text.contains("From bob, typed in a terminal.") && text.contains("send_message) to \"bob/terminal@xps\""),
             "{text}"
         );
         // Asked the other way: a message to `bob/terminal` names it in its receipt as Bob's answer will show here, so a
@@ -1459,16 +1868,16 @@ mod tests {
     #[tokio::test]
     async fn a_wait_whose_session_leaves_ends_empty_and_leaves_the_mail() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
-        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..codex(key) };
-        let old = d.register(Some(1), named("codex:a", "old"), crate::git::GitInfo::default()).unwrap().address;
+        let named = |key: &str, name: &str| SessionReg { name: Some(name.into()), ..gemini(key) };
+        let old = d.register(Some(1), named("gemini:a", "old"), crate::git::GitInfo::default()).unwrap().address;
         d.register(Some(2), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
         let waiting = tokio::spawn({
             let d = d.clone();
-            async move { d.inbox("codex:a".into(), 5, false).await.unwrap() }
+            async move { d.inbox("gemini:a".into(), 5, false).await.unwrap() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         d.drop_conn(1);
-        d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
+        d.register(Some(3), named("gemini:b", "old"), crate::git::GitInfo::default()).unwrap();
         let t0 = std::time::Instant::now();
         d.send("codex:s".into(), &old, "for b", None, true, false, None, Vec::new()).await.unwrap();
         let got = waiting.await.unwrap().messages;
@@ -1492,6 +1901,7 @@ mod tests {
             pid: None,
             tier,
             name: None,
+            claude_dir: None,
         };
         let to = d.register(Some(7), claude(Tier::Pull), crate::git::GitInfo::default()).unwrap().address;
         let send = |body: &'static str| d.send("codex:1".into(), &to, body, None, true, false, None, Vec::new());

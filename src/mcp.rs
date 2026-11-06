@@ -438,6 +438,8 @@ impl ReasonNetworkMcp {
             },
             tier,
             name: None,
+            // Where its Claude Code keeps the registry that names it: ours, which the daemon may not share.
+            claude_dir: claude_dir_of(agent),
         };
         self.link.register(reg).await?;
         Ok(key)
@@ -540,8 +542,22 @@ fn join_hint() -> String {
     )
 }
 
+/// The Claude Code directory a session of `agent` names in its registration: only Claude Code keeps one.
+fn claude_dir_of(agent: &str) -> Option<String> {
+    (agent == agent::CLAUDE_CODE).then(|| crate::paths::claude_dir().to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_claude_code_names_its_claude_dir() {
+        let dir = crate::paths::claude_dir().to_string_lossy().into_owned();
+        assert_eq!(super::claude_dir_of(crate::agent::CLAUDE_CODE), Some(dir));
+        for agent in ["codex", "gemini", "cli"] {
+            assert_eq!(super::claude_dir_of(agent), None, "{agent}");
+        }
+    }
+
     #[test]
     fn failures_open_no_frame() {
         let r = super::failure(anyhow::anyhow!("nobody called '<reason-message>' in the team"));
