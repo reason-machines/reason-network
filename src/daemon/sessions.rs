@@ -126,9 +126,18 @@ impl Daemon {
             }
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
             // Its title named it before this daemon started (an update restarts it), or before it went offline: the
-            // default name it went by is still its own (see `Live::former`). Its hooks told it its new one then.
+            // default name it went by is still its own (see `Live::former`), unless another session has taken it since.
             let former = match g.store.session_by_key(&key)? {
-                Some(r) if r.name == name => g.store.former(&key)?.filter(|f| *f != name && g.live_called(f).is_none()),
+                Some(r) if r.name == name => match g.store.former(&key)? {
+                    Some((f, told))
+                        if f != name
+                            && g.live_called(&f).is_none()
+                            && g.store.session_by_name(&f)?.is_some_and(|o| o.key == key) =>
+                    {
+                        Some((f, told))
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             if reg.name.is_some() {
@@ -163,8 +172,8 @@ impl Daemon {
                     mailbox: key == TERMINAL,
                     codex_home: None,
                     introduced: false,
-                    told_renamed: former.is_some(),
-                    former,
+                    told_renamed: former.as_ref().is_some_and(|(_, told)| *told),
+                    former: former.map(|(f, _)| f),
                 },
             );
             self.presence_changed();
@@ -276,7 +285,7 @@ impl Daemon {
             log(&format!("{} lapsed: a new session takes the name", self.addr(name)));
             g.store.forget_session(&r, &self.person)?;
         }
-        Ok(())
+        g.store.give_up_former(name, key)
     }
 
     pub(super) fn set_status(&self, key: &str, doing: Option<String>, name: Option<String>) -> Result<Registered> {
@@ -358,7 +367,7 @@ impl Daemon {
             }
         }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
-        g.store.set_former(&live.name, live.former.as_deref())?;
+        g.store.set_former(&live.name, live.former.as_deref(), live.told_renamed)?;
         let address = self.addr(&live.name);
         Ok(Some(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address }))
     }
@@ -535,13 +544,16 @@ impl Daemon {
         // tool's output may not reach the model, or would keep it going).
         if matches!(event, "start" | "prompt")
             && let Some(l) = g.live.get_mut(&key)
-            && let Some(former) = l.former.as_deref()
+            && let Some(former) = l.former.clone()
             && !std::mem::replace(&mut l.told_renamed, true)
         {
+            // Told once, after a restart too.
+            let name = l.name.clone();
+            g.store.set_former(&name, Some(&former), true)?;
             let note = format!(
                 "Reason Network: you are {address} now, named after what this chat is about. Mail to {} still reaches \
                  you; give teammates your new address.",
-                self.addr(former)
+                self.addr(&former)
             );
             text = Some(match text {
                 Some(t) => format!("{note}\n\n{t}"),
@@ -1658,38 +1670,157 @@ mod tests {
 
     const TITLED: &str = "api-fix-the-login-bug";
 
-    #[test]
-    fn a_titled_chats_old_name_stays_its_own_after_the_daemon_restarts() {
-        let home = std::env::temp_dir().join(format!("reason-network-restart-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&home).unwrap();
-        let open = || crate::store::Store::open(&home.join("network.db"), home.join("inbox")).unwrap();
-        {
-            let (d, _) = with_bob(open(), false);
+    /// Claude Code's hook for the conversation `id`.
+    fn claude_hook(id: &str, event: &str) -> HookCall {
+        HookCall {
+            through_reason: Some(false),
+            agent: agent::CLAUDE_CODE.into(),
+            event: event.into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            keep: false,
+            name: None,
+            dirs: Vec::new(),
+            codex_home: None,
+        }
+    }
+
+    /// Whether the hook for `event` tells the conversation `id` its name now.
+    async fn told(d: &Arc<Daemon>, id: &str, event: &str) -> bool {
+        let reply = d.hook(claude_hook(id, event)).await.unwrap();
+        reply.text.is_some_and(|t| t.contains(&format!("you are {} now", d.addr(TITLED))))
+    }
+
+    #[tokio::test]
+    async fn a_titled_chats_old_name_stays_its_own_after_the_daemon_restarts() {
+        // Restarted before its next hook told it its new name, and after.
+        for told_before in [false, true] {
+            let home = std::env::temp_dir().join(format!("reason-network-restart-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&home).unwrap();
+            let open = || crate::store::Store::open(&home.join("network.db"), home.join("inbox")).unwrap();
+            {
+                let (d, _) = with_bob(open(), false);
+                let d = Arc::new(d);
+                assert_eq!(join(&d, claude("x")).name, "api-claude");
+                assert_eq!(join(&d, claude("a")).name, "api-claude-2");
+                assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+                if told_before {
+                    assert!(told(&d, "a", "prompt").await);
+                }
+            }
+            // An update restarts the daemon, on the same database: a new chat in the folder registers before `a` does.
+            let (d, bob) = with_bob(open(), false);
+            let d = Arc::new(d);
             assert_eq!(join(&d, claude("x")).name, "api-claude");
-            assert_eq!(join(&d, claude("a")).name, "api-claude-2");
-            assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
-        }
-        // An update restarts the daemon, on the same database: a new chat in the folder registers before `a` does.
-        let (d, bob) = with_bob(open(), false);
-        let d = Arc::new(d);
-        assert_eq!(join(&d, claude("x")).name, "api-claude");
-        assert_eq!(join(&d, claude("z")).name, "api-claude-3");
-        assert_eq!(join(&d, claude("a")).name, TITLED);
-        {
+            assert_eq!(join(&d, claude("z")).name, "api-claude-3");
+            assert_eq!(join(&d, claude("a")).name, TITLED);
+            assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude-2"));
+            // Told its new name once: at its next prompt, unless it was told before the restart.
+            assert_eq!(told(&d, "a", "prompt").await, !told_before, "told before: {told_before}");
+            assert!(!told(&d, "a", "prompt").await);
+            // Bob's mail to the name it was told reaches it, not the new chat.
+            let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude-2")).unwrap();
+            assert_ne!(state, "refused");
             let g = d.inner.lock().unwrap();
-            assert_eq!(g.live["claude-code:a"].former.as_deref(), Some("api-claude-2"));
-            // Already told its new name before the restart: not told again.
-            assert!(g.live["claude-code:a"].told_renamed);
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-3")).unwrap(), 0);
+            drop(g);
+            let _ = std::fs::remove_dir_all(&home);
         }
-        // Bob's mail to the name it was told reaches it, not the new chat.
-        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude-2")).unwrap();
+    }
+
+    #[test]
+    fn an_old_name_another_chat_took_never_comes_back_to_the_titled_one_after_a_restart() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        settled(&mut d);
+        let d = Arc::new(d);
+        // Known only from its hooks, so its name isn't kept for it once it ends.
+        let hook_only = || SessionReg { tier: Tier::Turn, ..claude("a") };
+        assert_eq!(d.register_quiet(None, hook_only(), GitInfo::default()).unwrap().0.name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        leave(&d, "claude-code:a", 0);
+        // Its old name is free, and another chat takes it: for good.
+        assert_eq!(join(&d, claude("z")).name, "api-claude");
+        assert_eq!(d.inner.lock().unwrap().store.former("claude-code:a").unwrap(), None);
+        // A restart, and the titled chat comes back first.
+        restart(&d);
+        assert_eq!(d.register_quiet(None, hook_only(), GitInfo::default()).unwrap().0.name, TITLED);
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former, None);
+        // Mail to the name waits for the chat that has it, not the titled one.
+        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude")).unwrap();
         assert_ne!(state, "refused");
         let g = d.inner.lock().unwrap();
-        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
-        assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
-        assert_eq!(g.store.unread_count(&d.addr("api-claude-3")).unwrap(), 0);
-        drop(g);
-        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 1);
+        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_a_titled_chat_to_mail_sent_to_its_old_name_counts_as_the_reply() {
+        let (d, _) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        // Sent here to its old name, while it is live and once it has ended.
+        for live in [true, false] {
+            if !live {
+                leave(&d, "claude-code:a", 0);
+            }
+            let sent = d.send("claude-code:z".into(), "api-claude", "q", None, true, false, None, Vec::new()).await;
+            let id = sent.unwrap().ids[0].clone();
+            if !live {
+                join(&d, claude("a"));
+            }
+            let reply =
+                d.send("claude-code:a".into(), "api-claude-2", "a", Some(id.clone()), true, false, None, Vec::new());
+            reply.await.unwrap();
+            let status = d.inner.lock().unwrap().store.delivery_status("claude-code:z", &[id]).unwrap();
+            assert_eq!(status[0]["stage"], "replied", "live: {live}: {status:?}");
+            assert_eq!(status[0]["recipient"], d.addr(TITLED));
+        }
+    }
+
+    #[test]
+    fn a_teammate_says_where_mail_to_an_old_name_went_and_its_reply_from_there_counts() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        join(&d, claude("z"));
+        let sent = |id: &str| Message {
+            id: id.into(),
+            from: d.addr("api-claude"),
+            to: "bob/web-claude".into(),
+            sent_at: util::now_ms(),
+            ..from_bob(&d, "x")
+        };
+        let reply = |id: &str, from: &str| Message {
+            from: from.into(),
+            to: d.addr("api-claude"),
+            reply_to: Some(id.into()),
+            ..from_bob(&d, "x")
+        };
+        let stage = |id: &str| {
+            let g = d.inner.lock().unwrap();
+            g.store.delivery_status("claude-code:z", &[id.into()]).unwrap()[0]["stage"].as_str().unwrap().to_string()
+        };
+        let (one, other) = ("01JA0000000000000000000001", "01JA0000000000000000000002");
+        for id in [one, other] {
+            d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(id), "bob/web-claude", "queued").unwrap();
+        }
+        // Bob's machine took it for the chat at its name now; nobody else can say so, nor name someone else's session.
+        let carol = iroh::SecretKey::generate();
+        d.readdressed(&carol.public(), one, "bob/web-fix");
+        d.readdressed(&bob.public(), one, "carol/web");
+        d.readdressed(&bob.public(), one, "bob/web-fix");
+        d.receive(bob.public(), reply(one, "bob/web-fix")).unwrap();
+        assert_eq!(stage(one), "replied");
+        // Without word of where it went, a reply from another of Bob's chats is not the one it waits for.
+        d.receive(bob.public(), reply(other, "bob/web-fix")).unwrap();
+        assert_ne!(stage(other), "replied");
     }
 
     #[tokio::test]
@@ -1738,8 +1869,10 @@ mod tests {
             assert_eq!(join(&d, claude("z")).name, "api-claude-2");
             let msg = from_bob(&d, "api-claude");
             let id = msg.id.clone();
-            let (state, note) = d.receive(bob.public(), msg).unwrap();
+            let (state, note, to) = d.receive_readdressed(bob.public(), msg).unwrap();
             assert_ne!(state, "refused", "{note}");
+            // Bob's machine hears where it went, which the reply comes from.
+            assert_eq!(to, Some(d.addr(TITLED)), "hold: {hold}");
             let mut ids = vec![id.clone()];
             if hold {
                 assert_eq!(state, "held");

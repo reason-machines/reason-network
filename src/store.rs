@@ -301,6 +301,8 @@ impl Store {
             // The default name a session went by before its conversation's title named it: still its own, with its
             // mail, for as long as the session is remembered (see `session_by_name`).
             ("former", "TEXT"),
+            // Its hooks have told it the name it goes by now, in place of `former`.
+            ("told_renamed", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
@@ -394,6 +396,21 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let sql = format!("SELECT {MESSAGE_COLS}, held FROM messages WHERE id = ?1");
         Ok(self.db.query_row(&sql, [id], |r| self.row(r)).optional()?)
+    }
+
+    /// The machine that took message `id` delivered it to `to`, the name the session it was sent to (at `from`, the
+    /// default name it went by before its title named it) goes by now: a reply from there is the one it waits for.
+    pub fn readdress_receipt(&self, id: &str, from: &str, to: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE sent_receipts SET recipient = ?3 WHERE id = ?1 AND recipient = ?2",
+            params![id, from, to],
+        )?;
+        Ok(())
+    }
+
+    /// Who message `id` was sent to, as its receipt says.
+    pub fn receipt_recipient(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT recipient FROM sent_receipts WHERE id = ?1", [id], |r| r.get(0)).optional()?)
     }
 
     fn observe_reply(&self, message: &Message) -> Result<()> {
@@ -681,7 +698,8 @@ impl Store {
                  native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
                  native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
                  codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END,
-                 former = CASE WHEN key = ?2 THEN former ELSE NULL END"
+                 former = CASE WHEN key = ?2 THEN former ELSE NULL END,
+                 told_renamed = CASE WHEN key = ?2 THEN told_renamed ELSE 0 END"
             ),
             params![
                 s.name,
@@ -771,16 +789,33 @@ impl Store {
         Ok(self.db.query_row(&sql, [name], remembered).optional()?)
     }
 
-    /// Remembers the default name the session `name` went by before its title named it (`None`: no such name).
-    pub fn set_former(&self, name: &str, former: Option<&str>) -> Result<()> {
-        self.db.execute("UPDATE sessions SET former = ?2 WHERE name = ?1", params![name, former])?;
+    /// Remembers the default name the session `name` went by before its title named it (`None`: no such name), and
+    /// whether its hooks have told it the name it goes by now.
+    pub fn set_former(&self, name: &str, former: Option<&str>, told: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = ?2, told_renamed = ?3 WHERE name = ?1",
+            params![name, former, former.is_some() && told],
+        )?;
         Ok(())
     }
 
-    /// The default name the session `key` went by before its title named it, as remembered.
-    pub fn former(&self, key: &str) -> Result<Option<String>> {
-        let sql = "SELECT former FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1";
-        Ok(self.db.query_row(sql, [key], |r| r.get(0)).optional()?.flatten())
+    /// The default name the session `key` went by before its title named it, as remembered, and whether its hooks
+    /// told it its name now.
+    pub fn former(&self, key: &str) -> Result<Option<(String, bool)>> {
+        let sql = "SELECT former, told_renamed FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1";
+        let row: Option<(Option<String>, bool)> =
+            self.db.query_row(sql, [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        Ok(row.and_then(|(f, told)| Some((f?, told))))
+    }
+
+    /// `key` takes `name`: a remembered session that went by it before its title named it, and has not kept it, gives
+    /// it up for good, so it never comes back to that session after a restart.
+    pub fn give_up_former(&self, name: &str, key: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = NULL, told_renamed = 0 WHERE former = ?1 AND key <> ?2",
+            params![name, key],
+        )?;
+        Ok(())
     }
 
     /// Each remembered session's former default name (see `set_former`), by its name now.

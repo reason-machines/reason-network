@@ -64,7 +64,10 @@ session, never one that mail went to or from, and never a session remembered fro
 `settled_names` table). The default name it was told at its start stays its own (the `former` column of `sessions`):
 mail to it, from this machine or a teammate's, reaches the renamed session at its new name, no other session gets it,
 and the person's other machines hear it is kept. That holds after a daemon restart and while the session is offline,
-and the name is forgotten with the session. Its next prompt's hook tells the agent its new address, once.
+and the name is forgotten with the session; a session whose name is not kept once it ends gives the old name up for
+good when another session takes it. A teammate's machine that delivers mail sent to the old name says where it went, so
+the sender's receipt counts the reply from the new name. Its next start or prompt hook tells the agent its new address,
+once, also across a restart (`told_renamed`).
 
 **A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
 conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table. This holds for

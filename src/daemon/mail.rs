@@ -833,9 +833,31 @@ impl Daemon {
         }
     }
 
-    /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
-    /// means "not now": the sender keeps it in its outbox.
+    #[cfg(test)]
     pub fn receive(self: &Arc<Self>, peer: EndpointId, msg: Message) -> Result<(String, String)> {
+        self.receive_readdressed(peer, msg).map(|(state, note, _)| (state, note))
+    }
+
+    /// A message from a teammate's machine. Returns the state and a note for the sender. A `retry` state
+    /// means "not now": the sender keeps it in its outbox. With the address it went to, when that is not the one it
+    /// was sent to: the name the session it was sent to (at the default name it went by before its title named it)
+    /// goes by now, which its replies come from.
+    pub fn receive_readdressed(
+        self: &Arc<Self>,
+        peer: EndpointId,
+        msg: Message,
+    ) -> Result<(String, String, Option<String>)> {
+        let mut to = None;
+        let (state, note) = self.receive_to(peer, msg, &mut to)?;
+        Ok((state, note, to))
+    }
+
+    fn receive_to(
+        self: &Arc<Self>,
+        peer: EndpointId,
+        msg: Message,
+        to: &mut Option<String>,
+    ) -> Result<(String, String)> {
         let (sender, machine) = self
             .team_state()
             .and_then(|t| t.member(&peer).map(|m| (m.person.clone(), m.machine.clone())))
@@ -878,6 +900,7 @@ impl Daemon {
             bail!("{} is not on this machine", msg.to);
         }
         let name = name.to_string();
+        let asked = msg.to.clone();
 
         let res = {
             let mut g = self.inner.lock().unwrap();
@@ -901,6 +924,9 @@ impl Daemon {
                 _ => name,
             };
             let name = name.as_str();
+            if msg.to != asked {
+                *to = Some(msg.to.clone());
+            }
             if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }
@@ -955,6 +981,28 @@ impl Daemon {
             net.note_session(&peer, from.split_once('@').map_or(from, |(n, _)| n));
         }
         Ok(res)
+    }
+
+    /// `peer` delivered message `id` to `to`, the name the session it was sent to goes by now (see
+    /// `receive_readdressed`): its receipt waits for a reply from there. Only for a session of the person it was sent
+    /// to, on that person's machine.
+    pub fn readdressed(&self, peer: &EndpointId, id: &str, to: &str) {
+        let Some((person, machine)) =
+            self.team_state().and_then(|t| t.member(peer).map(|m| (m.person.clone(), m.machine.clone())))
+        else {
+            return;
+        };
+        let theirs =
+            |a: &str| render::without_machine(a).split_once('/').is_some_and(|(p, n)| p == person && !n.is_empty());
+        if !theirs(to) || to.contains('@') {
+            return;
+        }
+        let g = self.inner.lock().unwrap();
+        if let Ok(Some(old)) = g.store.receipt_recipient(id)
+            && theirs(&old)
+        {
+            let _ = g.store.readdress_receipt(id, &old, &render::shown_from(to, &machine));
+        }
     }
 
     fn allow(&self, peer: &EndpointId) -> bool {
