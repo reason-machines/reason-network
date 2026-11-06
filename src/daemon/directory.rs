@@ -962,12 +962,13 @@ mod tests {
             assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
         }
         // A list of everyone (`*`) reaches it once, by its name now.
-        let g = d.inner.lock().unwrap();
-        let all = d.resolve(&g, &HashMap::new(), "*", Some("claude-code:sender")).unwrap();
-        let mut all: Vec<String> = all.iter().map(|t| t.address()).collect();
-        all.sort();
-        assert_eq!(all, [d.addr("api-claude-2"), now.clone()]);
-        drop(g);
+        {
+            let g = d.inner.lock().unwrap();
+            let all = d.resolve(&g, &HashMap::new(), "*", Some("claude-code:sender")).unwrap();
+            let mut all: Vec<String> = all.iter().map(|t| t.address()).collect();
+            all.sort();
+            assert_eq!(all, [d.addr("api-claude-2"), now.clone()]);
+        }
         // Its next turn's hook tells it its new address, once.
         let told = d.hook(hook("prompt")).await.unwrap();
         let text = told.text.unwrap();
