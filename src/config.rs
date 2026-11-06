@@ -183,20 +183,20 @@ impl Config {
                         Policy::Hold
                     });
                 }
+                // What an unreadable `people` or person counts as: hold, unless the default already refuses.
+                let fallback = if cfg.inbound.default == Policy::Refuse { Policy::Refuse } else { Policy::Hold };
                 if let Some(value) = inbound.get("people") {
                     if let Some(people) = value.as_table() {
                         for (person, value) in people {
                             let policy = value.clone().try_into().unwrap_or_else(|error| {
                                 errors.push(format!("inbound.people.{person}: {error}"));
-                                Policy::Hold
+                                fallback
                             });
                             cfg.inbound.people.insert(person.clone(), policy);
                         }
                     } else {
                         errors.push("inbound.people: expected a table".into());
-                        if cfg.inbound.default != Policy::Refuse {
-                            cfg.inbound.default = Policy::Hold;
-                        }
+                        cfg.inbound.default = fallback;
                     }
                 }
             } else {
@@ -446,6 +446,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let output = result.unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn an_unreadable_person_is_held_unless_the_default_refuses() {
+        let policy = |default: &str, entry: &str| {
+            let text = format!("[inbound]\ndefault = \"{default}\"\n[inbound.people]\nalice = \"{entry}\"\n");
+            Config::read_private(&text).policy_for("alice")
+        };
+        for entry in ["refused", "Refuse", "block", "refuse "] {
+            assert_eq!(policy("refuse", entry), Policy::Refuse, "{entry}");
+            assert_eq!(policy("accept", entry), Policy::Hold, "{entry}");
+            assert_eq!(policy("hold", entry), Policy::Hold, "{entry}");
+        }
     }
 
     #[test]
