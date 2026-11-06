@@ -110,8 +110,8 @@ fn broken_config_keeps_the_daemon_available_and_warns_clients() {
     }
 }
 
-/// What a `list_team` call says when its MCP server starts in `folder`.
-fn mcp_says(home: &Path, folder: &Path) -> String {
+/// What a tool `call` (its name and arguments) says when its MCP server starts in `folder`.
+fn mcp_says(home: &Path, folder: &Path, call: Value) -> String {
     let mut server = Daemon(
         reason_network(home)
             .arg("mcp")
@@ -144,7 +144,7 @@ fn mcp_says(home: &Path, folder: &Path) -> String {
     send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": init}));
     reply_to(1);
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}}));
+    send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": call}));
     let text = reply_to(2)["result"]["content"][0]["text"].as_str().unwrap().to_string();
     // In a folder that is on, the server starts a daemon: don't leave it running.
     if home.join("network.sock").exists() {
@@ -161,7 +161,7 @@ fn mcp_tools_blame_the_file_only_when_the_user_turned_nothing_off() {
     let off = format!("[folders]\n\"{}\" = \"off\"\n", folder.display());
     let says = |config: &str| {
         fs::write(home.0.join("config.toml"), config).unwrap();
-        mcp_says(&home.0, &folder)
+        mcp_says(&home.0, &folder, json!({"name": "list_team", "arguments": {}}))
     };
     // The file can't be read, so every folder is off. The user turned none off, and is the one to fix the file.
     let text = says("[inbound\n");
@@ -193,4 +193,44 @@ fn an_agents_shell_is_told_the_file_is_unreadable_not_that_its_folder_was_turned
     let error = stderr.lines().find(|l| l.starts_with("Error:")).unwrap_or_default();
     assert!(!send.status.success() && !started, "{stderr}");
     assert!(error.contains("ask your user to fix") && !error.contains("turned Reason Network off"), "{stderr}");
+}
+
+/// A temporary folder holding the state (`home`) and, apart from it, a project with a file in a subfolder that is
+/// off, while another setting can't be read.
+fn project_with_a_private_file(name: &str) -> (Home, PathBuf, PathBuf) {
+    let root = Home(std::env::temp_dir().join(format!("rn-config-{name}-{}", std::process::id())));
+    let (home, project) = (root.0.join("state"), root.0.join("project"));
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(project.join("private")).unwrap();
+    fs::write(project.join("private").join("notes.txt"), "not for the team\n").unwrap();
+    let config = format!("port = \"41641\"\n[folders]\n\"{}\" = \"off\"\n", project.join("private").display());
+    fs::write(home.join("config.toml"), config).unwrap();
+    (root, home, project)
+}
+
+#[test]
+fn an_agents_shell_sends_no_file_from_a_folder_that_is_off_when_another_setting_cannot_be_read() {
+    let (_root, home, project) = project_with_a_private_file("send-file");
+    let send = reason_network(&home)
+        .args(["send", "alice/work", "hello", "--file", "private/notes.txt"])
+        .current_dir(&project)
+        .env("AI_AGENT", "1")
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .output()
+        .unwrap();
+    let started = home.join("network.sock").exists();
+    if started {
+        let _ = reason_network(&home).arg("stop").output();
+    }
+    let stderr = String::from_utf8_lossy(&send.stderr);
+    assert!(!send.status.success() && !started, "{stderr}");
+    assert!(stderr.contains("private/notes.txt is in a folder your user turned Reason Network off for"), "{stderr}");
+}
+
+#[test]
+fn mcp_tools_send_no_file_from_a_folder_that_is_off_when_another_setting_cannot_be_read() {
+    let (_root, home, project) = project_with_a_private_file("mcp-file");
+    let args = json!({"to": "alice/work", "message": "hello", "files": ["private/notes.txt"]});
+    let text = mcp_says(&home, &project, json!({"name": "send_message", "arguments": args}));
+    assert!(text.contains("private/notes.txt is in a folder your user turned Reason Network off for"), "{text}");
 }

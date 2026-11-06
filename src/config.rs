@@ -558,15 +558,45 @@ mod tests {
 
     #[test]
     fn bad_syntax_pauses_folders_and_holds_mail_without_disabling_updates() {
-        for text in ["[inbound", "[inbound]\n[inbound]", "folders = 3"] {
+        // Settings it turns on before the line that breaks it can't be trusted either.
+        let on = "lan = true\nshare_paths = true\nshare_unmanaged = true\nreason = true\nauto_update = false\n[inbound";
+        for text in [on, "[inbound", "[inbound]\n[inbound]", "folders = 3"] {
             let cfg = Config::read_private(text);
             assert!(cfg.off_in("/anywhere"));
             if text != "folders = 3" {
                 assert_eq!(cfg.policy_for("alice"), Policy::Hold);
             }
             assert!(cfg.auto_update);
+            assert!(!cfg.lan && !cfg.share_paths && !cfg.share_unmanaged && !cfg.reason, "{text}");
             assert!(cfg.warning().is_some());
         }
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_read_never_turns_sharing_on_or_updates_off() {
+        for key in ["lan", "share_paths", "share_unmanaged", "reason", "debug_log"] {
+            let cfg = Config::read_private(&format!("{key} = \"yes\"\n"));
+            assert!(cfg.warning().is_some(), "{key}");
+            assert!(!cfg.lan && !cfg.share_paths && !cfg.share_unmanaged && !cfg.reason && !cfg.debug_log, "{key}");
+        }
+        assert!(Config::read_private("auto_update = \"no\"\n").auto_update);
+    }
+
+    #[test]
+    fn an_inbound_that_is_not_a_table_holds_every_sender() {
+        assert_eq!(Config::read_private("inbound = 3\n").policy_for("bob"), Policy::Hold);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_pauses() {
+        with_config_file("a_file_that_cannot_be_read_pauses", "", |dir| {
+            // Not UTF-8, so not text at all.
+            std::fs::write(dir.join("config.toml"), b"lan = true\n\xff\n").unwrap();
+            let cfg = Config::load();
+            assert!(cfg.warning().is_some_and(|w| w.starts_with("Reason Network is paused")), "{:?}", cfg.warning());
+            assert!(cfg.off_in("/work") && !cfg.lan);
+            assert_eq!(cfg.policy_for("bob"), Policy::Hold);
+        });
     }
 
     #[test]
