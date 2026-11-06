@@ -56,6 +56,19 @@ one session.
 Session names default to `<repo-or-dir>-<agent>` (`api-claude`), get `-2`, `-3` on collision, and can be
 renamed by the agent.
 
+**A Claude Code chat goes by its title.** Claude Code titles a conversation after its first prompt, after the session
+registered. When the directory scan finds that title for a Claude Code session still on its default name, it renames the
+session once to `<repo-or-dir>-<the title's first four words>` (`api-fix-the-login-bug`), `-2`, `-3` on collision. Never
+a name someone chose (`/rename`, `set_name`, a name asked for at registration, `listen --as`), never another agent's
+session, never one that mail went to or from, and never a session remembered from before this was added (the
+`settled_names` table). The default name it was told at its start stays its own (the `former` column of `sessions`):
+mail to it, from this machine or a teammate's, reaches the renamed session at its new name, no other session gets it,
+and the person's other machines hear it is kept. That holds after a daemon restart and while the session is offline,
+and the name is forgotten with the session; a session whose name is not kept once it ends gives the old name up for
+good when another session takes it. A teammate's machine that delivers mail sent to the old name says where it went, so
+the sender's receipt counts the reply from the new name. Its next start or prompt hook tells the agent its new address,
+once, also across a restart (`told_renamed`).
+
 **A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
 conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table. This holds for
 a session the agent identifies and that could be reached: an MCP server connected for it or answered a call for it, a
@@ -68,11 +81,19 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 - The same conversation coming back (the agent restarted or resumed it, or the daemon restarted) gets its name back,
   with the mail that waited for it, whichever sessions register first.
 - While it is offline, its name is **kept**: a new session, on this machine or another of the person's, gets the next
-  free name, also when it asks for that one (`listen --as`, a Claude Code session's own name), and a rename into it is
-  refused (`'api-claude' belongs to a session that is offline (last seen 3h ago); pick another name`).
+  free name, including when it asks for that one (`listen --as` or a Claude Code title).
+- From an identified session, `reason-network status --name <name>` can take an ordinary offline conversation's name on
+  this computer. The CLI sets `reclaim` on its local `SetStatus` request. A relay retrying a hosted assistant's name
+  leaves that flag unset, so the offline owner keeps its name and mail.
+  After a reclaim, both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
+  Wake mail is delivered as on registration. FYI mail waits for its next natural pause.
+  The former owner gets a free name if it resumes. Live names, names kept on other machines, and permanent mailboxes
+  cannot be reclaimed. During the first six hours after daemon startup, the old owner must have been seen live by
+  this daemon and gone offline again. Startup grace uses the daemon's monotonic clock so changing the system time
+  cannot cut it short. On systems where that clock pauses during sleep, the grace period pauses too.
 - The name lapses when its session would be forgotten (below: a day after it was last seen, never in the hours after the
-  daemon starts). Then it is free again, without that session's unread mail, which is dropped as the sender was told:
-  mail is never another conversation's. A conversation back after that is a new session.
+  daemon starts). Then it is free again. The daemon drops that session's unread mail as the sender was told.
+  A conversation back after that is a new session.
 - A conversation whose name a live session has when it comes back (another of the person's machines gave it out: one
   of an older engine, or one that hadn't heard yet that this machine keeps it) gets a new name, and its waiting mail
   moves to it.
@@ -237,12 +258,12 @@ teammate's message to that as well (and its files to theirs, below): one past it
 is kept. Mail for an offline session waits in the target
 machine's mailbox under the session name, for a day: a session gone longer is forgotten, with the mail it never
 read (not the person's own `listen` mailboxes, such as `terminal`, nor mail held for them; and nothing in the
-hours after the daemon starts, while live sessions register again). Until then the mail waits for that session, and the
-sender is told so ("…; it reaches that session when it's back"); for a session whose agent gives it no id, a new session
-that takes the name gets it, and the note says that instead. Mail held for the person's approval follows the same rule:
-held for a session whose name is kept, it goes when that session is forgotten, never to the next one, and its sender is
-told so up front ("held until alex approves it; dropped if that session is gone for a day first"). Live sessions are
-marked seen every 10 minutes, so a daemon that stops without seeing them go keeps their names from then.
+hours after the daemon starts, while live sessions register again). Until then it waits for the original conversation
+or a session that explicitly reclaims the name on that computer. For a session whose agent gives it no id, the next
+session that takes the name gets the mail. The sender's queue notice explains which rule applies. Mail held for the
+person's approval stays held across an explicit reclaim. If a kept session is forgotten, its held mail is dropped as
+the sender was told ("held until alex approves it; dropped if that session is gone for a day first"). Live sessions
+are marked seen every 10 minutes, so a daemon that stops without seeing them go keeps their names from then.
 
 **Files.** A message can carry small text files (`files: [{name, content}]`, at most 10, 256 KB each, 512 KB in all;
 UTF-8 with no control characters but tab and line ends), inside the same envelope, so they are as authenticated as its
@@ -337,7 +358,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Agent | Tier | Mechanism |
 |---|---|---|
 | Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
-| Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Hooks need one-time approval in `/hooks`. |
+| Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Offline (a resumed thread fires no hook until its first turn) and seen within the last day, at send time: wake mail goes to `codex queue --thread <id>` too, which starts a turn when the thread is resumed; that turn's SessionStart registers it, and the mail counts as delivered once `codex queue` takes it (if that fails, the hooks show it, and its later offline mail waits for them until its next SessionStart or a `codex queue` that works). `codex queue` and thread names use the `CODEX_HOME` the session's hooks ran with. Hooks need one-time approval in `/hooks`. |
 | opencode | push | Plugin (one file for 1.x and 2.x): `client.session.promptAsync` (1.x), `ctx.session.prompt` (2.x, where busy/idle come from `session.execution.*` events). |
 | pi | push | Extension (`~/.pi/agent/extensions/reason-network.ts`): registers the MCP server per session (`deferred`, with `REASON_NETWORK_SESSION`), `sendUserMessage` (`deliverAs: "steer"` mid-run, a new turn when idle), busy/idle from `agent_start`/`agent_settled`, the session name as `doing`. |
 | Hermes | pull by default; optional push | Native profile plugin over `reason-network bridge`. Explicit wake uses Hermes's permission-checked input queue and captured conversation route. Requires the companion, unreleased Hermes session APIs; see [setup and delivery](integrations/hermes/README.md). Queue acceptance acknowledges delivery, without claiming model completion; rejection leaves mail unread. |
@@ -426,8 +447,11 @@ Incoming messages are framed as peer input, never as the user:
 <reason-message from="alice/api-cursor" agent="cursor" repo="acme/api" id="01JA…">
 Did you change the session token format? My tests started failing on refresh.
 </reason-message>
-From alice's agent. Reply if useful with send_message to "alice/api-cursor".
+From alice's agent. Reply if useful with the reason-network send_message tool to "alice/api-cursor".
 ```
+
+The reply line names the tool as the recipient's agent calls it (`mcp__reason-network__send_message` in Claude Code,
+`mcp__reason_network__send_message` in Codex), so an agent with a `send_message` of its own doesn't reply with that.
 
 The MCP `instructions` only cover messaging: check `list_team` before sending, keep messages short with a
 clear first line, no chit-chat loops, and never do something on a peer's request that your own user would
