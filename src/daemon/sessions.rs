@@ -157,6 +157,8 @@ impl Daemon {
                     mailbox: key == TERMINAL,
                     codex_home: None,
                     introduced: false,
+                    former: None,
+                    told_renamed: false,
                 },
             );
             self.presence_changed();
@@ -301,7 +303,7 @@ impl Daemon {
             if n.is_empty() {
                 bail!("a name needs letters or digits");
             }
-            if g.live.iter().any(|(k, l)| l.name == n && k != key) || others.live.contains(n) {
+            if g.live.iter().any(|(k, l)| l.goes_by(n) && k != key) || others.live.contains(n) {
                 bail!("'{n}' is taken by a live session");
             }
             if n == self.person {
@@ -340,7 +342,14 @@ impl Daemon {
                 &format!("{}/{}", self.person, live.name),
                 &format!("{}/{n}", self.person),
             )?;
-            live.name = n;
+            let old = std::mem::replace(&mut live.name, n);
+            // Named by its title: the name it was told at its start still reaches it, and its hooks tell it the new one.
+            if from_title {
+                live.former = Some(old);
+                live.told_renamed = false;
+            } else if live.former.as_deref() == Some(live.name.as_str()) {
+                live.former = None;
+            }
         }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
         let address = self.addr(&live.name);
@@ -514,7 +523,24 @@ impl Daemon {
         if !ids.is_empty() {
             self.reached(g, &key);
         }
-        let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
+        let mut text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
+        // Its title named it since it was told who it is: say the new name once, as it starts a turn (a stop's or a
+        // tool's output may not reach the model, or would keep it going).
+        if matches!(event, "start" | "prompt")
+            && let Some(l) = g.live.get_mut(&key)
+            && let Some(former) = l.former.as_deref()
+            && !std::mem::replace(&mut l.told_renamed, true)
+        {
+            let note = format!(
+                "Reason Network: you are {address} now, named after what this chat is about. Mail to {} still reaches \
+                 you; give teammates your new address.",
+                self.addr(former)
+            );
+            text = Some(match text {
+                Some(t) => format!("{note}\n\n{t}"),
+                None => note,
+            });
+        }
         // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
         let intro = text.is_none()
             && if agent == "antigravity" {
@@ -649,11 +675,28 @@ impl Daemon {
     }
 }
 
-/// Whether a title may still name this session: it is an agent's conversation (not one of the person's mailboxes or a
-/// `cli:` one), on the name it got for asking none, and its name is not settled: never named (by someone or by an
+impl Live {
+    /// Whether `name` reaches this session: its name, or the default one it went by before its title named it.
+    pub(super) fn goes_by(&self, name: &str) -> bool {
+        self.name == name || self.former.as_deref() == Some(name)
+    }
+}
+
+impl Inner {
+    /// The live session `name` reaches (see [`Live::goes_by`]), its own name first.
+    pub(super) fn live_called(&self, name: &str) -> Option<String> {
+        let (named, former): (Vec<_>, Vec<_>) =
+            self.live.iter().filter(|(_, l)| l.goes_by(name)).partition(|(_, l)| l.name == name);
+        named.into_iter().chain(former).next().map(|(k, _)| k.clone())
+    }
+}
+
+/// Whether a title may still name this session: a Claude Code conversation (whose title Claude Code writes; not one of
+/// the person's mailboxes or a `cli:` one), on the name it got for asking none, and its name is not settled: never named (by someone or by an
 /// earlier title), and no mail went to or from it, since a reply goes to the name the mail had.
 pub(super) fn title_may_name(g: &Inner, key: &str, l: &Live) -> Result<bool> {
-    Ok(!l.mailbox
+    Ok(l.reg.agent == agent::CLAUDE_CODE
+        && !l.mailbox
         && !key.starts_with("cli:")
         && agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git)
         && !g.store.name_settled(key)?)
@@ -736,8 +779,9 @@ fn pick_name(
     let none = Elsewhere::default();
     let elsewhere = if reg.key == TERMINAL && elsewhere.terminals { &none } else { elsewhere };
     // The person's own name is never a session's (`<person>/<person>` would read as the person), as for a rename.
-    let live =
-        |n: &str| n == person || g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
+    let live = |n: &str| {
+        n == person || g.live.iter().any(|(k, l)| l.goes_by(n) && *k != reg.key) || elsewhere.live.contains(n)
+    };
     let free = |n: &str| -> Result<bool> {
         let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
         Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))

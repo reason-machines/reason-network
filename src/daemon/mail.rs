@@ -873,11 +873,21 @@ impl Daemon {
         if person != self.person {
             bail!("{} is not on this machine", msg.to);
         }
+        let name = name.to_string();
 
         let res = {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
-            let key = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone());
+            let key = g.live_called(&name);
+            // To the default name a live session went by before its title named it: that session's, at its name now.
+            let name = match key.as_ref().map(|k| &g.live[k]) {
+                Some(l) if l.name != name => {
+                    msg.to = self.addr(&l.name);
+                    l.name.clone()
+                }
+                _ => name,
+            };
+            let name = name.as_str();
             let remembered = if key.is_none() { g.store.session_by_name(name)? } else { None };
             if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
@@ -1016,7 +1026,7 @@ impl Daemon {
             for m in &msgs {
                 self.record_remote_received(m);
                 let name = m.to.split_once('/').map_or("", |(_, n)| n);
-                if let Some(key) = g.live.iter().find(|(_, l)| l.name == name).map(|(k, _)| k.clone()) {
+                if let Some(key) = g.live_called(name) {
                     self.deliver(&mut g, &key, vec![m.clone()], m.wake);
                 }
             }
