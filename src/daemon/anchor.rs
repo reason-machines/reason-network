@@ -266,7 +266,7 @@ impl Daemon {
                 return Ok(("refused".into(), "the permanent mailbox was removed".into()));
             }
         }
-        self.receive(source, msg)
+        self.receive_readdressed(source, msg).map(|(state, note, _)| (state, note))
     }
 
     fn anchor_notice(&self, original: &Message, why: &str) -> Message {

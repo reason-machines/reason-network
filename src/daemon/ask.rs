@@ -232,6 +232,7 @@ impl Daemon {
             name: Some("terminal".into()),
             dirs: Vec::new(),
             keep: false,
+            codex_home: None,
         };
         if let Err(e) = self.hook(call).await {
             log(&format!("couldn't register {}/terminal: {e:#}", self.person));
@@ -569,6 +570,7 @@ mod tests {
             pid: None,
             tier: crate::proto::Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         let address = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
         d.answer_later("codex:1", "ship it?", &Answer::Approved(String::new()));

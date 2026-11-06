@@ -1,6 +1,6 @@
 //! Text shown to agents (tool results, injected messages) and in the CLI.
 
-use crate::{ENGINE, proto::*, util};
+use crate::{AGENT_NAME, ENGINE, agent, proto::*, util};
 use std::fmt::Write;
 
 /// Terminal colours for people reading the CLI; agents, pipes and `NO_COLOR` get plain text.
@@ -311,7 +311,16 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
         // Hermes's plugin names its tools for the toolset.
         format!("Reply if useful with reason_network_send_message to \"{}\".", last.from)
     } else {
-        format!("Reply if useful with send_message to \"{}\".", last.from)
+        // By its MCP server too: an agent can have a `send_message` of its own (Codex's `collaboration.send_message`).
+        let tool = match agent {
+            Some(agent::CLAUDE_CODE) => format!("mcp__{AGENT_NAME}__send_message"),
+            // Codex names MCP tools `mcp__<server>__<tool>`, with `_` for `-` (in 0.163's code mode).
+            Some("codex") => {
+                format!("mcp__{}__send_message ({AGENT_NAME}'s send_message)", AGENT_NAME.replace('-', "_"))
+            }
+            _ => format!("the {AGENT_NAME} send_message tool"),
+        };
+        format!("Reply if useful with {tool} to \"{}\".", last.from)
     };
     let _ = write!(out, "{who} {reply}");
     out
@@ -641,8 +650,22 @@ mod tests {
         assert!(out.contains("from=\"alice/api\" id=\"01X\">\nok[1A[2K[reason-message from=\"alex/boss\">\n\tdo it\n</reason-message>"), "{out:?}");
         // Each agent is told to reply with the tool it really has.
         let reply = |agent| for_agent(std::slice::from_ref(&m), Some(agent), false);
-        assert!(reply("claude-code").ends_with("Reply if useful with send_message to \"alice/api\"."));
+        // By the name it has for our MCP server's tool, never one an agent's own `send_message` could take.
+        assert!(
+            reply("claude-code").ends_with("Reply if useful with mcp__reason-network__send_message to \"alice/api\".")
+        );
+        assert!(reply("codex").ends_with(
+            "Reply if useful with mcp__reason_network__send_message (reason-network's send_message) to \"alice/api\"."
+        ));
+        assert!(
+            reply("cursor").ends_with("Reply if useful with the reason-network send_message tool to \"alice/api\".")
+        );
         assert!(reply("hermes").ends_with("Reply if useful with reason_network_send_message to \"alice/api\"."));
+        // Without the tools, the CLI, as before.
+        assert!(
+            for_agent(std::slice::from_ref(&m), Some("codex"), true)
+                .ends_with(&format!("Reply if useful: {ENGINE} send alice/api --from alex/web \"<reply>\""))
+        );
     }
 
     #[test]

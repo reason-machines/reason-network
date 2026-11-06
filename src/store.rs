@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -160,7 +160,8 @@ impl Store {
             "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",
             params![message.id, key, message.from, recipient, stage, message.sent_at],
         )?;
-        Ok(())
+        // Mail went from it: a reply goes to the name it sent from (see `settle_name`).
+        self.settle_name(key)
     }
     pub fn handoff(&self, ids: &[String], now: i64) -> Result<()> {
         for id in ids {
@@ -249,6 +250,16 @@ impl Store {
     pub fn open(path: &Path, inbox: PathBuf) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        // Added when a title could name a session: a session remembered from before may have had its name chosen, and
+        // nothing says which, so a title names none of them. One transaction, so the table is never there without them.
+        {
+            let tx = db.unchecked_transaction()?;
+            if !tx.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settled_names'")?.exists([])? {
+                tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", [])?;
+                tx.execute("INSERT INTO settled_names (key) SELECT DISTINCT key FROM sessions", [])?;
+            }
+            tx.commit()?;
+        }
         // Deleted rows are overwritten, not just let go (see `scrub`).
         db.execute_batch("PRAGMA secure_delete = ON;")?;
         // Only this user reads it, like machine.key: it holds the team link. (SQLite gives the log files the mode the
@@ -293,6 +304,13 @@ impl Store {
             ("native_app", "INTEGER NOT NULL DEFAULT 0"),
             ("native_hook_at", "INTEGER"),
             ("native_dirs", "TEXT NOT NULL DEFAULT '[]'"),
+            // The `CODEX_HOME` a Codex session's hooks named, for mail to reach it while it is offline.
+            ("codex_home", "TEXT"),
+            // The default name a session went by before its conversation's title named it: still its own, with its
+            // mail, for as long as the session is remembered (see `session_by_name`).
+            ("former", "TEXT"),
+            // Its hooks have told it the name it goes by now, in place of `former`.
+            ("told_renamed", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
@@ -368,6 +386,15 @@ impl Store {
         if n.as_ref().is_ok_and(|n| *n == 1) && !held {
             let _ = self.observe_reply(m);
         }
+        // Mail went to the session with this name: its name is settled (see `settle_name`).
+        if n.as_ref().is_ok_and(|n| *n == 1)
+            && let Some((_, name)) = m.to.split_once('/')
+        {
+            let _ = self.db.execute(
+                "INSERT OR IGNORE INTO settled_names (key) SELECT key FROM sessions WHERE name = ?1",
+                [name.split('@').next().unwrap_or(name)],
+            );
+        }
         match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
                 m.files = files::located(&dir, &k.files);
@@ -386,6 +413,33 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let sql = format!("SELECT {MESSAGE_COLS}, held FROM messages WHERE id = ?1");
         Ok(self.db.query_row(&sql, [id], |r| self.row(r)).optional()?)
+    }
+
+    /// The machine that took message `id` delivered it to `to`, the name the session it was sent to (at `from`, the
+    /// default name it went by before its title named it) goes by now: a reply from there is the one it waits for.
+    /// A reply from there that came before this (its machine sent it first, as it flushed its outbox on a reconnect)
+    /// counts now, checked as `observe_reply` checks one.
+    pub fn readdress_receipt(&self, id: &str, from: &str, to: &str) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        let n = transaction.execute(
+            "UPDATE sent_receipts SET recipient = ?3 WHERE id = ?1 AND recipient = ?2",
+            params![id, from, to],
+        )?;
+        if n > 0 {
+            transaction.execute(
+                "UPDATE sent_receipts SET stage = 'replied', updated_at = ?2 WHERE id = ?1 AND stage <> 'replied' \
+                 AND EXISTS (SELECT 1 FROM messages m WHERE m.reply_to = ?1 AND m.held = 0 \
+                 AND m.sender = sent_receipts.recipient AND m.recipient = sent_receipts.sender)",
+                params![id, crate::util::now_ms()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Who message `id` was sent to, as its receipt says.
+    pub fn receipt_recipient(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT recipient FROM sent_receipts WHERE id = ?1", [id], |r| r.get(0)).optional()?)
     }
 
     fn observe_reply(&self, message: &Message) -> Result<()> {
@@ -682,15 +736,20 @@ impl Store {
         Ok(changed)
     }
 
-    /// A renamed session keeps its unread mail.
-    pub fn rename(&self, old_name: &str, new_name: &str, old_addr: &str, new_addr: &str) -> Result<()> {
+    /// Unread mail follows a rename. On reclaim, keep the claimant attached so a later registration cannot inherit the mail.
+    pub fn rename(&self, person: &str, old_name: &str, new_name: &str, claimant: Option<&str>) -> Result<()> {
         let transaction = self.db.unchecked_transaction()?;
         transaction.execute(
             "UPDATE messages SET recipient = ?2 WHERE recipient = ?1 AND read_at IS NULL",
-            params![old_addr, new_addr],
+            params![format!("{person}/{old_name}"), format!("{person}/{new_name}")],
         )?;
         transaction.execute("DELETE FROM sessions WHERE name = ?1", [new_name])?;
-        transaction.execute("UPDATE sessions SET name = ?2 WHERE name = ?1", params![old_name, new_name])?;
+        let moved = transaction.execute(
+            "UPDATE sessions SET name = ?2, attached = max(attached, ?3 IS NOT NULL)
+             WHERE name = ?1 AND (?3 IS NULL OR key = ?3)",
+            params![old_name, new_name, claimant],
+        )?;
+        anyhow::ensure!(claimant.is_none() || moved == 1, "the session being renamed is no longer registered");
         transaction.commit()?;
         Ok(())
     }
@@ -703,7 +762,7 @@ impl Store {
             st.query_map(params![s.key, s.name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         for old in before {
-            self.rename(&old, &s.name, &format!("{person}/{old}"), &format!("{person}/{}", s.name))?;
+            self.rename(person, &old, &s.name, None)?;
         }
         // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
@@ -715,7 +774,10 @@ impl Store {
                  mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
                  native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
                  native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
-                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END"
+                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
+                 codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END,
+                 former = CASE WHEN key = ?2 THEN former ELSE NULL END,
+                 told_renamed = CASE WHEN key = ?2 THEN told_renamed ELSE 0 END"
             ),
             params![
                 s.name,
@@ -778,20 +840,84 @@ impl Store {
         Ok(())
     }
 
+    /// Settles a session's name: a title never renames it. Someone chose it (`/rename`, `set_name`, a name it
+    /// registered with), it came from the conversation's title, or mail went to or from it (a reply goes to the name
+    /// the mail had).
+    pub fn settle_name(&self, key: &str) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO settled_names (key) VALUES (?1)", [key])?;
+        Ok(())
+    }
+
+    pub fn name_settled(&self, key: &str) -> Result<bool> {
+        Ok(self.db.prepare_cached("SELECT 1 FROM settled_names WHERE key = ?1")?.exists([key])?)
+    }
+
     pub fn session_by_key(&self, key: &str) -> Result<Option<Remembered>> {
         let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1");
         Ok(self.db.query_row(&sql, [key], remembered).optional()?)
     }
 
+    /// The session remembered as `name`: by its name, or else by the default name it went by before its title named
+    /// it (`former`), which stays its own while it is remembered.
     pub fn session_by_name(&self, name: &str) -> Result<Option<Remembered>> {
-        let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE name = ?1");
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE name = ?1 OR former = ?1 ORDER BY name = ?1 DESC, last_seen DESC \
+             LIMIT 1"
+        );
         Ok(self.db.query_row(&sql, [name], remembered).optional()?)
+    }
+
+    /// Remembers the default name the session `name` went by before its title named it (`None`: no such name), and
+    /// whether its hooks have told it the name it goes by now.
+    pub fn set_former(&self, name: &str, former: Option<&str>, told: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = ?2, told_renamed = ?3 WHERE name = ?1",
+            params![name, former, former.is_some() && told],
+        )?;
+        Ok(())
+    }
+
+    /// The default name the session `key` went by before its title named it, as remembered, and whether its hooks
+    /// told it its name now.
+    pub fn former(&self, key: &str) -> Result<Option<(String, bool)>> {
+        let sql = "SELECT former, told_renamed FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1";
+        let row: Option<(Option<String>, bool)> =
+            self.db.query_row(sql, [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        Ok(row.and_then(|(f, told)| Some((f?, told))))
+    }
+
+    /// `key` takes `name`: a remembered session that went by it before its title named it, and has not kept it, gives
+    /// it up for good, so it never comes back to that session after a restart.
+    pub fn give_up_former(&self, name: &str, key: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = NULL, told_renamed = 0 WHERE former = ?1 AND key <> ?2",
+            params![name, key],
+        )?;
+        Ok(())
+    }
+
+    /// Each remembered session's former default name (see `set_former`), by its name now.
+    pub fn formers(&self) -> Result<HashMap<String, String>> {
+        let mut st = self.db.prepare_cached("SELECT name, former FROM sessions WHERE former IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn sessions(&self) -> Result<Vec<Remembered>> {
         let mut st = self.db.prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY name"))?;
         let rows = st.query_map([], remembered)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `CODEX_HOME` the hooks of the Codex session `key` run with (`None`: the default home).
+    pub fn remember_codex_home(&self, key: &str, home: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE sessions SET codex_home=?2 WHERE key=?1 AND agent='codex'", params![key, home])?;
+        Ok(())
+    }
+
+    pub fn codex_home(&self, key: &str) -> Result<Option<String>> {
+        let sql = "SELECT codex_home FROM sessions WHERE key=?1 AND agent='codex' ORDER BY last_seen DESC LIMIT 1";
+        Ok(self.db.query_row(sql, [key], |r| r.get(0)).optional()?.flatten())
     }
 
     pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>, dirs: &[String]) -> Result<()> {
@@ -876,8 +1002,9 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn a_failed_rename_keeps_the_sessions_and_their_unread_mail() {
-        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+    fn a_failed_reclaim_keeps_the_sessions_and_their_unread_mail() {
+        let inbox = temp_inbox();
+        let store = Store::open(Path::new(":memory:"), inbox.clone()).unwrap();
         for name in ["old", "new"] {
             store
                 .upsert_session(
@@ -891,7 +1018,7 @@ mod tests {
                         doing: None,
                         tier: Tier::Pull,
                         last_seen: 0,
-                        attached: true,
+                        attached: name == "new",
                         mailbox: false,
                     },
                     "lars",
@@ -899,6 +1026,12 @@ mod tests {
                 .unwrap();
         }
         store.insert(&mut message("pending", "lars/old"), false).unwrap();
+        store.insert(&mut with_files("held", "lars/new"), true).unwrap();
+        store.insert(&mut message("already-read", "lars/old"), false).unwrap();
+        store.mark_read(&["already-read".into()], 1).unwrap();
+        for key in ["old", "new"] {
+            store.remember_codex_home(key, Some(key)).unwrap();
+        }
         store
             .db
             .execute_batch(
@@ -906,15 +1039,67 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
             )
             .unwrap();
-        assert!(store.rename("old", "new", "lars/old", "lars/new").is_err());
+        assert!(store.rename("lars", "old", "new", Some("old")).is_err());
         assert_eq!(store.unread("lars/old").unwrap().len(), 1);
         assert!(store.unread("lars/new").unwrap().is_empty());
-        assert_eq!(store.sessions().unwrap().len(), 2);
+        assert!(!store.session_by_name("old").unwrap().unwrap().attached);
+        assert_eq!(store.session_by_name("new").unwrap().unwrap().key, "new");
+        assert_eq!(store.held().unwrap()[0].id, "held");
         store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
-        store.rename("old", "new", "lars/old", "lars/new").unwrap();
+        store.rename("lars", "old", "new", Some("old")).unwrap();
         assert!(store.unread("lars/old").unwrap().is_empty());
         assert_eq!(store.unread("lars/new").unwrap().len(), 1);
-        assert_eq!(store.sessions().unwrap().len(), 1);
+        let owner = store.session_by_name("new").unwrap().unwrap();
+        assert_eq!(owner.key, "old");
+        assert!(owner.kept());
+        assert!(store.session_by_key("new").unwrap().is_none());
+        assert_eq!(store.codex_home("old").unwrap().as_deref(), Some("old"));
+        assert_eq!(store.message("already-read").unwrap().unwrap().to, "lars/old");
+        let (released, errors) = store.settle_held(&["held".into()], true).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(released[0].to, "lars/new");
+        assert_eq!(std::fs::read_to_string(folder(&released[0]).join("notes.md")).unwrap(), "# notes\n");
+        std::fs::remove_dir_all(inbox).unwrap();
+    }
+
+    #[test]
+    fn sessions_remembered_from_before_titles_keep_their_names() {
+        let dir = std::env::temp_dir().join(format!("reason-network-store-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("network.db");
+        let session = Remembered {
+            name: "api-claude-3".into(),
+            key: "claude-code:old".into(),
+            agent: "claude-code".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        // A database from an engine before titles named sessions: whether `api-claude-3` was chosen, nothing says.
+        {
+            let store = Store::open(&db, temp_inbox()).unwrap();
+            store.upsert_session(&session, "alex").unwrap();
+            store.db.execute("DROP TABLE settled_names", []).unwrap();
+            // A migration cut short (the engine stopped before the backfill) leaves no table behind to skip it next time.
+            let tx = store.db.unchecked_transaction().unwrap();
+            tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", []).unwrap();
+            drop(tx);
+        }
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert!(store.name_settled("claude-code:old").unwrap());
+        assert!(!store.name_settled("claude-code:new").unwrap());
+        // Opened again, it settles no more: a session since is the one it was.
+        store
+            .upsert_session(&Remembered { name: "api-claude".into(), key: "claude-code:new".into(), ..session }, "alex")
+            .unwrap();
+        drop(store);
+        assert!(!Store::open(&db, temp_inbox()).unwrap().name_settled("claude-code:new").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1073,6 +1258,31 @@ mod tests {
         store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
         assert_eq!(totals(&store), (1, 1));
         std::fs::remove_dir_all(&inbox).unwrap();
+    }
+
+    #[test]
+    fn a_codex_sessions_home_stays_with_it_and_never_goes_to_the_next_session_with_its_name() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = |key: &str| Remembered {
+            name: "api-codex".into(),
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen: 1,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&session("codex:t1"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap(), None);
+        store.remember_codex_home("codex:t1", Some("/work/.codex-b")).unwrap();
+        store.upsert_session(&Remembered { last_seen: 2, ..session("codex:t1") }, "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap().as_deref(), Some("/work/.codex-b"));
+        store.upsert_session(&session("codex:t2"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t2").unwrap(), None);
     }
 
     #[test]

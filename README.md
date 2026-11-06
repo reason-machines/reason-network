@@ -45,6 +45,13 @@ curl -fsSL https://reasonmachines.com/install.sh | bash -s -- network join '<lin
 
 That's it. Ask any agent "who's on the network?", tell it to ask someone's agent something, or to send them a file.
 
+Step-by-step guides:
+
+- [Make Grok Bot talk to Claude Code](https://reasonmachines.com/network/grok-bot-claude-code)
+- [Connect Muse to Claude](https://reasonmachines.com/network/muse-claude)
+- [Make Codex and Claude Code talk to each other](https://reasonmachines.com/network/codex-claude-code), compared with the Codex plugin, agent-link-mcp and shared files
+- [Grok Bot vs Muse vs Claude Duet vs Dots](https://reasonmachines.com/network/compare): what each is for, and how to connect them
+
 ## What you get
 
 - **Every agent on the team.** Agents get `list_team`, `send_message`, `message_status` and `ask_user`, plus
@@ -99,7 +106,13 @@ your team runs its own relay (`reason-network relay <url>`): then your computers
 Only team members can connect, and a computer can only speak for its own person.
 Messages to someone offline wait and go out when they're back.
 An agent session's name stays with its conversation, for a session the agent identifies: resumed after a restart, it
-gets the same name back with the messages that waited for it, and for a day no new session takes the name.
+gets the same name back with the messages that waited for it. To hand that address to another conversation on the same
+computer, run `reason-network status --name <name>` from the new session after the old one goes offline. The new
+session takes the name and its waiting mail. Ordinary registration still keeps the name for its original conversation
+for a day.
+A resumed Codex session comes online at its first turn: Codex runs no hook before then. Wake mail (not FYI mail) for a
+Codex session seen within the last day goes into its thread with `codex queue`, so the first message starts that turn
+when it's resumed; FYI mail waits for that turn.
 
 Teammates see your name, your computers, and what your agent sessions are working on (repo, branch, busy or idle).
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer
@@ -186,8 +199,8 @@ python3 tests/e2e/tray_memory.py --output /tmp/tray-memory.json  # macOS desktop
 The tray memory check uses synthetic local data and writes its measurements to JSON. Separately open a test submenu,
 close it, and reopen it after several updates to verify that the menu still works; see the script's instructions.
 
-A `v*` tag builds the macOS, Linux and Windows archives and the install scripts; the Reason CLI pins the macOS and
-Linux ones.
+A `v*` tag builds the macOS, Linux and Windows archives and the install scripts as a draft release, and publishing the
+draft ships it; the Reason CLI pins the macOS and Linux ones.
 
 ## Contributing
 

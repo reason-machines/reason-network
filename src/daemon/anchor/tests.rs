@@ -528,6 +528,7 @@ fn live_and_offline_permanent_mailboxes_are_announced_without_ordinary_sessions(
         agent: "cli".into(),
         cwd: "/".into(),
         agent_session_id: None,
+        claude_dir: None,
         pid: None,
         tier: Tier::Pull,
         name: Some("terminal".into()),
@@ -942,6 +943,7 @@ fn register_terminal(d: &Arc<Daemon>, name: &str) {
             agent: "cli".into(),
             cwd: "/".into(),
             agent_session_id: None,
+            claude_dir: None,
             pid: None,
             tier: Tier::Pull,
             name: Some(name.into()),
@@ -959,6 +961,7 @@ fn register_other_mailbox(d: &Arc<Daemon>) {
             agent: "cli".into(),
             cwd: "/".into(),
             agent_session_id: None,
+            claude_dir: None,
             pid: None,
             tier: Tier::Pull,
             name: Some("other".into()),
@@ -998,7 +1001,9 @@ async fn notices_created_after_a_terminal_rename_are_read_once_only_by_that_term
     let t = team(true);
     learn(&t);
     register_terminal(&t.daemon, "terminal");
-    t.daemon.set_status("cli:terminal", None, Some("operations".into())).unwrap();
+    t.daemon
+        .set_status("cli:terminal", None, Some("operations".into()), super::super::sessions::Rename::Explicit)
+        .unwrap();
     register_other_mailbox(&t.daemon);
     let msg = message();
     t.daemon.accept_anchor(t.source.public(), t.laptop.public(), msg.clone()).unwrap();

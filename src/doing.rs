@@ -24,6 +24,8 @@ pub struct Source {
     pub session: Option<String>,
     /// The transcript its hooks told us about.
     pub transcript: Option<PathBuf>,
+    /// The `CODEX_HOME` its hooks run with, if not the default.
+    pub codex_home: Option<PathBuf>,
 }
 
 /// `title · task in progress`, either alone, or nothing.
@@ -33,7 +35,9 @@ pub fn of(s: &Source) -> Option<String> {
         s.transcript.clone().or_else(|| claude.then(|| claude_transcript(s.session.as_deref()?)).flatten());
     let seen = transcript.as_deref().map(scan).unwrap_or_default();
     let task = claude.then(|| claude_task(s.session.as_deref()?)).flatten().or(seen.task.flatten());
-    let title = seen.title.or_else(|| (s.agent == "codex").then(|| codex_title(s.session.as_deref()?)).flatten());
+    let title = seen.title.or_else(|| {
+        (s.agent == "codex").then(|| codex_title(s.session.as_deref()?, s.codex_home.as_deref())).flatten()
+    });
     let line = match (title, task) {
         (Some(t), Some(k)) if !t.eq_ignore_ascii_case(&k) => format!("{t} · {k}"),
         (Some(t), _) => t,
@@ -41,6 +45,15 @@ pub fn of(s: &Source) -> Option<String> {
         (None, None) => return None,
     };
     Some(clip(&crate::team::without_tickets(&line)))
+}
+
+/// A Claude Code session's title alone (its `ai-title`), which says what the conversation is about.
+pub fn title(s: &Source) -> Option<String> {
+    if s.agent != agent::CLAUDE_CODE {
+        return None;
+    }
+    let transcript = s.transcript.clone().or_else(|| claude_transcript(s.session.as_deref()?))?;
+    scan(&transcript).title
 }
 
 fn clip(s: &str) -> String {
@@ -184,16 +197,20 @@ fn claude_task(session: &str) -> Option<String> {
         })
 }
 
-/// Codex names its threads in `~/.codex/session_index.jsonl` (appended to; the last entry wins).
-fn codex_title(thread: &str) -> Option<String> {
+/// Codex names its threads in `~/.codex/session_index.jsonl` (appended to; the last entry wins), or in that file under
+/// the `CODEX_HOME` the session's hooks run with.
+fn codex_title(thread: &str, home: Option<&Path>) -> Option<String> {
     /// Thread names as of the file's modification time.
     type Names = (Option<SystemTime>, HashMap<String, String>);
-    static INDEX: OnceLock<Mutex<Names>> = OnceLock::new();
-    let path = std::env::var_os("CODEX_HOME")
-        .map_or_else(|| paths::user_home().join(".codex"), PathBuf::from)
+    static INDEX: OnceLock<Mutex<HashMap<PathBuf, Names>>> = OnceLock::new();
+    let path = home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| paths::user_home().join(".codex"))
         .join("session_index.jsonl");
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-    let mut index = INDEX.get_or_init(Default::default).lock().unwrap();
+    let mut indexes = INDEX.get_or_init(Default::default).lock().unwrap();
+    let index = indexes.entry(path.clone()).or_default();
     if index.0 != Some(modified) {
         let mut file = File::open(&path).ok()?;
         let len = file.metadata().ok()?.len();
@@ -274,8 +291,27 @@ mod tests {
         let line = |v: Value| format!("{v}\n");
         let todo = serde_json::json!({"todos": [{"content": format!("join {ticket}"), "status": "in_progress"}]});
         std::fs::write(&p, line(serde_json::json!({"type": "ai-title", "aiTitle": title})) + &line(todo)).unwrap();
-        let s = Source { agent: "cursor".into(), session: None, transcript: Some(p) };
+        let s = Source { agent: "cursor".into(), session: None, transcript: Some(p), codex_home: None };
         assert_eq!(of(&s).as_deref(), Some("Join the Reason Network: (team link) · join (team link)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_codex_thread_is_named_from_the_home_its_hooks_run_with() {
+        let dir = std::env::temp_dir().join(format!("reason-network-doing-codex-{}", std::process::id()));
+        let source = |home: &str| Source {
+            agent: "codex".into(),
+            session: Some("thread-1".into()),
+            transcript: None,
+            codex_home: Some(dir.join(home)),
+        };
+        for (home, name) in [("one", "Fix the login"), ("two", "Ship the docs")] {
+            std::fs::create_dir_all(dir.join(home)).unwrap();
+            let line = serde_json::json!({ "id": "thread-1", "thread_name": name });
+            std::fs::write(dir.join(home).join("session_index.jsonl"), format!("{line}\n")).unwrap();
+        }
+        assert_eq!(of(&source("one")).as_deref(), Some("Fix the login"));
+        assert_eq!(of(&source("two")).as_deref(), Some("Ship the docs"));
+        assert_eq!(of(&source("none")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -54,6 +54,9 @@ struct Cand {
     live: bool,
     repo: Option<String>,
     place: Place,
+    /// For the default name a session here went by before its title named it, the name it goes by now: it reaches that
+    /// session by name only.
+    former: Option<String>,
 }
 
 enum Place {
@@ -64,7 +67,12 @@ enum Place {
 impl Daemon {
     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
-        let claude = self.shared(tokio::task::spawn_blocking(claude::scan).await?);
+        // Sessions of Claude Code run with another `CLAUDE_CONFIG_DIR` than ours are listed in that directory.
+        let dirs: Vec<std::path::PathBuf> = {
+            let g = self.inner.lock().unwrap();
+            g.live.values().filter_map(|l| l.reg.claude_dir.as_ref().map(std::path::PathBuf::from)).collect()
+        };
+        let claude = self.shared(tokio::task::spawn_blocking(move || claude::scan_in(&dirs)).await?);
         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
         let mut gits: HashMap<String, GitInfo> = HashMap::new();
@@ -76,25 +84,28 @@ impl Daemon {
         // With Claude Code on Reason Network, every open Claude session is on it: sessions started before Reason Network was set
         // up have no Reason Network tools, but take messages through their own socket and reply with the CLI.
         if claude::wired() {
-            let now = util::now_ms();
-            for c in &claude {
-                let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
-                self.claude_seen(c, git, now);
-            }
+            self.claude_scanned(&claude, &gits, util::now_ms());
         }
-        // A Claude Code session someone renamed goes by that name here too.
+        // A Claude Code session someone renamed goes by that name here too, and a title never renames it.
         let renames: Vec<(String, String)> = {
             let g = self.inner.lock().unwrap();
-            g.live
+            let chosen: Vec<(String, String)> = g
+                .live
                 .iter()
                 .filter_map(|(k, l)| {
                     let name = util::slug(claude.iter().find(|c| claude_match(c, &l.reg))?.chosen_name()?);
-                    (!name.is_empty() && name != l.name).then(|| (k.clone(), name))
+                    (!name.is_empty()).then(|| (k.clone(), name))
                 })
-                .collect()
+                .collect();
+            for (key, name) in &chosen {
+                if g.live[key].name == *name {
+                    let _ = g.store.settle_name(key);
+                }
+            }
+            chosen.into_iter().filter(|(k, n)| g.live[k].name != *n).collect()
         };
         for (key, name) in renames {
-            let _ = self.set_status(&key, None, Some(name));
+            let _ = self.set_status(&key, None, Some(name), super::sessions::Rename::Automatic);
         }
         // What each session is doing, from what its agent records anyway (title, task in progress).
         let sources: Vec<(String, doing::Source)> = {
@@ -102,19 +113,41 @@ impl Daemon {
             let live = g.live.iter().map(|(k, l)| {
                 let session = claude.iter().find(|c| claude_match(c, &l.reg)).and_then(|c| c.session_id.clone());
                 let session = session.or_else(|| l.reg.agent_session_id.clone());
-                (k.clone(), doing::Source { agent: l.reg.agent.clone(), session, transcript: l.transcript.clone() })
+                let source = doing::Source {
+                    agent: l.reg.agent.clone(),
+                    session,
+                    transcript: l.transcript.clone(),
+                    codex_home: l.codex_home.clone().map(Into::into),
+                };
+                (k.clone(), source)
             });
             let unmanaged = claude.iter().map(|c| {
-                let source =
-                    doing::Source { agent: agent::CLAUDE_CODE.into(), session: c.session_id.clone(), transcript: None };
+                let source = doing::Source {
+                    agent: agent::CLAUDE_CODE.into(),
+                    session: c.session_id.clone(),
+                    transcript: None,
+                    codex_home: None,
+                };
                 (format!("pid:{}", c.pid), source)
             });
             live.chain(unmanaged).collect()
         };
-        let doings: HashMap<String, String> = tokio::task::spawn_blocking(move || {
-            sources.into_iter().filter_map(|(k, s)| Some((k, doing::of(&s)?))).collect()
-        })
-        .await?;
+        let (doings, titles): (HashMap<String, String>, HashMap<String, String>) =
+            tokio::task::spawn_blocking(move || {
+                let mut doings = HashMap::new();
+                let mut titles = HashMap::new();
+                for (k, s) in sources {
+                    if let Some(t) = doing::title(&s) {
+                        titles.insert(k.clone(), t);
+                    }
+                    if let Some(d) = doing::of(&s) {
+                        doings.insert(k, d);
+                    }
+                }
+                (doings, titles)
+            })
+            .await?;
+        self.name_after_titles(&titles);
 
         let mut g = self.inner.lock().unwrap();
         self.prune(&mut g);
@@ -147,7 +180,7 @@ impl Daemon {
             rows.push(row);
         }
         if unmanaged {
-            for c in claude.iter().filter(|c| !matched.contains(&c.pid)) {
+            for c in claude.iter().filter(|c| !c.elsewhere && !matched.contains(&c.pid)) {
                 let cwd = c.cwd.clone().unwrap_or_default();
                 let name = c.label().unwrap_or_else(|| format!("claude-{}", c.pid));
                 let mut row = self.row(&name, agent::CLAUDE_CODE, &cwd, gits.get(&cwd));
@@ -158,6 +191,45 @@ impl Daemon {
             }
         }
         Ok(rows)
+    }
+
+    /// A session still on the name it got for asking none (`api-claude`, `api-claude-3`) goes by its folder and what
+    /// its conversation is about once its agent has titled it (`api-fix-the-login-bug`), so the chats in one folder can
+    /// be told apart, by the person and by the agents they ask to message one. Claude Code's only, which titles each
+    /// conversation. Once: a name from a title, or one someone chose (`/rename`, `set_name`), stays. Its mail comes
+    /// along, as for any rename, and while it is live the default name stays its own too: mail to the name it was told
+    /// at its start still reaches it, and its next hook tells it the new one (see `Live::former`). `-2`, `-3`, … when the
+    /// name is taken, and the default name is kept when none of those is free. Not one that mail went to or from: a
+    /// reply goes to the name the mail had (see `title_may_name`, checked again under the rename's lock).
+    fn name_after_titles(&self, titles: &HashMap<String, String>) {
+        let renames: Vec<(String, String)> = {
+            let g = self.inner.lock().unwrap();
+            g.live
+                .iter()
+                .filter(|(k, l)| super::sessions::title_may_name(&g, k, l).unwrap_or(false))
+                .filter_map(|(k, l)| Some((k.clone(), agent::titled_name(&l.reg.cwd, &l.git, titles.get(k)?)?)))
+                .collect()
+        };
+        for (key, base) in renames {
+            let names = std::iter::once(base.clone()).chain((2..10).map(|i| util::joined(&base, &i.to_string())));
+            for name in names {
+                // Renamed, or no longer to be (named meanwhile): either way, done with it.
+                if self.name_from_title(&key, name).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Every session of a scan of Claude Code's registries, each `claude_seen`.
+    fn claude_scanned(self: &Arc<Self>, claude: &[ClaudeSession], gits: &HashMap<String, GitInfo>, now: i64) {
+        // Only our own profile's: the daemon can't post into another's sessions, so it neither lists one there that
+        // has no MCP server of its own nor ends one its server registered (`/clear`); those just go by their names
+        // there.
+        for c in claude.iter().filter(|c| !c.elsewhere) {
+            let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
+            self.claude_seen(c, git, now);
+        }
     }
 
     /// A live Claude Code session in Claude Code's own registry: on the team, and the conversation its process is in.
@@ -186,6 +258,7 @@ impl Daemon {
                 pid: Some(c.pid),
                 tier: Tier::Push,
                 name: if named { c.label() } else { None },
+                claude_dir: None,
             };
             if let Err(e) = self.register(None, reg, git) {
                 super::log(&format!("adding the Claude session of process {}: {e:#}", c.pid));
@@ -227,7 +300,8 @@ impl Daemon {
 
     /// Sessions this machine remembers (gone for now), but none from a folder that is off.
     fn remembered(&self, g: &super::Inner) -> Vec<Remembered> {
-        let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+        let live: HashSet<&str> =
+            g.live.values().flat_map(|l| std::iter::once(l.name.as_str()).chain(l.former.as_deref())).collect();
         let mut known = g.store.sessions().unwrap_or_default();
         known.retain(|r| !live.contains(r.name.as_str()) && !self.cfg.off_in(&r.cwd));
         known
@@ -251,8 +325,27 @@ impl Daemon {
         known.sort_by_key(|r| -r.last_seen);
         // Not the person's own mailboxes: each machine has its own (`terminal`).
         let now = util::now_ms();
-        let kept: Vec<String> =
-            known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()).collect();
+        // A session's former default name (see `Live::former`) reaches it from teammates' machines too, and stays its
+        // own on the person's other machines: a live one's, and an offline one's while its name is kept.
+        let offline_formers = g.store.formers().unwrap_or_default();
+        let formers: Vec<String> = g.live.values().filter_map(|l| l.former.clone()).collect();
+        let kept: Vec<String> = formers
+            .iter()
+            .cloned()
+            .chain(
+                known
+                    .iter()
+                    .filter(|r| r.agent != "cli" && self.holds(r, now))
+                    .flat_map(|r| std::iter::once(r.name.clone()).chain(offline_formers.get(&r.name).cloned())),
+            )
+            .collect();
+        let known: Vec<String> = known
+            .into_iter()
+            .flat_map(|r| {
+                let former = offline_formers.get(&r.name).cloned();
+                std::iter::once(r.name).chain(former)
+            })
+            .collect();
         // Teammates' machines take 100 of each, so only the most recent go; the rest are named only here.
         if kept.len() > PRESENCE_NAMES && !self.capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
             super::log(&format!(
@@ -279,7 +372,7 @@ impl Daemon {
         }
         Presence {
             sessions,
-            known: known.into_iter().take(PRESENCE_NAMES).map(|r| r.name).collect(),
+            known: formers.into_iter().chain(known).take(PRESENCE_NAMES).collect(),
             kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
             features,
             mailboxes,
@@ -382,24 +475,33 @@ impl Daemon {
     fn candidates(&self, g: &super::Inner, remotes: &HashMap<EndpointId, Remote>) -> Vec<Cand> {
         let mut out = Vec::new();
         for l in g.live.values() {
-            out.push(Cand {
-                person: self.person.clone(),
-                name: l.name.clone(),
-                machine: self.machine.clone(),
-                live: true,
-                repo: l.git.repo.clone(),
-                place: Place::Local(Some(l.reg.key.clone())),
-            });
+            for (name, former) in std::iter::once((&l.name, None)).chain(l.former.iter().map(|f| (f, Some(&l.name)))) {
+                out.push(Cand {
+                    person: self.person.clone(),
+                    name: name.clone(),
+                    machine: self.machine.clone(),
+                    live: true,
+                    repo: l.git.repo.clone(),
+                    place: Place::Local(Some(l.reg.key.clone())),
+                    former: former.cloned(),
+                });
+            }
         }
+        let offline_formers = g.store.formers().unwrap_or_default();
         for r in self.remembered(g) {
-            out.push(Cand {
-                person: self.person.clone(),
-                name: r.name,
-                machine: self.machine.clone(),
-                live: false,
-                repo: r.repo,
-                place: Place::Local(None),
-            });
+            let former = offline_formers.get(&r.name).cloned();
+            let now = r.name.clone();
+            for (name, is_former) in std::iter::once((r.name, None)).chain(former.map(|f| (f, Some(now)))) {
+                out.push(Cand {
+                    person: self.person.clone(),
+                    name,
+                    machine: self.machine.clone(),
+                    live: false,
+                    repo: r.repo.clone(),
+                    place: Place::Local(None),
+                    former: is_former,
+                });
+            }
         }
         let Some(team) = &g.team else { return out };
         for (id, rem) in remotes {
@@ -413,6 +515,7 @@ impl Daemon {
                     live: rem.online && s.tier != Tier::None,
                     repo: s.repo.clone(),
                     place: Place::Remote(*id, rem.online),
+                    former: None,
                 });
             }
             for n in rem.presence.known.iter().filter(|n| !names.contains(n.as_str())) {
@@ -423,6 +526,7 @@ impl Daemon {
                     live: false,
                     repo: None,
                     place: Place::Remote(*id, rem.online),
+                    former: None,
                 });
             }
         }
@@ -440,6 +544,7 @@ impl Daemon {
                     live: false,
                     repo: None,
                     place: Place::Remote(route.machine, false),
+                    former: None,
                 });
             }
         }
@@ -470,7 +575,13 @@ impl Daemon {
             people.push(self.person.clone());
         }
         let target = |c: &Cand| match &c.place {
-            Place::Local(key) => Target::Session { address: self.addr(&c.name), key: key.clone() },
+            // A session at the name it goes by now, as its mail is kept.
+            Place::Local(key) => Target::Session {
+                address: self.addr(
+                    key.as_ref().and_then(|k| g.live.get(k)).map_or(c.former.as_ref().unwrap_or(&c.name), |l| &l.name),
+                ),
+                key: key.clone(),
+            },
             Place::Remote(id, online) => Target::Remote {
                 address: format!("{}/{}", c.person, c.name),
                 machine: *id,
@@ -479,7 +590,7 @@ impl Daemon {
             },
         };
         let live_matching = |f: &dyn Fn(&Cand) -> bool| -> Vec<Target> {
-            cands.iter().filter(|c| c.live && f(c)).map(|c| target(c)).collect()
+            cands.iter().filter(|c| c.live && c.former.is_none() && f(c)).map(|c| target(c)).collect()
         };
 
         let targets = if spec == "*" {
@@ -560,6 +671,7 @@ fn claude_match(c: &ClaudeSession, reg: &SessionReg) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sessions::Rename;
     use super::*;
 
     #[tokio::test]
@@ -576,6 +688,7 @@ mod tests {
                 pid: Some(pid),
                 tier: Tier::Push,
                 name: None,
+                claude_dir: None,
             };
             d.register(Some(conn), reg, GitInfo::default()).unwrap().name
         };
@@ -599,13 +712,130 @@ mod tests {
             .unwrap();
         assert_eq!(res.recipients[0].state, "queued");
         assert!(
-            res.recipients[0].note.ends_with("it reaches that session when it's back"),
+            res.recipients[0].note.ends_with("unless another session here explicitly takes its name"),
             "{}",
             res.recipients[0].note
         );
         let g = d.inner.lock().unwrap();
         assert_eq!(g.live["claude-code:after"].name, "api-claude-2");
         assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_in_another_claude_config_dir_goes_by_the_name_given_there() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        // `CLAUDE_CONFIG_DIR=~/.claude-b claude --name my-session`: its registry is in that profile, not the daemon's.
+        let profile = std::env::temp_dir().join(format!("reason-network-claude-b-{}", std::process::id()));
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let pid = std::process::id();
+        let entry = serde_json::json!({
+            "pid": pid, "sessionId": "b", "cwd": "/work/api", "name": "my-session", "nameSource": "user"
+        });
+        std::fs::write(profile.join("sessions").join(format!("{pid}.json")), entry.to_string()).unwrap();
+        let reg = SessionReg {
+            key: "claude-code:b".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("b".into()),
+            pid: Some(pid),
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some(profile.to_string_lossy().into_owned()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude");
+        let rows = d.local_rows(None, false).await.unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert!(names.iter().any(|a| a.ends_with("/my-session")), "{names:?}");
+    }
+
+    /// An entry of another profile's registry (`CLAUDE_CONFIG_DIR=~/.claude-b`), as `claude::scan_in` reads it.
+    fn elsewhere(entry: serde_json::Value) -> ClaudeSession {
+        ClaudeSession { elsewhere: true, ..serde_json::from_value(entry).unwrap() }
+    }
+
+    #[tokio::test]
+    async fn a_clear_in_another_claude_config_dir_keeps_its_session_pushed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let pid = std::process::id();
+        // Its MCP server registered it, with its connection, from the other profile.
+        let reg = SessionReg {
+            key: "claude-code:before".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("before".into()),
+            pid: Some(pid),
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some("/home/u/.claude-b".into()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude");
+        // `/clear` there: that profile's registry names the new conversation; the daemon can't post into it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": pid, "sessionId": "after", "cwd": "/work/api", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let g = d.inner.lock().unwrap();
+        let live: Vec<&String> = g.live.keys().collect();
+        assert_eq!(live, ["claude-code:before"]);
+        assert_eq!(g.live["claude-code:before"].reg.tier, Tier::Push);
+        assert!(g.live["claude-code:before"].conn.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_in_another_claude_config_dir_without_reason_network_is_not_listed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let codex = SessionReg {
+            key: "codex:1".into(),
+            agent: "codex".into(),
+            cwd: "/work/web".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+            claude_dir: None,
+        };
+        d.register(Some(1), codex, GitInfo::default()).unwrap();
+        // A session in the other profile with no MCP server of ours: only its registry entry knows of it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": std::process::id(), "sessionId": "b", "cwd": "/work/api", "name": "unmanaged-b",
+            "nameSource": "user", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+        assert_eq!(live, ["codex:1"]);
+        let err = d.send("codex:1".into(), "unmanaged-b", "hi", None, true, false, None, Vec::new()).await.unwrap_err();
+        assert!(err.to_string().starts_with("no session called 'unmanaged-b'"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_directory_lists_no_session_of_another_claude_config_dir_that_no_mcp_server_registered() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let profile = std::env::temp_dir().join(format!("reason-network-claude-b-unmanaged-{}", std::process::id()));
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let pid = std::process::id();
+        // Another session of that profile registered it (no process of its own, so nothing matches it by pid).
+        let reg = SessionReg {
+            key: "claude-code:managed".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/web".into(),
+            agent_session_id: Some("managed".into()),
+            pid: None,
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some(profile.to_string_lossy().into_owned()),
+        };
+        d.register(Some(1), reg, GitInfo::default()).unwrap();
+        // A session there with no MCP server of ours: only that profile's registry knows of it.
+        let entry = serde_json::json!({
+            "pid": pid, "sessionId": "unmanaged", "cwd": "/work/api", "name": "unmanaged-b", "nameSource": "user"
+        });
+        std::fs::write(profile.join("sessions").join(format!("{pid}.json")), entry.to_string()).unwrap();
+        let rows = d.local_rows(None, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert!(!names.iter().any(|a| a.ends_with("/unmanaged-b")), "{names:?}");
+        assert!(names.iter().any(|a| a.ends_with("/web-claude")), "{names:?}");
     }
 
     #[tokio::test]
@@ -627,6 +857,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude-2");
         // The scan, again and again, leaves it alone.
@@ -636,6 +867,202 @@ mod tests {
         let mut live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
         live.sort();
         assert_eq!(live, ["claude-code:inner", "claude-code:outer"]);
+    }
+
+    #[tokio::test]
+    async fn chats_in_one_folder_go_by_what_they_are_about_once_titled() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let dir = std::env::temp_dir().join(format!("reason-network-titles-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = |id: &str, conn: u64| {
+            let reg = SessionReg {
+                key: format!("claude-code:{id}"),
+                agent: agent::CLAUDE_CODE.into(),
+                cwd: "/work/api".into(),
+                agent_session_id: Some(id.into()),
+                pid: None,
+                tier: Tier::Pull,
+                name: None,
+                claude_dir: None,
+            };
+            d.register(Some(conn), reg, GitInfo::default()).unwrap().name
+        };
+        let titled = |id: &str, title: &str| {
+            let path = dir.join(format!("{id}.jsonl"));
+            let line = serde_json::json!({"type": "ai-title", "aiTitle": title, "sessionId": id});
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            d.inner.lock().unwrap().live.get_mut(&format!("claude-code:{id}")).unwrap().transcript = Some(path);
+        };
+        // Four chats in one folder: what they are called before Claude Code titles them.
+        assert_eq!(reg("a", 1), "api-claude");
+        assert_eq!(reg("b", 2), "api-claude-2");
+        assert_eq!(reg("c", 3), "api-claude-3");
+        assert_eq!(reg("d", 4), "api-claude-4");
+        // The person named one themselves; two get the same title.
+        d.set_status("claude-code:c", None, Some("review".into()), Rename::Explicit).unwrap();
+        titled("a", "Fix the login bug on Safari");
+        titled("b", "Add CSV export to reports");
+        titled("c", "Something else entirely");
+        titled("d", "Fix the login bug on Safari");
+        let rows = d.local_rows(None, false).await.unwrap();
+        let name = |id: &str| d.inner.lock().unwrap().live[&format!("claude-code:{id}")].name.clone();
+        let mut same = [name("a"), name("d")];
+        same.sort();
+        assert_eq!(same, ["api-fix-the-login-bug", "api-fix-the-login-bug-2"]);
+        assert_eq!(name("b"), "api-add-csv-export-to");
+        assert_eq!(name("c"), "review");
+        // The directory (list_team, `who`) shows the new names.
+        let mut shown: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        shown.sort();
+        assert_eq!(shown, ["api-add-csv-export-to", "api-fix-the-login-bug", "api-fix-the-login-bug-2", "review"]);
+        // A later title leaves a titled name alone.
+        titled("b", "Something new");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("b"), "api-add-csv-export-to");
+        let is_default = |n: &str| agent::is_default_name(n, agent::CLAUDE_CODE, "/work/api", &GitInfo::default());
+        // A title that reads like a default name (`Claude 7`) is still a title: the next one leaves it alone.
+        assert!(is_default(&reg("e", 5)));
+        titled("e", "Claude 7");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("e"), "api-claude-7");
+        titled("e", "Something new");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("e"), "api-claude-7");
+        // A name someone chose stays, even one that reads like a default. (Not `api-claude-3`: the chat titled
+        // `Claude 7` went by that, and keeps it while it is live.)
+        reg("f", 6);
+        assert!(d.set_status("claude-code:f", None, Some("api-claude-3".into()), Rename::Explicit).is_err());
+        d.set_status("claude-code:f", None, Some("api-claude-8".into()), Rename::Explicit).unwrap();
+        titled("f", "Rename me please");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("f"), "api-claude-8");
+        // So does one its MCP server asks for, after its hooks registered it under that name.
+        let first = reg("i", 9);
+        let asked = SessionReg {
+            key: "claude-code:i".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("i".into()),
+            pid: None,
+            tier: Tier::Pull,
+            name: Some(first.clone()),
+            claude_dir: None,
+        };
+        d.register(Some(10), asked, GitInfo::default()).unwrap();
+        titled("i", "Rename me too");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("i"), first);
+        // And the name of one that mail went from or to: a reply goes to the name the mail had.
+        let sender = reg("g", 7);
+        d.send("claude-code:g".into(), "review", "done?", None, true, false, None, Vec::new()).await.unwrap();
+        let receiver = reg("j", 11);
+        d.send("claude-code:c".into(), &receiver, "how is it going?", None, true, false, None, Vec::new())
+            .await
+            .unwrap();
+        titled("g", "Ship the release notes");
+        titled("j", "Write the changelog");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("g"), sender);
+        assert_eq!(name("j"), receiver);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr(&receiver)).unwrap(), 1);
+        // A title decided before someone named the session never overrides that name (checked under the rename's lock).
+        reg("h", 8);
+        d.set_status("claude-code:h", None, Some("mine".into()), Rename::Explicit).unwrap();
+        assert!(d.name_from_title("claude-code:h", "api-stale-title".into()).unwrap().is_none());
+        assert_eq!(name("h"), "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_chat_its_title_named_keeps_the_address_it_was_told() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let dir = std::env::temp_dir().join(format!("reason-network-former-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = |agent: &str, id: &str, conn: u64, name: Option<&str>| {
+            let reg = SessionReg {
+                key: format!("{agent}:{id}"),
+                agent: agent.into(),
+                cwd: "/work/api".into(),
+                agent_session_id: Some(id.into()),
+                pid: None,
+                tier: Tier::Pull,
+                name: name.map(str::to_string),
+                claude_dir: None,
+            };
+            d.register(Some(conn), reg, GitInfo::default()).unwrap().name
+        };
+        let titled = |key: &str, title: &str| {
+            let path = dir.join(format!("{}.jsonl", key.replace(':', "-")));
+            let line = serde_json::json!({"type": "ai-title", "aiTitle": title});
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            d.inner.lock().unwrap().live.get_mut(key).unwrap().transcript = Some(path);
+        };
+        let name = |key: &str| d.inner.lock().unwrap().live[key].name.clone();
+        let hook = |event: &str| crate::proto::HookCall {
+            through_reason: Some(false),
+            agent: agent::CLAUDE_CODE.into(),
+            event: event.into(),
+            session_id: "a".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+            codex_home: None,
+        };
+        reg("claude-code", "sender", 1, Some("sender"));
+        // Told at its start who it is: `api-claude`.
+        assert_eq!(reg(agent::CLAUDE_CODE, "a", 2, None), "api-claude");
+        assert_eq!(d.hook(hook("start")).await.unwrap().address.as_deref(), Some(d.addr("api-claude").as_str()));
+        titled("claude-code:a", "Fix the login bug on Safari");
+        d.local_rows(None, false).await.unwrap();
+        let now = d.addr("api-fix-the-login-bug");
+        assert_eq!(name("claude-code:a"), "api-fix-the-login-bug");
+        // The name it was told stays its own while it is live: a new chat in the folder gets another, nobody can take
+        // it, and the person's other machines hear it is taken.
+        assert_eq!(reg(agent::CLAUDE_CODE, "z", 3, None), "api-claude-2");
+        assert!(d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Explicit).is_err());
+        let presence = d.presence_of(Vec::new());
+        assert!(
+            presence.known.contains(&"api-claude".to_string()) && presence.kept.contains(&"api-claude".to_string())
+        );
+        // Mail to the address it was told reaches it, at its name now, not the new chat.
+        let sent =
+            d.send("claude-code:sender".into(), "api-claude", "still there?", None, true, false, None, Vec::new());
+        let sent = sent.await.unwrap();
+        assert_eq!(sent.recipients[0].address, now);
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&now).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+        }
+        // A list of everyone (`*`) reaches it once, by its name now.
+        {
+            let g = d.inner.lock().unwrap();
+            let all = d.resolve(&g, &HashMap::new(), "*", Some("claude-code:sender")).unwrap();
+            let mut all: Vec<String> = all.iter().map(|t| t.address()).collect();
+            all.sort();
+            assert_eq!(all, [d.addr("api-claude-2"), now.clone()]);
+        }
+        // Its next turn's hook tells it its new address, once.
+        let told = d.hook(hook("prompt")).await.unwrap();
+        let text = told.text.unwrap();
+        assert!(text.contains(&format!("you are {now} now")) && text.contains(&d.addr("api-claude")), "{text}");
+        assert_eq!(told.address.as_deref(), Some(now.as_str()));
+        assert_eq!(d.hook(hook("prompt")).await.unwrap().text, None);
+        // Gone, it keeps that name too, as it keeps its own (until it is forgotten).
+        d.inner.lock().unwrap().live.remove("claude-code:a");
+        assert_eq!(reg(agent::CLAUDE_CODE, "y", 4, None), "api-claude-3");
+        // Only Claude Code's chats go by their titles.
+        let codex = reg("codex", "x", 5, None);
+        titled("codex:x", "Fix the login bug on Safari");
+        d.local_rows(None, false).await.unwrap();
+        assert_eq!(name("codex:x"), codex);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -696,6 +1123,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: Some("terminal".into()),
+            claude_dir: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "terminal");
         let mut theirs = d.row("terminal", "cli", "/", None);
