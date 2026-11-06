@@ -139,8 +139,8 @@ pub struct Daemon {
     shown: Mutex<HashMap<String, Instant>>,
     /// Each session's `ask_user` question that is up, with its answer once there is one.
     asks: Mutex<HashMap<String, ask::Asking>>,
-    /// When this daemon started (ms): sessions live before it register again in the while after.
-    started: i64,
+    /// Until this deadline, sessions that were live before startup get time to register again.
+    startup_grace_ends: Instant,
     /// Whether the log says presence names only some of the names kept here.
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
@@ -153,6 +153,8 @@ pub struct Daemon {
 struct Inner {
     store: Store,
     live: HashMap<String, Live>,
+    /// During startup, only a conversation seen live by this daemon can be known to have left.
+    seen_since_start: HashSet<String>,
     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
     antigravity_conn: Option<u64>,
     next_conn: u64,
@@ -263,6 +265,7 @@ impl Daemon {
             inner: Mutex::new(Inner {
                 store,
                 live: HashMap::new(),
+                seen_since_start: HashSet::new(),
                 conns: HashMap::new(),
                 antigravity_conn: None,
                 next_conn: 0,
@@ -283,7 +286,7 @@ impl Daemon {
             rate: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
-            started: util::now_ms(),
+            startup_grace_ends: Instant::now() + sessions::HOOK_TTL,
             plain_until: Mutex::new(None),
             capped: Default::default(),
             #[cfg(test)]
@@ -387,7 +390,21 @@ impl Daemon {
                 let git = self.git(&session.cwd).await;
                 json!(self.register(Some(conn), session, git)?)
             }
-            Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
+            Request::SetStatus { key, doing, name, reclaim } => {
+                let rename = if reclaim { sessions::Rename::Explicit } else { sessions::Rename::Automatic };
+                let (r, reclaimed) = self.set_status_quiet(&key, doing, name, rename)?;
+                if reclaimed {
+                    let mut g = self.inner.lock().unwrap();
+                    // A hook may have read the mail, or the owner changed, since the rename released the lock.
+                    if g.live.get(&key).is_some_and(|l| l.name == r.name) {
+                        let wake: Vec<_> = g.pending(&r.address)?.into_iter().filter(|m| m.wake).collect();
+                        if !wake.is_empty() {
+                            self.deliver(&mut g, &key, wake, true);
+                        }
+                    }
+                }
+                json!(r)
+            }
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
             Request::Send { from, to, body, reply_to, wake, notify, files, purpose, idempotency_key } => {
                 let dims = crate::usage::Dimensions {

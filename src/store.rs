@@ -675,15 +675,20 @@ impl Store {
         Ok(changed)
     }
 
-    /// A renamed session keeps its unread mail.
-    pub fn rename(&self, old_name: &str, new_name: &str, old_addr: &str, new_addr: &str) -> Result<()> {
+    /// Unread mail follows a rename. On reclaim, keep the claimant attached so a later registration cannot inherit the mail.
+    pub fn rename(&self, person: &str, old_name: &str, new_name: &str, claimant: Option<&str>) -> Result<()> {
         let transaction = self.db.unchecked_transaction()?;
         transaction.execute(
             "UPDATE messages SET recipient = ?2 WHERE recipient = ?1 AND read_at IS NULL",
-            params![old_addr, new_addr],
+            params![format!("{person}/{old_name}"), format!("{person}/{new_name}")],
         )?;
         transaction.execute("DELETE FROM sessions WHERE name = ?1", [new_name])?;
-        transaction.execute("UPDATE sessions SET name = ?2 WHERE name = ?1", params![old_name, new_name])?;
+        let moved = transaction.execute(
+            "UPDATE sessions SET name = ?2, attached = max(attached, ?3 IS NOT NULL)
+             WHERE name = ?1 AND (?3 IS NULL OR key = ?3)",
+            params![old_name, new_name, claimant],
+        )?;
+        anyhow::ensure!(claimant.is_none() || moved == 1, "the session being renamed is no longer registered");
         transaction.commit()?;
         Ok(())
     }
@@ -696,7 +701,7 @@ impl Store {
             st.query_map(params![s.key, s.name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         for old in before {
-            self.rename(&old, &s.name, &format!("{person}/{old}"), &format!("{person}/{}", s.name))?;
+            self.rename(person, &old, &s.name, None)?;
         }
         // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
@@ -936,8 +941,9 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn a_failed_rename_keeps_the_sessions_and_their_unread_mail() {
-        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+    fn a_failed_reclaim_keeps_the_sessions_and_their_unread_mail() {
+        let inbox = temp_inbox();
+        let store = Store::open(Path::new(":memory:"), inbox.clone()).unwrap();
         for name in ["old", "new"] {
             store
                 .upsert_session(
@@ -951,7 +957,7 @@ mod tests {
                         doing: None,
                         tier: Tier::Pull,
                         last_seen: 0,
-                        attached: true,
+                        attached: name == "new",
                         mailbox: false,
                     },
                     "lars",
@@ -959,6 +965,12 @@ mod tests {
                 .unwrap();
         }
         store.insert(&mut message("pending", "lars/old"), false).unwrap();
+        store.insert(&mut with_files("held", "lars/new"), true).unwrap();
+        store.insert(&mut message("already-read", "lars/old"), false).unwrap();
+        store.mark_read(&["already-read".into()], 1).unwrap();
+        for key in ["old", "new"] {
+            store.remember_codex_home(key, Some(key)).unwrap();
+        }
         store
             .db
             .execute_batch(
@@ -966,15 +978,27 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
             )
             .unwrap();
-        assert!(store.rename("old", "new", "lars/old", "lars/new").is_err());
+        assert!(store.rename("lars", "old", "new", Some("old")).is_err());
         assert_eq!(store.unread("lars/old").unwrap().len(), 1);
         assert!(store.unread("lars/new").unwrap().is_empty());
-        assert_eq!(store.sessions().unwrap().len(), 2);
+        assert!(!store.session_by_name("old").unwrap().unwrap().attached);
+        assert_eq!(store.session_by_name("new").unwrap().unwrap().key, "new");
+        assert_eq!(store.held().unwrap()[0].id, "held");
         store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
-        store.rename("old", "new", "lars/old", "lars/new").unwrap();
+        store.rename("lars", "old", "new", Some("old")).unwrap();
         assert!(store.unread("lars/old").unwrap().is_empty());
         assert_eq!(store.unread("lars/new").unwrap().len(), 1);
-        assert_eq!(store.sessions().unwrap().len(), 1);
+        let owner = store.session_by_name("new").unwrap().unwrap();
+        assert_eq!(owner.key, "old");
+        assert!(owner.kept());
+        assert!(store.session_by_key("new").unwrap().is_none());
+        assert_eq!(store.codex_home("old").unwrap().as_deref(), Some("old"));
+        assert_eq!(store.message("already-read").unwrap().unwrap().to, "lars/old");
+        let (released, errors) = store.settle_held(&["held".into()], true).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(released[0].to, "lars/new");
+        assert_eq!(std::fs::read_to_string(folder(&released[0]).join("notes.md")).unwrap(), "# notes\n");
+        std::fs::remove_dir_all(inbox).unwrap();
     }
 
     #[test]

@@ -106,7 +106,10 @@ your team runs its own relay (`reason-network relay <url>`): then your computers
 Only team members can connect, and a computer can only speak for its own person.
 Messages to someone offline wait and go out when they're back.
 An agent session's name stays with its conversation, for a session the agent identifies: resumed after a restart, it
-gets the same name back with the messages that waited for it, and for a day no new session takes the name.
+gets the same name back with the messages that waited for it. To hand that address to another conversation on the same
+computer, run `reason-network status --name <name>` from the new session after the old one goes offline. The new
+session takes the name and its waiting mail. Ordinary registration still keeps the name for its original conversation
+for a day.
 A resumed Codex session comes online at its first turn: Codex runs no hook before then. Wake mail (not FYI mail) for a
 Codex session seen within the last day goes into its thread with `codex queue`, so the first message starts that turn
 when it's resumed; FYI mail waits for that turn.

@@ -81,11 +81,19 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
 - The same conversation coming back (the agent restarted or resumed it, or the daemon restarted) gets its name back,
   with the mail that waited for it, whichever sessions register first.
 - While it is offline, its name is **kept**: a new session, on this machine or another of the person's, gets the next
-  free name, also when it asks for that one (`listen --as`, a Claude Code session's own name), and a rename into it is
-  refused (`'api-claude' belongs to a session that is offline (last seen 3h ago); pick another name`).
+  free name, including when it asks for that one (`listen --as` or a Claude Code title).
+- From an identified session, `reason-network status --name <name>` can take an ordinary offline conversation's name on
+  this computer. The CLI sets `reclaim` on its local `SetStatus` request. A relay retrying a hosted assistant's name
+  leaves that flag unset, so the offline owner keeps its name and mail.
+  After a reclaim, both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
+  Wake mail is delivered as on registration. FYI mail waits for its next natural pause.
+  The former owner gets a free name if it resumes. Live names, names kept on other machines, and permanent mailboxes
+  cannot be reclaimed. During the first six hours after daemon startup, the old owner must have been seen live by
+  this daemon and gone offline again. Startup grace uses the daemon's monotonic clock so changing the system time
+  cannot cut it short. On systems where that clock pauses during sleep, the grace period pauses too.
 - The name lapses when its session would be forgotten (below: a day after it was last seen, never in the hours after the
-  daemon starts). Then it is free again, without that session's unread mail, which is dropped as the sender was told:
-  mail is never another conversation's. A conversation back after that is a new session.
+  daemon starts). Then it is free again. The daemon drops that session's unread mail as the sender was told.
+  A conversation back after that is a new session.
 - A conversation whose name a live session has when it comes back (another of the person's machines gave it out: one
   of an older engine, or one that hadn't heard yet that this machine keeps it) gets a new name, and its waiting mail
   moves to it.
@@ -250,12 +258,12 @@ teammate's message to that as well (and its files to theirs, below): one past it
 is kept. Mail for an offline session waits in the target
 machine's mailbox under the session name, for a day: a session gone longer is forgotten, with the mail it never
 read (not the person's own `listen` mailboxes, such as `terminal`, nor mail held for them; and nothing in the
-hours after the daemon starts, while live sessions register again). Until then the mail waits for that session, and the
-sender is told so ("…; it reaches that session when it's back"); for a session whose agent gives it no id, a new session
-that takes the name gets it, and the note says that instead. Mail held for the person's approval follows the same rule:
-held for a session whose name is kept, it goes when that session is forgotten, never to the next one, and its sender is
-told so up front ("held until alex approves it; dropped if that session is gone for a day first"). Live sessions are
-marked seen every 10 minutes, so a daemon that stops without seeing them go keeps their names from then.
+hours after the daemon starts, while live sessions register again). Until then it waits for the original conversation
+or a session that explicitly reclaims the name on that computer. For a session whose agent gives it no id, the next
+session that takes the name gets the mail. The sender's queue notice explains which rule applies. Mail held for the
+person's approval stays held across an explicit reclaim. If a kept session is forgotten, its held mail is dropped as
+the sender was told ("held until alex approves it; dropped if that session is gone for a day first"). Live sessions
+are marked seen every 10 minutes, so a daemon that stops without seeing them go keeps their names from then.
 
 **Files.** A message can carry small text files (`files: [{name, content}]`, at most 10, 256 KB each, 512 KB in all;
 UTF-8 with no control characters but tab and line ends), inside the same envelope, so they are as authenticated as its

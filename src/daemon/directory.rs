@@ -105,7 +105,7 @@ impl Daemon {
             chosen.into_iter().filter(|(k, n)| g.live[k].name != *n).collect()
         };
         for (key, name) in renames {
-            let _ = self.set_status(&key, None, Some(name));
+            let _ = self.set_status(&key, None, Some(name), super::sessions::Rename::Automatic);
         }
         // What each session is doing, from what its agent records anyway (title, task in progress).
         let sources: Vec<(String, doing::Source)> = {
@@ -614,6 +614,7 @@ fn claude_match(c: &ClaudeSession, reg: &SessionReg) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sessions::Rename;
     use super::*;
 
     #[tokio::test]
@@ -654,7 +655,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.recipients[0].state, "queued");
         assert!(
-            res.recipients[0].note.ends_with("it reaches that session when it's back"),
+            res.recipients[0].note.ends_with("unless another session here explicitly takes its name"),
             "{}",
             res.recipients[0].note
         );
@@ -841,7 +842,7 @@ mod tests {
         assert_eq!(reg("c", 3), "api-claude-3");
         assert_eq!(reg("d", 4), "api-claude-4");
         // The person named one themselves; two get the same title.
-        d.set_status("claude-code:c", None, Some("review".into())).unwrap();
+        d.set_status("claude-code:c", None, Some("review".into()), Rename::Explicit).unwrap();
         titled("a", "Fix the login bug on Safari");
         titled("b", "Add CSV export to reports");
         titled("c", "Something else entirely");
@@ -873,8 +874,8 @@ mod tests {
         // A name someone chose stays, even one that reads like a default. (Not `api-claude-3`: the chat titled
         // `Claude 7` went by that, and keeps it while it is live.)
         reg("f", 6);
-        assert!(d.set_status("claude-code:f", None, Some("api-claude-3".into())).is_err());
-        d.set_status("claude-code:f", None, Some("api-claude-8".into())).unwrap();
+        assert!(d.set_status("claude-code:f", None, Some("api-claude-3".into()), Rename::Explicit).is_err());
+        d.set_status("claude-code:f", None, Some("api-claude-8".into()), Rename::Explicit).unwrap();
         titled("f", "Rename me please");
         d.local_rows(None, false).await.unwrap();
         assert_eq!(name("f"), "api-claude-8");
@@ -909,7 +910,7 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr(&receiver)).unwrap(), 1);
         // A title decided before someone named the session never overrides that name (checked under the rename's lock).
         reg("h", 8);
-        d.set_status("claude-code:h", None, Some("mine".into())).unwrap();
+        d.set_status("claude-code:h", None, Some("mine".into()), Rename::Explicit).unwrap();
         assert!(d.name_from_title("claude-code:h", "api-stale-title".into()).unwrap().is_none());
         assert_eq!(name("h"), "mine");
         let _ = std::fs::remove_dir_all(&dir);
@@ -966,7 +967,7 @@ mod tests {
         // The name it was told stays its own while it is live: a new chat in the folder gets another, nobody can take
         // it, and the person's other machines hear it is taken.
         assert_eq!(reg(agent::CLAUDE_CODE, "z", 3, None), "api-claude-2");
-        assert!(d.set_status("claude-code:z", None, Some("api-claude".into())).is_err());
+        assert!(d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Explicit).is_err());
         let presence = d.presence_of(Vec::new());
         assert!(
             presence.known.contains(&"api-claude".to_string()) && presence.kept.contains(&"api-claude".to_string())
