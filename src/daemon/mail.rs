@@ -1169,6 +1169,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         d.register(Some(1), reg("codex:1", "/work/api"), crate::git::GitInfo::default()).unwrap();
         let to = d.register(Some(2), reg("codex:2", "/work/web"), crate::git::GitInfo::default()).unwrap().address;
@@ -1189,6 +1190,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         }
     }
 
@@ -1978,6 +1980,7 @@ mod tests {
             pid: None,
             tier,
             name: None,
+            claude_dir: None,
         };
         let to = d.register(Some(7), claude(Tier::Pull), crate::git::GitInfo::default()).unwrap().address;
         let send = |body: &'static str| d.send("codex:1".into(), &to, body, None, true, false, None, Vec::new());
