@@ -2050,6 +2050,33 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former, None);
     }
 
+    #[test]
+    fn mail_sent_again_to_an_old_name_says_where_it_went_then_not_who_has_the_name_now() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        settled(&mut d);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        // Bob's mail to the old name reaches the titled chat; word of where it went gets lost on the way back.
+        let first = from_bob(&d, "api-claude");
+        assert_eq!(d.receive_readdressed(bob.public(), first.clone()).unwrap().2, Some(d.addr(TITLED)));
+        // The titled chat ends, and another asks for the old name by name and gets it.
+        leave(&d, "claude-code:a", 0);
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Explicit).unwrap();
+        // Bob's machine sends it again: not delivered twice, and it went to the titled chat, where its reply comes from.
+        let (state, note, to) = d.receive_readdressed(bob.public(), first.clone()).unwrap();
+        assert_eq!((state.as_str(), note.as_str(), to), ("queued", "already delivered", Some(d.addr(TITLED))));
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+        }
+        // The same id from another of Bob's chats is not Bob's mail sent again: it says nothing of where that went.
+        let other = Message { from: "bob/other".into(), ..first };
+        assert_eq!(d.receive_readdressed(bob.public(), other).unwrap().2, None);
+    }
+
     #[tokio::test]
     async fn a_titled_chats_old_name_is_kept_for_it_once_it_ends_until_it_is_forgotten() {
         let (mut d, bob) = with_bob(memory_store(), false);

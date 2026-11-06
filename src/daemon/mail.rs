@@ -915,6 +915,13 @@ impl Daemon {
         let res = {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
+            // Sent again (word that it was taken got lost on the way): where it went then, not where its name leads now.
+            if let Some(had) = g.store.message(&msg.id)? {
+                if render::without_machine(&had.from) == msg.from && had.to != asked {
+                    *to = Some(had.to);
+                }
+                return Ok(("queued".into(), "already delivered".into()));
+            }
             let key = g.live_called(&name);
             // To the default name a live session went by before its title named it: that session's, at its name now.
             let name = match key.as_ref().map(|k| &g.live[k]) {
@@ -934,14 +941,10 @@ impl Daemon {
                 _ => name,
             };
             let name = name.as_str();
-            // Where it went, said only once it is taken (or was already): not for a refusal or a "retry".
+            // Where it went, said only once it is taken: not for a refusal or a "retry".
             let went = (msg.to != asked).then(|| msg.to.clone());
             if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
-            }
-            if g.store.has(&msg.id)? {
-                *to = went;
-                return Ok(("queued".into(), "already delivered".into()));
             }
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
             let bytes = files::size(&msg.files);
