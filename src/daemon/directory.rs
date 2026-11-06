@@ -81,11 +81,7 @@ impl Daemon {
         // With Claude Code on Reason Network, every open Claude session is on it: sessions started before Reason Network was set
         // up have no Reason Network tools, but take messages through their own socket and reply with the CLI.
         if claude::wired() {
-            let now = util::now_ms();
-            for c in &claude {
-                let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
-                self.claude_seen(c, git, now);
-            }
+            self.claude_scanned(&claude, &gits, util::now_ms());
         }
         // A Claude Code session someone renamed goes by that name here too.
         let renames: Vec<(String, String)> = {
@@ -162,7 +158,7 @@ impl Daemon {
             rows.push(row);
         }
         if unmanaged {
-            for c in claude.iter().filter(|c| !matched.contains(&c.pid)) {
+            for c in claude.iter().filter(|c| !c.elsewhere && !matched.contains(&c.pid)) {
                 let cwd = c.cwd.clone().unwrap_or_default();
                 let name = c.label().unwrap_or_else(|| format!("claude-{}", c.pid));
                 let mut row = self.row(&name, agent::CLAUDE_CODE, &cwd, gits.get(&cwd));
@@ -173,6 +169,17 @@ impl Daemon {
             }
         }
         Ok(rows)
+    }
+
+    /// Every session of a scan of Claude Code's registries, each `claude_seen`.
+    fn claude_scanned(self: &Arc<Self>, claude: &[ClaudeSession], gits: &HashMap<String, GitInfo>, now: i64) {
+        // Only our own profile's: the daemon can't post into another's sessions, so it neither lists one there that
+        // has no MCP server of its own nor ends one its server registered (`/clear`); those just go by their names
+        // there.
+        for c in claude.iter().filter(|c| !c.elsewhere) {
+            let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
+            self.claude_seen(c, git, now);
+        }
     }
 
     /// A live Claude Code session in Claude Code's own registry: on the team, and the conversation its process is in.
@@ -595,6 +602,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&profile);
         let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
         assert!(names.iter().any(|a| a.ends_with("/my-session")), "{names:?}");
+    }
+
+    /// An entry of another profile's registry (`CLAUDE_CONFIG_DIR=~/.claude-b`), as `claude::scan_in` reads it.
+    fn elsewhere(entry: serde_json::Value) -> ClaudeSession {
+        ClaudeSession { elsewhere: true, ..serde_json::from_value(entry).unwrap() }
+    }
+
+    #[tokio::test]
+    async fn a_clear_in_another_claude_config_dir_keeps_its_session_pushed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let pid = std::process::id();
+        // Its MCP server registered it, with its connection, from the other profile.
+        let reg = SessionReg {
+            key: "claude-code:before".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("before".into()),
+            pid: Some(pid),
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some("/home/u/.claude-b".into()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude");
+        // `/clear` there: that profile's registry names the new conversation; the daemon can't post into it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": pid, "sessionId": "after", "cwd": "/work/api", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let g = d.inner.lock().unwrap();
+        let live: Vec<&String> = g.live.keys().collect();
+        assert_eq!(live, ["claude-code:before"]);
+        assert_eq!(g.live["claude-code:before"].reg.tier, Tier::Push);
+        assert!(g.live["claude-code:before"].conn.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_in_another_claude_config_dir_without_reason_network_is_not_listed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let codex = SessionReg {
+            key: "codex:1".into(),
+            agent: "codex".into(),
+            cwd: "/work/web".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+            claude_dir: None,
+        };
+        d.register(Some(1), codex, GitInfo::default()).unwrap();
+        // A session in the other profile with no MCP server of ours: only its registry entry knows of it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": std::process::id(), "sessionId": "b", "cwd": "/work/api", "name": "unmanaged-b",
+            "nameSource": "user", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+        assert_eq!(live, ["codex:1"]);
+        let err = d.send("codex:1".into(), "unmanaged-b", "hi", None, true, false, None, Vec::new()).await.unwrap_err();
+        assert!(err.to_string().starts_with("no session called 'unmanaged-b'"), "{err:#}");
     }
 
     #[tokio::test]
