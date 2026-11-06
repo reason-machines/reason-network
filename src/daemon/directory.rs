@@ -664,6 +664,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_directory_lists_no_session_of_another_claude_config_dir_that_no_mcp_server_registered() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let profile = std::env::temp_dir().join(format!("reason-network-claude-b-unmanaged-{}", std::process::id()));
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let pid = std::process::id();
+        // Another session of that profile registered it (no process of its own, so nothing matches it by pid).
+        let reg = SessionReg {
+            key: "claude-code:managed".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/web".into(),
+            agent_session_id: Some("managed".into()),
+            pid: None,
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some(profile.to_string_lossy().into_owned()),
+        };
+        d.register(Some(1), reg, GitInfo::default()).unwrap();
+        // A session there with no MCP server of ours: only that profile's registry knows of it.
+        let entry = serde_json::json!({
+            "pid": pid, "sessionId": "unmanaged", "cwd": "/work/api", "name": "unmanaged-b", "nameSource": "user"
+        });
+        std::fs::write(profile.join("sessions").join(format!("{pid}.json")), entry.to_string()).unwrap();
+        let rows = d.local_rows(None, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert!(!names.iter().any(|a| a.ends_with("/unmanaged-b")), "{names:?}");
+        assert!(names.iter().any(|a| a.ends_with("/web-claude")), "{names:?}");
+    }
+
+    #[tokio::test]
     async fn a_headless_claude_run_from_an_interactive_ones_shell_is_a_session_of_its_own() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         // The interactive Claude, in `outer`, in Claude Code's registry.

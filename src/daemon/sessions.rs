@@ -761,6 +761,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registering_again_without_a_claude_dir_keeps_the_one_it_had() {
+        let d = super::super::test_daemon(Default::default());
+        let b = SessionReg { claude_dir: Some("/home/u/.claude-b".into()), ..claude("b") };
+        d.register_quiet(Some(1), b, GitInfo::default()).unwrap();
+        // A hook or the scan registers it again, knowing nothing of its Claude directory.
+        d.register_quiet(None, claude("b"), GitInfo::default()).unwrap();
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live["claude-code:b"].reg.claude_dir.as_deref(), Some("/home/u/.claude-b"));
+    }
+
     /// Registers a session through an MCP server of its own, as Claude Code runs one per session; a `cli` one as
     /// `listen --as` does, as one of the person's own mailboxes.
     fn join(d: &Daemon, reg: SessionReg) -> Registered {
