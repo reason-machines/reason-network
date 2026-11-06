@@ -284,12 +284,34 @@ pub fn label(agent: &str) -> &str {
     }
 }
 
-/// `<repo-or-dir>-<agent>`, e.g. `api-claude`.
-pub fn default_name(agent: &str, cwd: &str, git: &GitInfo) -> String {
+/// The repo's or directory's name, e.g. `api`, which a session's name starts with.
+fn folder(cwd: &str, git: &GitInfo) -> String {
     let dir = git.root.as_deref().unwrap_or(cwd);
     let base = util::slug(Path::new(dir).file_name().and_then(|n| n.to_str()).unwrap_or("home"));
-    let base = if base.is_empty() { "home".into() } else { base };
-    util::joined(&base, short(agent))
+    if base.is_empty() { "home".into() } else { base }
+}
+
+/// `<repo-or-dir>-<agent>`, e.g. `api-claude`.
+pub fn default_name(agent: &str, cwd: &str, git: &GitInfo) -> String {
+    util::joined(&folder(cwd, git), short(agent))
+}
+
+/// Whether `name` is the one a session gets when it asks for none: `default_name`, or it with `-2`, `-3`, ….
+pub fn is_default_name(name: &str, agent: &str, cwd: &str, git: &GitInfo) -> bool {
+    let base = default_name(agent, cwd, git);
+    // `-2`, `-3`, … as `pick_name` adds them, which cuts a long base short to fit.
+    name == base
+        || name.rsplit_once('-').is_some_and(|(_, n)| {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && name == util::joined(&base, n)
+        })
+}
+
+/// `<repo-or-dir>-<the first words of its title>`, e.g. `api-fix-the-login-bug`: the folder and what the conversation
+/// is about, so the person (and their other agents) can tell the chats in one folder apart. None for a title with no
+/// letters or digits.
+pub fn titled_name(cwd: &str, git: &GitInfo, title: &str) -> Option<String> {
+    let words = util::slug(&title.split_whitespace().take(4).collect::<Vec<_>>().join(" "));
+    (!words.is_empty()).then(|| util::joined(&folder(cwd, git), &words))
 }
 
 pub fn cwd() -> String {
@@ -589,6 +611,29 @@ mod tests {
         let git = GitInfo { root: Some("/Users/alex/src/API".into()), ..Default::default() };
         assert_eq!(default_name(CLAUDE_CODE, "/Users/alex/src/API/web", &git), "api-claude");
         assert_eq!(default_name("codex", "/tmp/My Thing", &GitInfo::default()), "my-thing-codex");
+    }
+
+    #[test]
+    fn default_names_and_titled_ones() {
+        let git = GitInfo { root: Some("/Users/alex/src/API".into()), ..Default::default() };
+        let cwd = "/Users/alex/src/API/web";
+        for name in ["api-claude", "api-claude-2", "api-claude-17"] {
+            assert!(is_default_name(name, CLAUDE_CODE, cwd, &git), "{name}");
+        }
+        for name in ["api-claude-", "api-claude-x", "api-claude2", "review", "api-fix-the-login-bug"] {
+            assert!(!is_default_name(name, CLAUDE_CODE, cwd, &git), "{name}");
+        }
+        assert_eq!(titled_name(cwd, &git, "Fix the login bug on Safari").as_deref(), Some("api-fix-the-login-bug"));
+        assert_eq!(
+            titled_name("/tmp/My Thing", &GitInfo::default(), "Résumé: export PDFs!").as_deref(),
+            Some("my-thing-resume-export-pdfs")
+        );
+        assert_eq!(titled_name(cwd, &git, " … "), None);
+        // In a folder with a long name, `-2` cuts the default short, as `pick_name` does.
+        let long = format!("/tmp/{}", "a".repeat(33));
+        let second = util::joined(&default_name(CLAUDE_CODE, &long, &GitInfo::default()), "2");
+        assert!(second.ends_with("-clau-2"), "{second}");
+        assert!(is_default_name(&second, CLAUDE_CODE, &long, &GitInfo::default()));
     }
 
     #[test]

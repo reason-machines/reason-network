@@ -47,6 +47,15 @@ pub fn of(s: &Source) -> Option<String> {
     Some(clip(&crate::team::without_tickets(&line)))
 }
 
+/// A Claude Code session's title alone (its `ai-title`), which says what the conversation is about.
+pub fn title(s: &Source) -> Option<String> {
+    if s.agent != agent::CLAUDE_CODE {
+        return None;
+    }
+    let transcript = s.transcript.clone().or_else(|| claude_transcript(s.session.as_deref()?))?;
+    scan(&transcript).title
+}
+
 fn clip(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= MAX_LEN { s } else { format!("{}…", s.chars().take(MAX_LEN - 1).collect::<String>()) }
