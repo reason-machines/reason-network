@@ -3,7 +3,6 @@
 use crate::{
     agent::{self, ClaudeSocket},
     client::Link,
-    config::OFF_HERE,
     proto::*,
     render,
 };
@@ -389,9 +388,9 @@ impl ReasonNetworkMcp {
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
         let cfg = crate::config::Config::load();
-        if cfg.off_in(&agent::cwd()) {
-            let warning = cfg.warning().map(|w| format!("; {w}")).unwrap_or_default();
-            anyhow::bail!("{OFF_HERE}{warning}");
+        let cwd = agent::cwd();
+        if cfg.off_in(&cwd) {
+            anyhow::bail!(cfg.off_message(&cwd));
         }
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {

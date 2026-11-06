@@ -12,6 +12,9 @@ pub struct Config {
     pub unreadable: Option<String>,
     #[serde(skip)]
     pub all_folders_off: bool,
+    /// `folders` entries whose value can't be read; they count as off.
+    #[serde(skip)]
+    pub unreadable_folders: Vec<String>,
     /// Show teammates full working directories (otherwise only the last component, plus repo@branch).
     pub share_paths: bool,
     /// Show teammates this machine's Claude Code sessions that don't have Reason Network loaded.
@@ -71,6 +74,7 @@ impl Default for Config {
             person: None,
             unreadable: None,
             all_folders_off: false,
+            unreadable_folders: Vec::new(),
             share_paths: false,
             share_unmanaged: false,
             lan: true,
@@ -116,6 +120,21 @@ impl Config {
                 paths::config().display()
             )
         })
+    }
+
+    /// What an agent is told in `cwd`, a folder that is off. If the file can't be read at all, or the entry that turns
+    /// `cwd` off can't be read, the user turned nothing off, so it is just the warning; else the usual message, with the
+    /// warning if some other setting is unreadable. (The daemon refuses such a session with exactly `OFF_HERE`: clients
+    /// of earlier releases drop it on reconnect only then.)
+    pub fn off_message(&self, cwd: &str) -> String {
+        let by_unreadable = self.all_folders_off
+            || folder_rule(&self.folders, &home(), cwd)
+                .is_some_and(|(entry, _)| self.unreadable_folders.iter().any(|f| f == entry));
+        match self.warning() {
+            Some(warning) if by_unreadable => warning,
+            Some(warning) => format!("{OFF_HERE}; {warning}"),
+            None => OFF_HERE.into(),
+        }
     }
 
     fn paused(error: String) -> Self {
@@ -166,6 +185,7 @@ impl Config {
                         "off"
                     } else {
                         errors.push(format!("folders.{folder}: expected \"off\""));
+                        cfg.unreadable_folders.push(folder.clone());
                         "off"
                     };
                     cfg.folders.insert(folder.clone(), rule.into());
@@ -459,6 +479,29 @@ mod tests {
             assert_eq!(policy("accept", entry), Policy::Hold, "{entry}");
             assert_eq!(policy("hold", entry), Policy::Hold, "{entry}");
         }
+    }
+
+    #[test]
+    fn a_folder_is_said_to_be_turned_off_only_when_the_user_turned_it_off() {
+        let says = |text: &str| Config::read_private(text).off_message("/private/work");
+        let off = "[folders]\n\"/private\" = \"off\"\n";
+        // The file can't be read at all: nothing was turned off.
+        for text in ["[inbound", "folders = 3"] {
+            let said = says(text);
+            assert!(said.starts_with("Reason Network is paused: ask your user to fix"), "{text}: {said}");
+            assert!(!said.contains(OFF_HERE), "{text}: {said}");
+        }
+        assert_eq!(says(off), OFF_HERE);
+        let said = says(&format!("port = \"41641\"\n{off}"));
+        assert!(said.starts_with(&format!("{OFF_HERE}; Reason Network could not read some settings:")), "{said}");
+        // A folder that is off only because its own entry can't be read wasn't turned off by the user either.
+        let said = says("[folders]\n\"/private\" = true\n");
+        assert!(said.starts_with("Reason Network could not read some settings: ask your user to fix"), "{said}");
+        assert!(!said.contains(OFF_HERE), "{said}");
+        // Unless a folder the user turned off is the one that decides.
+        let nested = "[folders]\n\"/private\" = true\n\"/private/work\" = \"off\"\n";
+        assert!(says(nested).starts_with(OFF_HERE));
+        assert!(Config::read_private(nested).off_message("/private/other").starts_with("Reason Network could not"));
     }
 
     #[test]
