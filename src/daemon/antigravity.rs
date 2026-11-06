@@ -39,6 +39,7 @@ impl Daemon {
                 pid: None,
                 tier: Tier::Push,
                 name: Some(known.name.clone()),
+                claude_dir: None,
             };
             let git = GitInfo { root: None, repo: known.repo.clone(), branch: known.branch.clone() };
             if self.register(Some(conn), reg, git).is_err() {

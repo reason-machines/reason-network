@@ -64,7 +64,12 @@ enum Place {
 impl Daemon {
     /// This machine's sessions: running ones, plus (if `unmanaged`) Claude Code sessions without Reason Network.
     pub(super) async fn local_rows(self: &Arc<Self>, me: Option<&str>, unmanaged: bool) -> Result<Vec<SessionInfo>> {
-        let claude = self.shared(tokio::task::spawn_blocking(claude::scan).await?);
+        // Sessions of Claude Code run with another `CLAUDE_CONFIG_DIR` than ours are listed in that directory.
+        let dirs: Vec<std::path::PathBuf> = {
+            let g = self.inner.lock().unwrap();
+            g.live.values().filter_map(|l| l.reg.claude_dir.as_ref().map(std::path::PathBuf::from)).collect()
+        };
+        let claude = self.shared(tokio::task::spawn_blocking(move || claude::scan_in(&dirs)).await?);
         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
         let mut gits: HashMap<String, GitInfo> = HashMap::new();
@@ -76,11 +81,7 @@ impl Daemon {
         // With Claude Code on Reason Network, every open Claude session is on it: sessions started before Reason Network was set
         // up have no Reason Network tools, but take messages through their own socket and reply with the CLI.
         if claude::wired() {
-            let now = util::now_ms();
-            for c in &claude {
-                let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
-                self.claude_seen(c, git, now);
-            }
+            self.claude_scanned(&claude, &gits, util::now_ms());
         }
         // A Claude Code session someone renamed goes by that name here too.
         let renames: Vec<(String, String)> = {
@@ -157,7 +158,7 @@ impl Daemon {
             rows.push(row);
         }
         if unmanaged {
-            for c in claude.iter().filter(|c| !matched.contains(&c.pid)) {
+            for c in claude.iter().filter(|c| !c.elsewhere && !matched.contains(&c.pid)) {
                 let cwd = c.cwd.clone().unwrap_or_default();
                 let name = c.label().unwrap_or_else(|| format!("claude-{}", c.pid));
                 let mut row = self.row(&name, agent::CLAUDE_CODE, &cwd, gits.get(&cwd));
@@ -168,6 +169,17 @@ impl Daemon {
             }
         }
         Ok(rows)
+    }
+
+    /// Every session of a scan of Claude Code's registries, each `claude_seen`.
+    fn claude_scanned(self: &Arc<Self>, claude: &[ClaudeSession], gits: &HashMap<String, GitInfo>, now: i64) {
+        // Only our own profile's: the daemon can't post into another's sessions, so it neither lists one there that
+        // has no MCP server of its own nor ends one its server registered (`/clear`); those just go by their names
+        // there.
+        for c in claude.iter().filter(|c| !c.elsewhere) {
+            let git = c.cwd.as_ref().and_then(|cwd| gits.get(cwd)).cloned().unwrap_or_default();
+            self.claude_seen(c, git, now);
+        }
     }
 
     /// A live Claude Code session in Claude Code's own registry: on the team, and the conversation its process is in.
@@ -196,6 +208,7 @@ impl Daemon {
                 pid: Some(c.pid),
                 tier: Tier::Push,
                 name: if named { c.label() } else { None },
+                claude_dir: None,
             };
             if let Err(e) = self.register(None, reg, git) {
                 super::log(&format!("adding the Claude session of process {}: {e:#}", c.pid));
@@ -530,6 +543,7 @@ mod tests {
                 pid: Some(pid),
                 tier: Tier::Push,
                 name: None,
+                claude_dir: None,
             };
             d.register(Some(conn), reg, GitInfo::default()).unwrap().name
         };
@@ -563,6 +577,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claude_session_in_another_claude_config_dir_goes_by_the_name_given_there() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        // `CLAUDE_CONFIG_DIR=~/.claude-b claude --name my-session`: its registry is in that profile, not the daemon's.
+        let profile = std::env::temp_dir().join(format!("reason-network-claude-b-{}", std::process::id()));
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let pid = std::process::id();
+        let entry = serde_json::json!({
+            "pid": pid, "sessionId": "b", "cwd": "/work/api", "name": "my-session", "nameSource": "user"
+        });
+        std::fs::write(profile.join("sessions").join(format!("{pid}.json")), entry.to_string()).unwrap();
+        let reg = SessionReg {
+            key: "claude-code:b".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("b".into()),
+            pid: Some(pid),
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some(profile.to_string_lossy().into_owned()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude");
+        let rows = d.local_rows(None, false).await.unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert!(names.iter().any(|a| a.ends_with("/my-session")), "{names:?}");
+    }
+
+    /// An entry of another profile's registry (`CLAUDE_CONFIG_DIR=~/.claude-b`), as `claude::scan_in` reads it.
+    fn elsewhere(entry: serde_json::Value) -> ClaudeSession {
+        ClaudeSession { elsewhere: true, ..serde_json::from_value(entry).unwrap() }
+    }
+
+    #[tokio::test]
+    async fn a_clear_in_another_claude_config_dir_keeps_its_session_pushed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let pid = std::process::id();
+        // Its MCP server registered it, with its connection, from the other profile.
+        let reg = SessionReg {
+            key: "claude-code:before".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/api".into(),
+            agent_session_id: Some("before".into()),
+            pid: Some(pid),
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some("/home/u/.claude-b".into()),
+        };
+        assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude");
+        // `/clear` there: that profile's registry names the new conversation; the daemon can't post into it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": pid, "sessionId": "after", "cwd": "/work/api", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let g = d.inner.lock().unwrap();
+        let live: Vec<&String> = g.live.keys().collect();
+        assert_eq!(live, ["claude-code:before"]);
+        assert_eq!(g.live["claude-code:before"].reg.tier, Tier::Push);
+        assert!(g.live["claude-code:before"].conn.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_in_another_claude_config_dir_without_reason_network_is_not_listed() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let codex = SessionReg {
+            key: "codex:1".into(),
+            agent: "codex".into(),
+            cwd: "/work/web".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+            claude_dir: None,
+        };
+        d.register(Some(1), codex, GitInfo::default()).unwrap();
+        // A session in the other profile with no MCP server of ours: only its registry entry knows of it.
+        let entry = elsewhere(serde_json::json!({
+            "pid": std::process::id(), "sessionId": "b", "cwd": "/work/api", "name": "unmanaged-b",
+            "nameSource": "user", "messagingSocketPath": "/tmp/b.sock"
+        }));
+        d.claude_scanned(&[entry], &HashMap::new(), util::now_ms());
+        let live: Vec<String> = d.inner.lock().unwrap().live.keys().cloned().collect();
+        assert_eq!(live, ["codex:1"]);
+        let err = d.send("codex:1".into(), "unmanaged-b", "hi", None, true, false, None, Vec::new()).await.unwrap_err();
+        assert!(err.to_string().starts_with("no session called 'unmanaged-b'"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_directory_lists_no_session_of_another_claude_config_dir_that_no_mcp_server_registered() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let profile = std::env::temp_dir().join(format!("reason-network-claude-b-unmanaged-{}", std::process::id()));
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let pid = std::process::id();
+        // Another session of that profile registered it (no process of its own, so nothing matches it by pid).
+        let reg = SessionReg {
+            key: "claude-code:managed".into(),
+            agent: agent::CLAUDE_CODE.into(),
+            cwd: "/work/web".into(),
+            agent_session_id: Some("managed".into()),
+            pid: None,
+            tier: Tier::Push,
+            name: None,
+            claude_dir: Some(profile.to_string_lossy().into_owned()),
+        };
+        d.register(Some(1), reg, GitInfo::default()).unwrap();
+        // A session there with no MCP server of ours: only that profile's registry knows of it.
+        let entry = serde_json::json!({
+            "pid": pid, "sessionId": "unmanaged", "cwd": "/work/api", "name": "unmanaged-b", "nameSource": "user"
+        });
+        std::fs::write(profile.join("sessions").join(format!("{pid}.json")), entry.to_string()).unwrap();
+        let rows = d.local_rows(None, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let names: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert!(!names.iter().any(|a| a.ends_with("/unmanaged-b")), "{names:?}");
+        assert!(names.iter().any(|a| a.ends_with("/web-claude")), "{names:?}");
+    }
+
+    #[tokio::test]
     async fn a_headless_claude_run_from_an_interactive_ones_shell_is_a_session_of_its_own() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         // The interactive Claude, in `outer`, in Claude Code's registry.
@@ -581,6 +712,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "api-claude-2");
         // The scan, again and again, leaves it alone.
@@ -650,6 +782,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: Some("terminal".into()),
+            claude_dir: None,
         };
         assert_eq!(d.register(Some(1), reg, GitInfo::default()).unwrap().name, "terminal");
         let mut theirs = d.row("terminal", "cli", "/", None);
