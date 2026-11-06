@@ -145,7 +145,12 @@ fn mcp_says(home: &Path, folder: &Path) -> String {
     reply_to(1);
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}}}));
-    reply_to(2)["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    let text = reply_to(2)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    // In a folder that is on, the server starts a daemon: don't leave it running.
+    if home.join("network.sock").exists() {
+        let _ = reason_network(home).arg("stop").output();
+    }
+    text
 }
 
 #[test]
