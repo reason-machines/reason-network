@@ -448,24 +448,33 @@ mod tests {
         entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
-    #[test]
-    fn malformed_people_preserves_explicit_refusal() {
-        const CHILD: &str = "REASON_TEST_REFUSAL_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            assert_eq!(Config::load().policy_for("bob"), Policy::Refuse);
-            return;
+    /// Runs the test `name` again in a process of its own, with `config` as its config file: `Config::load` and `save`
+    /// there use a folder made for it, never the real one. `check` runs in that process, given the folder.
+    fn with_config_file(name: &str, config: &str, check: impl FnOnce(&Path)) {
+        const CHILD: &str = "REASON_TEST_CONFIG_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            return check(Path::new(&dir));
         }
-        let dir = std::env::temp_dir().join(format!("reason-refusal-{}", ulid::Ulid::generate()));
+        let dir = std::env::temp_dir().join(format!("reason-config-{}", ulid::Ulid::generate()));
         std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), "[inbound]\ndefault = \"refuse\"\npeople = 1\n").unwrap();
+        std::fs::write(dir.join("config.toml"), config).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "config::tests::malformed_people_preserves_explicit_refusal", "--nocapture"])
-            .env(CHILD, "1")
+            .args(["--exact", &format!("config::tests::{name}"), "--nocapture"])
+            .env(CHILD, &dir)
             .env("REASON_NETWORK_HOME", &dir)
             .output();
         let _ = std::fs::remove_dir_all(&dir);
         let output = result.unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "{name} did not run");
+    }
+
+    #[test]
+    fn malformed_people_preserves_explicit_refusal() {
+        let config = "[inbound]\ndefault = \"refuse\"\npeople = 1\n";
+        with_config_file("malformed_people_preserves_explicit_refusal", config, |_| {
+            assert_eq!(Config::load().policy_for("bob"), Policy::Refuse);
+        });
     }
 
     #[test]
@@ -479,6 +488,49 @@ mod tests {
             assert_eq!(policy("accept", entry), Policy::Hold, "{entry}");
             assert_eq!(policy("hold", entry), Policy::Hold, "{entry}");
         }
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_read_turns_lan_off() {
+        // `lan = false` added at the end of the file lands in `[folders]`, so the real `lan` is still on.
+        assert!(!Config::read_private("[folders]\nlan = false\n").lan);
+        assert!(Config::read_private("[folders]\n\"/private\" = \"off\"\n").lan);
+    }
+
+    #[test]
+    fn a_file_that_parses_loads_as_written() {
+        // `on` isn't a value yet: the folder is ignored (`doctor` lists it), not read as unreadable and kept off.
+        let cfg = Config::read_private("[folders]\n\"/work\" = \"on\"\n");
+        assert!(cfg.warning().is_none() && cfg.lan);
+        assert!(!cfg.off_in("/work/api"));
+        assert_eq!(cfg.odd_folders().len(), 1);
+    }
+
+    #[test]
+    fn a_broken_file_keeps_off_folders_off_and_refused_senders_refused() {
+        // A setting added at the end of the file lands in `[folders]`, where it can't be read.
+        let config =
+            "[inbound]\n[inbound.people]\nbob = \"refuse\"\n[folders]\n\"/private\" = \"off\"\ndebug_log = true\n";
+        with_config_file("a_broken_file_keeps_off_folders_off_and_refused_senders_refused", config, |_| {
+            let cfg = Config::load();
+            assert!(cfg.warning().is_some());
+            assert!(cfg.off_in("/private/work") && !cfg.off_in("/public"));
+            assert_eq!(cfg.policy_for("bob"), Policy::Refuse);
+            assert_eq!(cfg.policy_for("carol"), Policy::Accept);
+        });
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_file_it_could_not_fully_read() {
+        let config = "# mine\nport = \"41641\"\n";
+        with_config_file("save_refuses_to_overwrite_a_file_it_could_not_fully_read", config, |dir| {
+            let file = dir.join("config.toml");
+            assert!(Config::load().save().is_err());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), config);
+            std::fs::write(&file, "lan = false\n").unwrap();
+            Config::load().save().unwrap();
+            assert!(std::fs::read_to_string(&file).unwrap().contains("[inbound]"));
+        });
     }
 
     #[test]
