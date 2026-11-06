@@ -56,6 +56,16 @@ one session.
 Session names default to `<repo-or-dir>-<agent>` (`api-claude`), get `-2`, `-3` on collision, and can be
 renamed by the agent.
 
+**A Claude Code chat goes by its title.** Claude Code titles a conversation after its first prompt, after the session
+registered. When the directory scan finds that title for a Claude Code session still on its default name, it renames the
+session once to `<repo-or-dir>-<the title's first four words>` (`api-fix-the-login-bug`), `-2`, `-3` on collision. Never
+a name someone chose (`/rename`, `set_name`, a name asked for at registration, `listen --as`), never another agent's
+session, never one that mail went to or from, and never a session remembered from before this was added (the
+`settled_names` table). The default name it was told at its start stays its own (the `former` column of `sessions`):
+mail to it, from this machine or a teammate's, reaches the renamed session at its new name, no other session gets it,
+and the person's other machines hear it is kept. That holds after a daemon restart and while the session is offline,
+and the name is forgotten with the session. Its next prompt's hook tells the agent its new address, once.
+
 **A name stays with its conversation.** Each machine binds a session's name to its key, the id its agent gives the
 conversation (`<agent>:<id>`, see Session registration below): one name per key, in the `sessions` table. This holds for
 a session the agent identifies and that could be reached: an MCP server connected for it or answered a call for it, a

@@ -210,8 +210,9 @@ struct Live {
     codex_home: Option<String>,
     /// Its hooks have already said who it is on Reason Network (Antigravity hooks run before every invocation).
     introduced: bool,
-    /// The default name it went by before its conversation's title named it, which it was told at its start: while it
-    /// is live, that name is still its own (no other session takes it) and mail to it comes here.
+    /// The default name it went by before its conversation's title named it, which it was told at its start: that
+    /// name is still its own (no other session takes it) and mail to it comes here. Remembered with the session
+    /// (`Store::set_former`), so it stays so after a restart and while the session is offline, until it is forgotten.
     former: Option<String>,
     /// Its hooks have told it the name it goes by now, in place of `former`.
     told_renamed: bool,

@@ -412,6 +412,10 @@ impl Daemon {
                     Target::Session { key: None, address } => {
                         let name = address.split_once('/').map_or("", |(_, n)| n);
                         let r = g.store.session_by_name(name)?;
+                        // To the default name an offline session went by before its title named it: at its name now.
+                        if let Some(r) = r.as_ref().filter(|r| r.name != name) {
+                            msg.to = self.addr(&r.name);
+                        }
                         g.store.insert(&mut msg, false)?;
                         self.deliver_offline(&mut g, r.as_ref(), vec![msg.clone()], wake)
                     }
@@ -887,8 +891,16 @@ impl Daemon {
                 }
                 _ => name,
             };
+            let remembered = if key.is_none() { g.store.session_by_name(&name)? } else { None };
+            // To the default name an offline session went by before its title named it: at its name now.
+            let name = match remembered.as_ref() {
+                Some(r) if r.name != name => {
+                    msg.to = self.addr(&r.name);
+                    r.name.clone()
+                }
+                _ => name,
+            };
             let name = name.as_str();
-            let remembered = if key.is_none() { g.store.session_by_name(name)? } else { None };
             if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }

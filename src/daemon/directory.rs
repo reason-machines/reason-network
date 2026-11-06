@@ -54,8 +54,9 @@ struct Cand {
     live: bool,
     repo: Option<String>,
     place: Place,
-    /// The default name a live session here went by before its title named it: it reaches that session by name only.
-    former: bool,
+    /// For the default name a session here went by before its title named it, the name it goes by now: it reaches that
+    /// session by name only.
+    former: Option<String>,
 }
 
 enum Place {
@@ -324,13 +325,26 @@ impl Daemon {
         known.sort_by_key(|r| -r.last_seen);
         // Not the person's own mailboxes: each machine has its own (`terminal`).
         let now = util::now_ms();
-        // A live session's former default name (see `Live::former`) reaches it from teammates' machines too, and stays its
-        // own on the person's other machines.
+        // A session's former default name (see `Live::former`) reaches it from teammates' machines too, and stays its
+        // own on the person's other machines: a live one's, and an offline one's while its name is kept.
+        let offline_formers = g.store.formers().unwrap_or_default();
         let formers: Vec<String> = g.live.values().filter_map(|l| l.former.clone()).collect();
         let kept: Vec<String> = formers
             .iter()
             .cloned()
-            .chain(known.iter().filter(|r| r.agent != "cli" && self.holds(r, now)).map(|r| r.name.clone()))
+            .chain(
+                known
+                    .iter()
+                    .filter(|r| r.agent != "cli" && self.holds(r, now))
+                    .flat_map(|r| std::iter::once(r.name.clone()).chain(offline_formers.get(&r.name).cloned())),
+            )
+            .collect();
+        let known: Vec<String> = known
+            .into_iter()
+            .flat_map(|r| {
+                let former = offline_formers.get(&r.name).cloned();
+                std::iter::once(r.name).chain(former)
+            })
             .collect();
         // Teammates' machines take 100 of each, so only the most recent go; the rest are named only here.
         if kept.len() > PRESENCE_NAMES && !self.capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -341,7 +355,7 @@ impl Daemon {
         }
         Presence {
             sessions,
-            known: formers.into_iter().chain(known.into_iter().map(|r| r.name)).take(PRESENCE_NAMES).collect(),
+            known: formers.into_iter().chain(known).take(PRESENCE_NAMES).collect(),
             kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
             features: vec![crate::files::FEATURE.into(), super::sessions::TERMINALS.into()],
         }
@@ -422,7 +436,7 @@ impl Daemon {
     fn candidates(&self, g: &super::Inner, remotes: &HashMap<EndpointId, Remote>) -> Vec<Cand> {
         let mut out = Vec::new();
         for l in g.live.values() {
-            for (name, former) in std::iter::once((&l.name, false)).chain(l.former.iter().map(|f| (f, true))) {
+            for (name, former) in std::iter::once((&l.name, None)).chain(l.former.iter().map(|f| (f, Some(&l.name)))) {
                 out.push(Cand {
                     person: self.person.clone(),
                     name: name.clone(),
@@ -430,20 +444,25 @@ impl Daemon {
                     live: true,
                     repo: l.git.repo.clone(),
                     place: Place::Local(Some(l.reg.key.clone())),
-                    former,
+                    former: former.cloned(),
                 });
             }
         }
+        let offline_formers = g.store.formers().unwrap_or_default();
         for r in self.remembered(g) {
-            out.push(Cand {
-                person: self.person.clone(),
-                name: r.name,
-                machine: self.machine.clone(),
-                live: false,
-                repo: r.repo,
-                place: Place::Local(None),
-                former: false,
-            });
+            let former = offline_formers.get(&r.name).cloned();
+            let now = r.name.clone();
+            for (name, is_former) in std::iter::once((r.name, None)).chain(former.map(|f| (f, Some(now)))) {
+                out.push(Cand {
+                    person: self.person.clone(),
+                    name,
+                    machine: self.machine.clone(),
+                    live: false,
+                    repo: r.repo.clone(),
+                    place: Place::Local(None),
+                    former: is_former,
+                });
+            }
         }
         let Some(team) = &g.team else { return out };
         for (id, rem) in remotes {
@@ -457,7 +476,7 @@ impl Daemon {
                     live: rem.online && s.tier != Tier::None,
                     repo: s.repo.clone(),
                     place: Place::Remote(*id, rem.online),
-                    former: false,
+                    former: None,
                 });
             }
             for n in rem.presence.known.iter().filter(|n| !names.contains(n.as_str())) {
@@ -468,7 +487,7 @@ impl Daemon {
                     live: false,
                     repo: None,
                     place: Place::Remote(*id, rem.online),
-                    former: false,
+                    former: None,
                 });
             }
         }
@@ -499,9 +518,11 @@ impl Daemon {
             people.push(self.person.clone());
         }
         let target = |c: &Cand| match &c.place {
-            // A live session at the name it goes by now, as its mail is kept.
+            // A session at the name it goes by now, as its mail is kept.
             Place::Local(key) => Target::Session {
-                address: self.addr(key.as_ref().and_then(|k| g.live.get(k)).map_or(&c.name, |l| &l.name)),
+                address: self.addr(
+                    key.as_ref().and_then(|k| g.live.get(k)).map_or(c.former.as_ref().unwrap_or(&c.name), |l| &l.name),
+                ),
                 key: key.clone(),
             },
             Place::Remote(id, online) => Target::Remote {
@@ -512,7 +533,7 @@ impl Daemon {
             },
         };
         let live_matching = |f: &dyn Fn(&Cand) -> bool| -> Vec<Target> {
-            cands.iter().filter(|c| c.live && !c.former && f(c)).map(|c| target(c)).collect()
+            cands.iter().filter(|c| c.live && c.former.is_none() && f(c)).map(|c| target(c)).collect()
         };
 
         let targets = if spec == "*" {
@@ -975,9 +996,9 @@ mod tests {
         assert!(text.contains(&format!("you are {now} now")) && text.contains(&d.addr("api-claude")), "{text}");
         assert_eq!(told.address.as_deref(), Some(now.as_str()));
         assert_eq!(d.hook(hook("prompt")).await.unwrap().text, None);
-        // Once it is gone, the name is free again.
+        // Gone, it keeps that name too, as it keeps its own (until it is forgotten).
         d.inner.lock().unwrap().live.remove("claude-code:a");
-        assert_eq!(reg(agent::CLAUDE_CODE, "y", 4, None), "api-claude");
+        assert_eq!(reg(agent::CLAUDE_CODE, "y", 4, None), "api-claude-3");
         // Only Claude Code's chats go by their titles.
         let codex = reg("codex", "x", 5, None);
         titled("codex:x", "Fix the login bug on Safari");

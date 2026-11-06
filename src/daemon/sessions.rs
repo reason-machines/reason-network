@@ -125,6 +125,12 @@ impl Daemon {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
             }
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
+            // Its title named it before this daemon started (an update restarts it), or before it went offline: the
+            // default name it went by is still its own (see `Live::former`). Its hooks told it its new one then.
+            let former = match g.store.session_by_key(&key)? {
+                Some(r) if r.name == name => g.store.former(&key)?.filter(|f| *f != name && g.live_called(f).is_none()),
+                _ => None,
+            };
             if reg.name.is_some() {
                 g.store.settle_name(&key)?;
             }
@@ -157,8 +163,8 @@ impl Daemon {
                     mailbox: key == TERMINAL,
                     codex_home: None,
                     introduced: false,
-                    former: None,
-                    told_renamed: false,
+                    told_renamed: former.is_some(),
+                    former,
                 },
             );
             self.presence_changed();
@@ -352,6 +358,7 @@ impl Daemon {
             }
         }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
+        g.store.set_former(&live.name, live.former.as_deref())?;
         let address = self.addr(&live.name);
         Ok(Some(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address }))
     }
@@ -1608,6 +1615,149 @@ mod tests {
         assert_eq!(held, [h2]);
         assert_eq!(d.settle(&[], true).unwrap(), 1);
         assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+    }
+
+    /// Alex's daemon, with Bob's machine in the team and mail from teammates held when `hold`.
+    fn with_bob(store: crate::store::Store, hold: bool) -> (Daemon, iroh::SecretKey) {
+        let inbound = if hold {
+            crate::config::Inbound { default: crate::config::Policy::Hold, ..Default::default() }
+        } else {
+            Default::default()
+        };
+        let cfg = crate::config::Config { person: Some("alex".into()), inbound, ..Default::default() };
+        let d = Daemon::with(cfg, store, iroh::SecretKey::generate()).unwrap();
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        (d, bob)
+    }
+
+    fn from_bob(d: &Daemon, to: &str) -> Message {
+        Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr(to),
+            via: None,
+            reply_to: None,
+            body: "still on the login bug?".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        }
+    }
+
+    fn memory_store() -> crate::store::Store {
+        let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
+        crate::store::Store::open(std::path::Path::new(":memory:"), inbox).unwrap()
+    }
+
+    const TITLED: &str = "api-fix-the-login-bug";
+
+    #[test]
+    fn a_titled_chats_old_name_stays_its_own_after_the_daemon_restarts() {
+        let home = std::env::temp_dir().join(format!("reason-network-restart-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&home).unwrap();
+        let open = || crate::store::Store::open(&home.join("network.db"), home.join("inbox")).unwrap();
+        {
+            let (d, _) = with_bob(open(), false);
+            assert_eq!(join(&d, claude("x")).name, "api-claude");
+            assert_eq!(join(&d, claude("a")).name, "api-claude-2");
+            assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        }
+        // An update restarts the daemon, on the same database: a new chat in the folder registers before `a` does.
+        let (d, bob) = with_bob(open(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("x")).name, "api-claude");
+        assert_eq!(join(&d, claude("z")).name, "api-claude-3");
+        assert_eq!(join(&d, claude("a")).name, TITLED);
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.live["claude-code:a"].former.as_deref(), Some("api-claude-2"));
+            // Already told its new name before the restart: not told again.
+            assert!(g.live["claude-code:a"].told_renamed);
+        }
+        // Bob's mail to the name it was told reaches it, not the new chat.
+        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude-2")).unwrap();
+        assert_ne!(state, "refused");
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+        assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+        assert_eq!(g.store.unread_count(&d.addr("api-claude-3")).unwrap(), 0);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_titled_chats_old_name_is_kept_for_it_once_it_ends_until_it_is_forgotten() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        // Long after the daemon started: sessions gone a day are forgotten.
+        settled(&mut d);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        leave(&d, "claude-code:a", 0);
+        // A new chat in the folder doesn't get the name the ended one was told, nor can take it.
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        assert!(d.set_status("claude-code:z", None, Some("api-claude".into())).is_err());
+        let presence = d.presence_of(Vec::new());
+        assert!(presence.kept.contains(&"api-claude".to_string()), "{:?}", presence.kept);
+        // Bob's mail to it (say from his outbox, while Alex was offline) waits for the ended chat, at its name now.
+        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude")).unwrap();
+        assert_ne!(state, "refused");
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+        }
+        // Mail sent here to it goes the same way.
+        let sent = d.send("claude-code:z".into(), "api-claude", "me too", None, true, false, None, Vec::new()).await;
+        assert_eq!(sent.unwrap().recipients[0].address, d.addr(TITLED));
+        // It comes back to its name and the old one, with that mail.
+        let back = join(&d, claude("a"));
+        assert_eq!((back.name.as_str(), back.unread), (TITLED, 2));
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude"));
+        // Once it is forgotten, both names are free again.
+        leave(&d, "claude-code:a", 2 * DAY);
+        assert_eq!(join(&d, claude("y")).name, "api-claude");
+        assert!(d.inner.lock().unwrap().store.session_by_name(TITLED).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_teammates_mail_to_a_titled_chats_old_name_reaches_it_held_or_not() {
+        for hold in [false, true] {
+            let (d, bob) = with_bob(memory_store(), hold);
+            let d = Arc::new(d);
+            assert_eq!(join(&d, claude("a")).name, "api-claude");
+            assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+            assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+            let msg = from_bob(&d, "api-claude");
+            let id = msg.id.clone();
+            let (state, note) = d.receive(bob.public(), msg).unwrap();
+            assert_ne!(state, "refused", "{note}");
+            let mut ids = vec![id.clone()];
+            if hold {
+                assert_eq!(state, "held");
+                assert_eq!(d.settle(std::slice::from_ref(&id), true).unwrap(), 1);
+            } else {
+                // Taken as mail to the live chat at its name now is (not left waiting as for an offline one).
+                let to_now = from_bob(&d, TITLED);
+                ids.push(to_now.id.clone());
+                assert_eq!(d.receive(bob.public(), to_now).unwrap(), (state, note));
+            }
+            let g = d.inner.lock().unwrap();
+            let unread = g.store.unread(&d.addr(TITLED)).unwrap();
+            assert_eq!(unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids, "hold: {hold}");
+            assert!(unread.iter().all(|m| m.to == d.addr(TITLED)));
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), ids.len() as u32);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+        }
     }
 
     #[test]

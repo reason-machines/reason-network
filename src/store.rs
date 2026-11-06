@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -298,6 +298,9 @@ impl Store {
             ("native_dirs", "TEXT NOT NULL DEFAULT '[]'"),
             // The `CODEX_HOME` a Codex session's hooks named, for mail to reach it while it is offline.
             ("codex_home", "TEXT"),
+            // The default name a session went by before its conversation's title named it: still its own, with its
+            // mail, for as long as the session is remembered (see `session_by_name`).
+            ("former", "TEXT"),
         ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
@@ -677,7 +680,8 @@ impl Store {
                  native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
                  native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
                  native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
-                 codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END"
+                 codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END,
+                 former = CASE WHEN key = ?2 THEN former ELSE NULL END"
             ),
             params![
                 s.name,
@@ -757,9 +761,33 @@ impl Store {
         Ok(self.db.query_row(&sql, [key], remembered).optional()?)
     }
 
+    /// The session remembered as `name`: by its name, or else by the default name it went by before its title named
+    /// it (`former`), which stays its own while it is remembered.
     pub fn session_by_name(&self, name: &str) -> Result<Option<Remembered>> {
-        let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE name = ?1");
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE name = ?1 OR former = ?1 ORDER BY name = ?1 DESC, last_seen DESC \
+             LIMIT 1"
+        );
         Ok(self.db.query_row(&sql, [name], remembered).optional()?)
+    }
+
+    /// Remembers the default name the session `name` went by before its title named it (`None`: no such name).
+    pub fn set_former(&self, name: &str, former: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE sessions SET former = ?2 WHERE name = ?1", params![name, former])?;
+        Ok(())
+    }
+
+    /// The default name the session `key` went by before its title named it, as remembered.
+    pub fn former(&self, key: &str) -> Result<Option<String>> {
+        let sql = "SELECT former FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1";
+        Ok(self.db.query_row(sql, [key], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Each remembered session's former default name (see `set_former`), by its name now.
+    pub fn formers(&self) -> Result<HashMap<String, String>> {
+        let mut st = self.db.prepare_cached("SELECT name, former FROM sessions WHERE former IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn sessions(&self) -> Result<Vec<Remembered>> {
