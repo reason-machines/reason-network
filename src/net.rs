@@ -1151,14 +1151,7 @@ impl Net {
                 let _ = tx.send(Wire::Ack { id, state, note, to });
             }
             Wire::Ack { id, state, note, to } => {
-                // Only once it was taken: a "retry" may go elsewhere next time, or nowhere.
-                if let Some(to) = to.filter(|_| state != "refused" && state != "retry") {
-                    daemon.readdressed(&peer, &id, &to);
-                }
-                // "retry": the other side is busy; keep it in the outbox for the next flush.
-                if state != "retry" {
-                    daemon.outbox_done(&id, state != "refused");
-                }
+                daemon.acked(&peer, &id, &state, to);
                 if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
                     let _ = waiter.send((state, note));
                 }

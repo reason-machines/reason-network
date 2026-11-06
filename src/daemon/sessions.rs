@@ -2026,6 +2026,50 @@ mod tests {
     }
 
     #[test]
+    fn a_title_never_takes_an_offline_chats_name_or_its_mail() {
+        let mut d = super::super::test_daemon(Default::default());
+        settled(&mut d);
+        // Someone named this chat by hand, as a title would; it has gone offline with mail waiting.
+        let by_hand = SessionReg { name: Some(TITLED.into()), ..claude("h") };
+        assert_eq!(join(&d, by_hand).name, TITLED);
+        mail(&d, "waiting", TITLED);
+        leave(&d, "claude-code:h", 0);
+        // A new chat titled "Fix the login bug" may not take it, though someone asking for it by name could.
+        assert_eq!(join(&d, claude("n")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:n", TITLED.into()).is_err());
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.store.session_by_name(TITLED).unwrap().unwrap().key, "claude-code:h");
+        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+        assert_eq!(g.live["claude-code:n"].name, "api-claude");
+        assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_teammates_ack_moves_the_receipt_to_where_mail_went_only_once_it_was_taken() {
+        let (d, bob) = with_bob(memory_store(), false);
+        join(&d, claude("z"));
+        let sent = |id: &str| Message {
+            id: id.into(),
+            from: d.addr("api-claude"),
+            to: "bob/web-claude".into(),
+            sent_at: util::now_ms(),
+            ..from_bob(&d, "x")
+        };
+        let recipient = |id: &str| d.inner.lock().unwrap().store.receipt_recipient(id).unwrap().unwrap();
+        let (busy, refused) = ("01JA0000000000000000000011", "01JA0000000000000000000012");
+        for id in [busy, refused] {
+            d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(id), "bob/web-claude", "queued").unwrap();
+        }
+        // Turned away for now, or for good: the receipt keeps the address it was sent to.
+        d.acked(&bob.public(), busy, "retry", Some("bob/web-fix".into()));
+        d.acked(&bob.public(), refused, "refused", Some("bob/web-fix".into()));
+        assert_eq!((recipient(busy), recipient(refused)), ("bob/web-claude".into(), "bob/web-claude".into()));
+        // Taken, at the name its chat goes by now: the receipt waits for a reply from there.
+        d.acked(&bob.public(), busy, "queued", Some("bob/web-fix".into()));
+        assert_eq!(recipient(busy), "bob/web-fix");
+    }
+
+    #[test]
     fn an_explicit_reclaim_of_an_ended_titled_chats_old_name_takes_it_for_good() {
         let mut d = super::super::test_daemon(Default::default());
         settled(&mut d);

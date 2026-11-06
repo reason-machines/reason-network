@@ -997,6 +997,19 @@ impl Daemon {
         Ok(res)
     }
 
+    /// `peer` answered message `id` from our outbox with `state`, and where it went when not to the address it was sent
+    /// to.
+    pub fn acked(&self, peer: &EndpointId, id: &str, state: &str, to: Option<String>) {
+        // Only once it was taken: a "retry" may go elsewhere next time, or nowhere.
+        if let Some(to) = to.filter(|_| state != "refused" && state != "retry") {
+            self.readdressed(peer, id, &to);
+        }
+        // "retry": the other side is busy; keep it in the outbox for the next flush.
+        if state != "retry" {
+            self.outbox_done(id, state != "refused");
+        }
+    }
+
     /// `peer` delivered message `id` to `to`, the name the session it was sent to goes by now (see
     /// `receive_readdressed`): its receipt waits for a reply from there. Only for a session of the person it was sent
     /// to, on that person's machine.
