@@ -95,7 +95,7 @@ impl Daemon {
                 .collect()
         };
         for (key, name) in renames {
-            let _ = self.set_status(&key, None, Some(name));
+            let _ = self.set_status(&key, None, Some(name), super::sessions::Rename::Automatic);
         }
         // What each session is doing, from what its agent records anyway (title, task in progress).
         let sources: Vec<(String, doing::Source)> = {
@@ -567,7 +567,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.recipients[0].state, "queued");
         assert!(
-            res.recipients[0].note.ends_with("it reaches that session when it's back"),
+            res.recipients[0].note.ends_with("unless another session here explicitly takes its name"),
             "{}",
             res.recipients[0].note
         );

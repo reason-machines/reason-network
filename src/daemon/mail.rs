@@ -123,13 +123,17 @@ fn codex_queue(thread: &str) -> Vec<String> {
 
 /// The note for mail queued for a session that is offline. Its unread mail is deleted at the first cleanup a day after
 /// it was last seen, unless it is one of the person's own mailboxes (`terminal`, `listen --as`), which are kept. Until then it waits for
-/// that session, when the session can come back to its name (see [`Remembered::kept`]); else a new session that takes
-/// the name gets it.
+/// that session or one that explicitly reclaims its name. For a session without a durable id it waits for the name.
 fn offline_note(r: Option<&Remembered>, now: i64) -> String {
     const NAME: &str = "a new session that takes this name gets the mail";
-    const BACK: &str = "it reaches that session when it's back";
     let Some(r) = r else { return format!("queued: the session is offline; {NAME}") };
-    let who = if r.kept() { BACK } else { NAME };
+    let who = if r.mailbox {
+        "it reaches that session when it's back"
+    } else if r.kept() {
+        "it reaches that session when it's back, unless another session here explicitly takes its name"
+    } else {
+        NAME
+    };
     let seen = util::ago(r.last_seen, now);
     let forgotten = r.last_seen.saturating_add(super::sessions::FORGET_MS);
     if r.mailbox {
@@ -719,6 +723,9 @@ impl Daemon {
             for id in &ids {
                 g.in_flight.remove(id);
             }
+            if !matches!(res, Ok(Ok(()))) {
+                this.arrived.notify_waiters();
+            }
             match res {
                 Ok(Ok(())) => {
                     let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
@@ -792,6 +799,9 @@ impl Daemon {
             g.codex_failed.remove(key);
         } else if bin == "codex" {
             g.codex_failed.insert(key.to_string());
+        }
+        if res.is_err() {
+            self.arrived.notify_waiters();
         }
         match res {
             Ok(()) => {
@@ -1142,6 +1152,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::sessions::Rename;
     use crate::team::TeamState;
     use iroh::SecretKey;
     use serde::Deserialize;
@@ -1443,6 +1454,8 @@ mod tests {
     async fn codex_queue_in_flight() -> (Arc<Daemon>, String, Vec<String>) {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        // The MCP connection makes this a reachable conversation even on runners without the Codex CLI.
+        d.register(Some(1), codex("codex:t1"), crate::git::GitInfo::default()).unwrap();
         let name = gone(&d, "codex:t1", HOUR);
         let to = d.addr(&name);
         let mut msg = Message {
@@ -1461,10 +1474,37 @@ mod tests {
             files: Vec::new(),
         };
         let mut g = d.inner.lock().unwrap();
+        assert!(g.store.session_by_name(&name).unwrap().unwrap().kept());
         g.store.insert(&mut msg, false).unwrap();
         g.in_flight.insert(msg.id.clone(), Instant::now());
         drop(g);
         (d, to, vec![msg.id])
+    }
+
+    #[tokio::test]
+    async fn reclaim_skips_an_old_codex_handoff_and_only_a_failed_handoff_becomes_available() {
+        for accepted in [true, false] {
+            let (d, address, ids) = codex_queue_in_flight().await;
+            d.register(Some(2), gemini("gemini:new"), crate::git::GitInfo::default()).unwrap();
+            let name = address.split_once('/').unwrap().1;
+            let req =
+                Request::SetStatus { key: "gemini:new".into(), doing: None, name: Some(name.into()), reclaim: true };
+            let new = d.handle(2, req).await.unwrap();
+            assert_eq!(new["address"], address);
+            assert_eq!(new["unread"], 0);
+            assert!(d.inbox("gemini:new".into(), 0, false).await.unwrap().messages.is_empty());
+            let mut waiting = Box::pin(d.inbox("gemini:new".into(), 10, false));
+            assert!(futures_lite::future::poll_once(&mut waiting).await.is_none());
+            d.handed("codex", "codex:t1", &ids, if accepted { Ok(()) } else { Err("offline".into()) });
+            let inbox = if accepted {
+                d.inbox("gemini:new".into(), 0, false).await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("retry wakes the inbox").unwrap()
+            };
+            let got: Vec<_> = inbox.messages.into_iter().map(|msg| msg.id).collect();
+            assert_eq!(got, if accepted { vec![] } else { ids });
+            assert!(d.inbox("gemini:new".into(), 0, false).await.unwrap().messages.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1693,8 +1733,7 @@ mod tests {
             attached: true,
             mailbox: agent == "cli",
         };
-        // A conversation its agent gave an id waits for it, whoever takes the name meanwhile.
-        let back = "it reaches that session when it's back";
+        let back = "it reaches that session when it's back, unless another session here explicitly takes its name";
         assert_eq!(
             offline_note(Some(&seen("codex:1", "codex")), 3 * HOUR),
             format!("queued: last seen 3h ago; unread mail is dropped after about 21h if it stays offline; {back}")
@@ -1704,7 +1743,10 @@ mod tests {
             format!("queued: last seen 1d ago; unread mail may be dropped any time; {back}")
         );
         // The person's own mailboxes are never forgotten.
-        assert_eq!(offline_note(Some(&seen("cli:t", "cli")), 30 * HOUR), format!("queued: last seen 1d ago; {back}"));
+        assert_eq!(
+            offline_note(Some(&seen("cli:t", "cli")), 30 * HOUR),
+            "queued: last seen 1d ago; it reaches that session when it's back"
+        );
         // A session known only by its process can't come back: a new one in its place gets the mail.
         let name = "a new session that takes this name gets the mail";
         assert_eq!(
@@ -1754,7 +1796,7 @@ mod tests {
         let (state, note) = d.receive(bob.public(), msg).unwrap();
         assert_eq!(state, "queued");
         assert!(note.starts_with("queued: last seen 3h ago; unread mail is dropped after about 2"), "{note}");
-        assert!(note.ends_with("; it reaches that session when it's back"), "{note}");
+        assert!(note.ends_with("unless another session here explicitly takes its name"), "{note}");
     }
 
     #[test]
@@ -1830,7 +1872,7 @@ mod tests {
             async move { d.inbox("codex:a".into(), 5, true).await.unwrap() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let new = d.set_status("codex:a", None, Some("new".into())).unwrap().address;
+        let new = d.set_status("codex:a", None, Some("new".into()), Rename::Explicit).unwrap().address;
         // Another session takes the name it gave up; its mail is its own.
         d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
         for (to, body) in [(&old, "for b"), (&new, "for a")] {
@@ -1853,7 +1895,7 @@ mod tests {
             async move { d.inbox("codex:a".into(), 5, false).await.unwrap() }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let new = d.set_status("codex:a", None, Some("new".into())).unwrap().address;
+        let new = d.set_status("codex:a", None, Some("new".into()), Rename::Explicit).unwrap().address;
         d.register(Some(3), named("codex:b", "old"), crate::git::GitInfo::default()).unwrap();
         for (to, body) in [(&old, "for b"), (&new, "for a")] {
             d.send("codex:s".into(), to, body, None, true, false, None, Vec::new()).await.unwrap();
@@ -1884,6 +1926,43 @@ mod tests {
         assert!(got.is_empty());
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(d.inner.lock().unwrap().store.unread(&old).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaim_pushes_waiting_mail_to_the_replacements_connection() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+        let old = SessionReg { name: Some("handoff".into()), ..gemini("gemini:old") };
+        let address = d.register(Some(2), old, crate::git::GitInfo::default()).unwrap().address;
+        d.drop_conn(2);
+        let sent =
+            d.send("codex:sender".into(), &address, "waiting message", None, true, false, None, vec![]).await.unwrap();
+        assert_eq!(sent.recipients[0].state, "queued");
+        let fyi = d
+            .send("codex:sender".into(), &address, "for a natural pause", None, false, false, None, vec![])
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let key = "claude-code:new";
+        let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex(key) };
+        d.register(Some(7), reg, crate::git::GitInfo::default()).unwrap();
+        let rename =
+            || Request::SetStatus { key: key.into(), doing: None, name: Some("handoff".into()), reclaim: true };
+        // The CLI uses a different connection from the session's MCP server.
+        let reply = d.handle(9, rename()).await.unwrap();
+        assert_eq!(reply["address"], address);
+        assert_eq!(reply["unread"], 2);
+        let Event::Deliver { key: recipient, ids, text } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(recipient, key);
+        assert_eq!(ids, sent.ids);
+        assert!(text.contains("waiting message") && !text.contains("for a natural pause"));
+        d.handle(9, rename()).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        d.handle(7, Request::Delivered { key: key.into(), ids }).await.unwrap();
+        let inbox = d.inbox(key.into(), 0, false).await.unwrap();
+        assert_eq!(inbox.messages.into_iter().map(|m| m.id).collect::<Vec<_>>(), fyi.ids);
     }
 
     #[tokio::test]
@@ -2072,7 +2151,15 @@ mod tests {
 
     /// A daemon for alex, with bob's machine on the team and a session here. Returns it, bob's key and the session.
     fn with_teammate() -> (Arc<Daemon>, SecretKey, String) {
-        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        with_inbound_policy(Policy::Accept)
+    }
+
+    fn with_inbound_policy(policy: Policy) -> (Arc<Daemon>, SecretKey, String) {
+        let cfg = crate::config::Config {
+            person: Some("alex".into()),
+            inbound: crate::config::Inbound { default: policy, ..Default::default() },
+            ..Default::default()
+        };
         let d = Arc::new(super::super::test_daemon(cfg));
         let bob = SecretKey::generate();
         let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
@@ -2098,6 +2185,27 @@ mod tests {
             approval: None,
             files,
         }
+    }
+
+    #[tokio::test]
+    async fn held_mail_reaches_the_replacement_only_after_approval() {
+        let (d, bob, address) = with_inbound_policy(Policy::Hold);
+        let name = gone(&d, "codex:1", 0);
+        assert!(d.inner.lock().unwrap().store.session_by_name(&name).unwrap().unwrap().kept());
+        let msg = from_bob(&address, "for review".into(), vec![]);
+        let id = msg.id.clone();
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "held");
+
+        let key = "gemini:new";
+        d.register(Some(2), gemini(key), crate::git::GitInfo::default()).unwrap();
+        let req = Request::SetStatus { key: key.into(), doing: None, name: Some(name), reclaim: true };
+        let reply = d.handle(2, req).await.unwrap();
+        assert_eq!(reply["address"], address);
+        assert_eq!(reply["unread"], 0);
+        assert!(d.inbox(key.into(), 0, false).await.unwrap().messages.is_empty());
+        assert_eq!(d.settle(std::slice::from_ref(&id), true).unwrap(), 1);
+        let inbox = d.inbox(key.into(), 0, false).await.unwrap();
+        assert_eq!(inbox.messages.into_iter().map(|m| m.id).collect::<Vec<_>>(), [id]);
     }
 
     /// Takes `msg` from bob's machine: its error, if refused, after checking nothing of it was kept.
