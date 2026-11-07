@@ -532,7 +532,10 @@ impl Daemon {
             return info.clone();
         }
         let dir = cwd.to_string();
-        let info = tokio::task::spawn_blocking(move || git::lookup(&dir)).await.unwrap_or_default();
+        let info = tokio::task::spawn_blocking(move || git::lookup(&dir)).await.ok().flatten().unwrap_or_else(|| {
+            log(&format!("git didn't answer in {cwd} within {:?}: showing it without repo and branch", git::BUDGET));
+            GitInfo::default()
+        });
         self.git_cache.lock().unwrap().insert(cwd.to_string(), (Instant::now(), info.clone()));
         info
     }
