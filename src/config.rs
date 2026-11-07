@@ -1,4 +1,4 @@
-use crate::{paths, util};
+use crate::{CLI, paths, util};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -116,7 +116,7 @@ impl Config {
                 "Reason Network could not read some settings"
             };
             format!(
-                "{status}: ask your user to fix {}, then run `reason-network stop` and `reason-network who`: {error}",
+                "{status}: ask your user to fix {}, then run `{CLI} stop` and `{CLI} who`: {error}",
                 paths::config().display()
             )
         })
@@ -488,6 +488,17 @@ mod tests {
             assert_eq!(policy("accept", entry), Policy::Hold, "{entry}");
             assert_eq!(policy("hold", entry), Policy::Hold, "{entry}");
         }
+    }
+
+    #[test]
+    fn people_that_is_not_a_table_holds_every_sender_unless_the_default_refuses() {
+        let policy = |default: &str| {
+            let text = format!("[inbound]\ndefault = \"{default}\"\npeople = [\"bob\"]\n");
+            Config::read_private(&text).policy_for("bob")
+        };
+        assert_eq!(policy("accept"), Policy::Hold);
+        assert_eq!(policy("hold"), Policy::Hold);
+        assert_eq!(policy("refuse"), Policy::Refuse);
     }
 
     #[test]
