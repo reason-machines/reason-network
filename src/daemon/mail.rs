@@ -324,6 +324,14 @@ impl Daemon {
                 } else {
                     Ulid::generate().to_string()
                 };
+                if send_key.is_some()
+                    && let Some(receipt) = g.store.retry_remote_send(&id)?
+                {
+                    *may_have_dispatched = true;
+                    res.ids.push(id);
+                    res.recipients.push(receipt);
+                    continue;
+                }
                 if let Some(old) = g.store.message(&id)? {
                     *may_have_dispatched = true;
                     res.ids.push(id);
@@ -424,7 +432,8 @@ impl Daemon {
                         self.deliver_offline(&mut g, r.as_ref(), vec![msg.clone()], wake)
                     }
                     Target::Remote { machine, .. } => {
-                        let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE));
+                        let takes_files = remotes.get(&machine).is_some_and(|r| r.presence.has(files::FEATURE))
+                            || self.learned_routes(&g, &remotes).iter().any(|r| r.machine == machine);
                         match for_machine(msg.clone(), takes_files) {
                             Ok(m) => {
                                 msg = m;
@@ -462,14 +471,19 @@ impl Daemon {
         self.arrived.notify_waiters();
 
         if let Some(net) = net {
-            let sends = remote_jobs.into_iter().filter(|j| j.3).map(|(i, machine, name, _, msg)| {
+            let sends = remote_jobs.into_iter().map(|(i, machine, name, online, msg)| {
                 let net = net.clone();
                 async move {
-                    let verdict = net.send_msg(&machine, &msg).await;
-                    (i, name, verdict)
+                    let verdict = if online { net.send_msg(&machine, &msg).await } else { None };
+                    let verdict = if verdict.is_none() && !net.is_online(&machine) {
+                        net.send_anchor(machine, &msg).await
+                    } else {
+                        verdict
+                    };
+                    (i, name, online, verdict)
                 }
             });
-            for (i, name, verdict) in futures_join(sends).await {
+            for (i, name, online, verdict) in futures_join(sends).await {
                 let r = &mut res.recipients[i];
                 match verdict {
                     // A pop-up only (see above): nothing kept to retry.
@@ -481,6 +495,7 @@ impl Daemon {
                         r.note = note;
                     }
                     None if r.state == "not notified" => r.note = format!("no answer from {name}"),
+                    None if !online => {}
                     None => r.note = format!("queued: no answer from {name} yet; it will be retried"),
                 }
             }
@@ -870,7 +885,7 @@ impl Daemon {
     ) -> Result<(String, String)> {
         let (sender, machine) = self
             .team_state()
-            .and_then(|t| t.member(&peer).map(|m| (m.person.clone(), m.machine.clone())))
+            .and_then(|t| t.member(&peer).filter(|m| m.active).map(|m| (m.person.clone(), m.machine.clone())))
             .ok_or_else(|| anyhow!("not a team member"))?;
         let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
@@ -1010,7 +1025,7 @@ impl Daemon {
         }
         // "retry": the other side is busy; keep it in the outbox for the next flush.
         if state != "retry" {
-            self.outbox_done(id, state != "refused");
+            self.outbox_done_from(peer, id, state != "refused");
         }
     }
 
@@ -1072,7 +1087,11 @@ impl Daemon {
                 };
                 // By its current name: a rename while waiting frees the old one for another session.
                 let address = self.addr(&l.name);
-                let messages = g.pending(&address)?;
+                let mut messages = g.pending(&address)?;
+                if key == "cli:terminal" {
+                    messages.extend(g.pending(&self.addr(super::anchor::NOTICE_INBOX))?);
+                    messages.sort_by_key(|m| m.sent_at);
+                }
                 if !messages.is_empty() && !peek {
                     let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
                     let changed = g.store.mark_read(&ids, util::now_ms())?;
@@ -1188,7 +1207,7 @@ fn fits(body: &str) -> Result<()> {
 }
 
 /// Validates a message from a peer and strips its metadata down to safe characters.
-fn clean(m: Message) -> Result<Message> {
+pub(super) fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
     };

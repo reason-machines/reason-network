@@ -353,11 +353,30 @@ impl Daemon {
                 kept.len()
             ));
         }
+        let mailboxes = g
+            .store
+            .sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.mailbox && !self.cfg.off_in(&r.cwd))
+            .map(|r| r.name)
+            .collect();
+        let mut features = vec![
+            crate::files::FEATURE.into(),
+            super::sessions::TERMINALS.into(),
+            super::anchor::FEATURE.into(),
+            super::anchor::RECEIPTS.into(),
+        ];
+        if self.cfg.anchor || g.store.anchor_holds_mail().unwrap_or(false) {
+            features.push("anchor".into());
+        }
         Presence {
             sessions,
             known: formers.into_iter().chain(known).take(PRESENCE_NAMES).collect(),
             kept: kept.into_iter().take(PRESENCE_NAMES).collect(),
-            features: vec![crate::files::FEATURE.into(), super::sessions::TERMINALS.into()],
+            features,
+            mailboxes,
+            anchor_routes: self.saved_mailboxes(&g),
         }
     }
 
@@ -400,6 +419,26 @@ impl Daemon {
                         s.since = Some(rem.last_seen);
                     }
                     rows.push(s);
+                }
+            }
+            let remotes = net.remotes();
+            let routes = {
+                let g = self.inner.lock().unwrap();
+                self.learned_routes(&g, &remotes)
+            };
+            for route in routes {
+                let Some(m) = team.member(&route.machine).filter(|m| m.active) else { continue };
+                for name in route.names {
+                    if rows.iter().any(|r| r.person == m.person && r.machine == m.machine && r.name == name) {
+                        continue;
+                    }
+                    let mut row = self.row(&name, "cli", "", None);
+                    row.person = m.person.clone();
+                    row.address = format!("{}/{name}", m.person);
+                    row.machine = m.machine.clone();
+                    row.status = "offline".into();
+                    row.tier = Tier::Pull;
+                    rows.push(row);
                 }
             }
         }
@@ -488,6 +527,24 @@ impl Daemon {
                     live: false,
                     repo: None,
                     place: Place::Remote(*id, rem.online),
+                    former: None,
+                });
+            }
+        }
+        for route in self.learned_routes(g, remotes) {
+            let Some(m) = team.member(&route.machine).filter(|m| m.active) else { continue };
+            for name in route.names {
+                if out.iter().any(|c| c.name == name && matches!(c.place, Place::Remote(id, _) if id == route.machine))
+                {
+                    continue;
+                }
+                out.push(Cand {
+                    person: m.person.clone(),
+                    name,
+                    machine: m.machine.clone(),
+                    live: false,
+                    repo: None,
+                    place: Place::Remote(route.machine, false),
                     former: None,
                 });
             }

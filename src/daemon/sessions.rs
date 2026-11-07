@@ -2088,6 +2088,21 @@ mod tests {
     }
 
     #[test]
+    fn a_teammates_ack_only_clears_its_own_outbox() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let msg = Message { id: "peer-bound-ack".into(), ..from_bob(&d, "x") };
+        let target = bob.public().to_string();
+        d.inner.lock().unwrap().store.outbox_add(&target, &msg).unwrap();
+        let stranger = iroh::SecretKey::generate();
+        d.acked(&stranger.public(), &msg.id, "queued", None);
+        assert!(d.inner.lock().unwrap().store.outbox_message(&target, &msg.id).unwrap().is_some());
+        d.acked(&bob.public(), &msg.id, "retry", None);
+        assert!(d.inner.lock().unwrap().store.outbox_message(&target, &msg.id).unwrap().is_some());
+        d.acked(&bob.public(), &msg.id, "queued", None);
+        assert!(d.inner.lock().unwrap().store.outbox_message(&target, &msg.id).unwrap().is_none());
+    }
+
+    #[test]
     fn a_teammates_ack_moves_the_receipt_to_where_mail_went_only_once_it_was_taken() {
         let (d, bob) = with_bob(memory_store(), false);
         join(&d, claude("z"));

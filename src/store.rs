@@ -14,9 +14,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod anchor;
+pub use anchor::TTL_MS as ANCHOR_TTL_MS;
+
 pub struct Store {
     db: Connection,
     inbox: PathBuf,
+    #[cfg(test)]
+    pub(crate) outbox_reads: std::cell::Cell<usize>,
+    #[cfg(test)]
+    pub(crate) anchor_payload_reads: std::cell::Cell<usize>,
 }
 
 /// What the `files` column keeps of a message's files: their folder in the inbox folder, named by an id made here
@@ -47,6 +54,7 @@ const RECEIPT_KEEP_MS: i64 = 7 * 86_400_000;
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
+pub type OutboxMeta = (String, Option<String>);
 
 #[derive(Debug, Clone)]
 pub struct Remembered {
@@ -186,7 +194,7 @@ impl Store {
         anyhow::ensure!(ids.len() <= 100, "request at most 100 delivery receipts");
         let mut out = Vec::new();
         for id in ids {
-            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2 AND sent_at>=?3", params![id,key,crate::util::now_ms()-RECEIPT_KEEP_MS], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
+            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2 AND (sent_at>=?3 OR id IN (SELECT id FROM anchor_sends WHERE retain_until>?4))", params![id,key,crate::util::now_ms()-RECEIPT_KEEP_MS,crate::util::now_ms()], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
             out.push(found.unwrap_or_else(|| serde_json::json!({"id":id,"stage":"unknown"})));
         }
         Ok(out)
@@ -222,7 +230,7 @@ impl Store {
     }
 
     fn prune_receipts(&self, now: i64) -> Result<()> {
-        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1", [now - RECEIPT_KEEP_MS])?;
+        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1 AND id NOT IN (SELECT id FROM anchor_sends WHERE retain_until>?2)", params![now - RECEIPT_KEEP_MS,now])?;
         self.db.execute("DELETE FROM send_keys WHERE created_at < ?1", [now - RECEIPT_KEEP_MS])?;
         Ok(())
     }
@@ -312,7 +320,16 @@ impl Store {
             // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
             db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
-        Ok(Store { db, inbox })
+        let store = Store {
+            db,
+            inbox,
+            #[cfg(test)]
+            outbox_reads: Default::default(),
+            #[cfg(test)]
+            anchor_payload_reads: Default::default(),
+        };
+        store.init_anchor()?;
+        Ok(store)
     }
 
     /// A folder named in the `files` column: only one of the ids made here (a ULID), so always just inside the inbox.
@@ -579,16 +596,49 @@ impl Store {
 
     /// Undelivered messages for a machine; older than a week are given up on.
     pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
-        let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+        #[cfg(test)]
+        self.outbox_reads.set(self.outbox_reads.get() + 1);
+        let expired = self.outbox_prune(now)?;
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
         Ok((rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect(), expired))
+    }
+
+    fn outbox_prune(&self, now: i64) -> Result<usize> {
+        Ok(self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?)
+    }
+
+    pub fn outbox_meta_for(&self, target: &str, now: i64) -> Result<(Vec<OutboxMeta>, usize)> {
+        let expired = self.outbox_prune(now)?;
+        let mut st = self.db.prepare_cached("SELECT o.id, r.recipient FROM outbox o LEFT JOIN sent_receipts r ON r.id=o.id WHERE o.target = ?1 ORDER BY o.created_at, o.rowid")?;
+        let rows =
+            st.query_map([target], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, expired))
+    }
+
+    pub fn outbox_message(&self, target: &str, id: &str) -> Result<Option<Message>> {
+        let encoded: Option<String> = self
+            .db
+            .prepare_cached("SELECT msg FROM outbox WHERE target = ?1 AND id = ?2")?
+            .query_row(params![target, id], |row| row.get(0))
+            .optional()?;
+        #[cfg(test)]
+        if encoded.is_some() {
+            self.outbox_reads.set(self.outbox_reads.get() + 1);
+        }
+        Ok(encoded.and_then(|s| serde_json::from_str(&s).ok()))
     }
 
     /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
     /// (once, however many answers come).
     pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
         let transaction = self.db.unchecked_transaction()?;
+        let removed = self.finish_outbox(id, taken)?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    fn finish_outbox(&self, id: &str, taken: bool) -> Result<bool> {
         let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
         if removed {
             self.db.execute(
@@ -599,8 +649,19 @@ impl Store {
                 let _ = self.count(crate::util::now_ms(), Counted::Sent);
             }
         }
-        transaction.commit()?;
         Ok(removed)
+    }
+
+    pub fn outbox_done_from(&self, target: &str, id: &str, taken: bool) -> Result<bool> {
+        let matches = self
+            .db
+            .query_row("SELECT 1 FROM outbox WHERE id = ?1 AND target = ?2", params![id, target], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if matches {
+            return self.outbox_done(id, taken);
+        }
+        Ok(false)
     }
 
     /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
@@ -1341,6 +1402,28 @@ mod tests {
             approval: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn peer_scoped_acknowledgments_update_receipts_and_counts_once() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        for (id, taken, expected) in [("accepted", true, "accepted"), ("refused", false, "rejected")] {
+            let mut outgoing = message(id, "bob/terminal");
+            outgoing.sent_at = now;
+            store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+            store.outbox_add("laptop", &outgoing).unwrap();
+            let stage = || store.delivery_status("sender", &[id.into()]).unwrap()[0]["stage"].clone();
+            assert!(!store.outbox_done_from("other-peer", id, taken).unwrap());
+            assert_eq!(stage(), "queued");
+            assert_eq!(store.outbox_for("laptop", now).unwrap().0.len(), 1);
+            assert!(store.outbox_done_from("laptop", id, taken).unwrap());
+            assert_eq!(stage(), expected);
+            assert!(!store.outbox_done_from("laptop", id, !taken).unwrap());
+            assert_eq!(stage(), expected);
+        }
+        assert!(store.outbox_for("laptop", now).unwrap().0.is_empty());
+        assert_eq!(store.counts(now).unwrap().iter().map(|day| day.sent).sum::<u64>(), 1);
     }
 
     #[test]

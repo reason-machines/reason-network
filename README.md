@@ -135,6 +135,47 @@ To work out why connections drop or switch to a relay, `debug_log = true` (also 
 networking library's events to `~/.reason/network/debug.log`, on this computer only and without message text, links
 or keys. It's off by default; see [DESIGN.md](DESIGN.md#troubleshooting).
 
+For handoffs while your laptop is off, one of **your own** always-on computers can hold mail for it. On that
+computer (a VPS or Pi, signed in as you), add this at the top of `~/.reason/network/config.toml`, then restart its daemon:
+
+```toml
+anchor = true
+```
+
+Choose it explicitly with `reason-network anchor vps` on that computer (replace `vps` with its machine name from
+`team`). On existing own computers, `reason-network anchor vps --trust` follows the VPS's signed choice. Membership
+or a Reason sign-in proof alone cannot select a custodian. New own computers joining with the private code from
+`invite --me` sign that trust in their inviter automatically; a public team-link join needs an explicit choice or
+`--trust` command. `team` and `doctor` show the selected anchor and warn about unselected or multiple claims.
+Use `reason-network anchor none` to stop new handoffs on this computer.
+Both the sender and destination must select the same anchor. If the destination has not opted in, the sender keeps
+its queued copy for direct delivery.
+
+Run `reason-network listen --as inbox --wait 0` on the laptop while both computers are online once. The anchor
+remembers that permanent mailbox. After that, even a fresh workspace signed in as you can find it with `who` and send
+to `you/inbox@laptop` (use your name and the laptop's machine name). Use one anchor per person; the sending and receiving
+computers need an engine with anchor support. Other people's mail and ordinary agent sessions keep working as before.
+
+Messages go directly when the laptop is online. When it is off, the anchor saves the whole message and its small text
+files in its SQLite database before answering **stored**. The sender can then go away; the anchor keeps its copy until
+the laptop saves it. This confirms storage, not that an agent has read or completed the work. Your own anchor can read
+the mail, just as your laptop can; keep its state on persistent disk.
+
+An anchor holds up to 1,000 pending messages and 64 MB of message data, with up to 10,000 retry receipts. One sending
+computer can use at most 250 pending messages, 16 MB, and 2,500 receipts. When full it refuses the handoff and the sender
+keeps its copy; payload retries back off from 30 seconds to ten minutes. Mail expires seven days from the original send,
+including after a restart or retry. Missing mailbox announcements or an older engine withdraw discovery without
+discarding accepted mail. Actual delivery refusal or machine revocation drops that handoff. Drop notices stay in the
+anchor's `terminal` inbox (`reason-network listen --as terminal --wait 0` there), even if the sending workspace is gone.
+The sender's receipt stays `anchored` until the anchor reports recipient storage, refusal, or expiry. Compact results
+and corresponding source receipts remain available for seven more days after payload expiry, without retaining the
+payload. Queries continue against the original custodian after a selection change. Already accepted mail continues to
+drain if you turn the anchor setting off while keeping it selected; changing the selected anchor can leave old custody
+waiting until the original expiry. File data is synced before storage acknowledgment; directory syncing is best effort
+on filesystems that don't support it. Reason keeps hosted assistants' inboxes centrally,
+but mail not yet handed to Reason can still be waiting on a computer or its peers. This anchor covers permanent
+mailboxes, not that hosted-session handoff.
+
 ## Uninstall
 
 ```sh

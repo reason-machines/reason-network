@@ -253,6 +253,12 @@ pub enum Request {
         #[serde(default)]
         url: Option<String>,
     },
+    /// Explicitly select an own-machine anchor, or clear the choice with `none`.
+    SetAnchor {
+        machine: String,
+        #[serde(default)]
+        trust: bool,
+    },
     Held,
     /// Approve (`release`) or drop held messages; no ids means all of them.
     Settle {
@@ -465,6 +471,8 @@ pub struct TeamInfo {
     /// for others. Older engines leave it out.
     #[serde(default)]
     pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchor: Vec<String>,
     /// Per-day totals of messages sent and received on this machine, returned to local clients on the socket: sent
     /// once the receiving machine took them, received once in a mailbox here (a held one once approved). For the days
     /// (UTC) from six before today to tomorrow that had any. Older engines leave it out.
@@ -602,6 +610,7 @@ mod tests {
             machine: "mbp".into(),
             machines: vec![],
             features: vec![],
+            anchor: Vec::new(),
             messages: vec![DayCount { day: "2026-10-20".into(), sent: 3, received: 1 }],
             udp: Some(UdpPort { port: 41641, fixed: Some(41641), fell_back: false }),
         };
