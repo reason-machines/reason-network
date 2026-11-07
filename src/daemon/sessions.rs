@@ -1725,6 +1725,49 @@ mod tests {
         assert!(d.inner.lock().unwrap().store.session_by_name("review-2").unwrap().is_none());
     }
 
+    #[test]
+    fn paused_sessions_and_held_mail_keep_the_normal_expiry() {
+        let mut d =
+            super::super::test_daemon(crate::config::Config { person: Some("alex".into()), ..Default::default() });
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        d.cfg.unreadable = Some("bad TOML".into());
+        d.cfg.all_folders_off = true;
+        d.cfg.inbound.default = crate::config::Policy::Hold;
+        settled(&mut d);
+        let d = Arc::new(d);
+        let msg = Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr("api-claude"),
+            via: None,
+            reply_to: None,
+            body: "kept while paused".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "held");
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.unread(&d.addr("api-claude")).unwrap().is_empty());
+        drop(g);
+        d.inner.lock().unwrap().store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.prune(&mut g);
+        }
+        assert!(d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap().is_none());
+        assert!(d.inner.lock().unwrap().store.held().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn mail_held_for_a_conversation_goes_with_it_and_never_to_the_next_session() {
         let cfg = crate::config::Config {
@@ -2512,5 +2555,43 @@ mod tests {
         // Once its folders are all on again, it is a session like any other.
         assert!(d.hook(call("c1", "prompt", &[])).await.unwrap().address.is_some());
         assert!(d.inner.lock().unwrap().live.contains_key("cursor:c1"));
+    }
+
+    /// MCP servers of earlier releases drop a session refused on reconnect only when the refusal is exactly `OFF_HERE`.
+    /// Any other text fails their whole reconnect, and they keep retrying it, so it stays exactly that, whatever part
+    /// of the config file can't be read.
+    #[tokio::test]
+    async fn a_daemon_refuses_a_folder_that_is_off_with_exactly_the_old_text_even_when_the_file_is_unreadable() {
+        let off: std::collections::BTreeMap<_, _> = [("/work/private".to_string(), "off".to_string())].into();
+        for cfg in [
+            // The whole file: every folder is off.
+            crate::config::Config { unreadable: Some("bad TOML".into()), all_folders_off: true, ..Default::default() },
+            // Another setting.
+            crate::config::Config {
+                folders: off.clone(),
+                unreadable: Some("port: invalid type".into()),
+                ..Default::default()
+            },
+            // The folder's own entry.
+            crate::config::Config {
+                folders: off.clone(),
+                unreadable_folders: vec!["/work/private".into()],
+                unreadable: Some("folders./work/private: expected \"off\"".into()),
+                ..Default::default()
+            },
+        ] {
+            let d = Arc::new(super::super::test_daemon(cfg));
+            let private = SessionReg { cwd: "/work/private".into(), ..named("cursor:c1", "cursor", None) };
+            let in_private = HookCall { dirs: vec!["/work/private".into()], ..gemini("c2", "prompt") };
+            let said = [
+                d.register_quiet(Some(1), private, GitInfo::default()).unwrap_err(),
+                d.hook(in_private).await.unwrap_err(),
+                // Its hooks said it is in a folder that is off; its MCP server doesn't know.
+                d.register_quiet(Some(2), named("gemini:c2", "gemini", None), GitInfo::default()).unwrap_err(),
+            ];
+            for e in said {
+                assert_eq!(e.to_string(), OFF_HERE);
+            }
+        }
     }
 }

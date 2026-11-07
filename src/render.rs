@@ -38,6 +38,9 @@ const CYAN: &str = "36";
 pub fn directory(d: &Directory, agent: bool, paint: Paint) -> String {
     let now = util::now_ms();
     let mut out = String::new();
+    if let Some(warning) = &d.config_warning {
+        let _ = writeln!(out, "! {warning}");
+    }
     let team = d.team.as_deref().map_or_else(
         || paint.on(DIM, "no team yet (this machine only)"),
         |t| format!("{} {}", paint.on(DIM, "team"), paint.on(BOLD, t)),
@@ -506,6 +509,7 @@ mod tests {
             is_me: false,
         };
         Directory {
+            config_warning: None,
             team: Some(team.into()),
             person: "alex".into(),
             machine: "mbp".into(),

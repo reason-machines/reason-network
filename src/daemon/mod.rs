@@ -246,7 +246,11 @@ impl Daemon {
         }
     }
     fn open() -> Result<Self> {
-        let mut daemon = Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
+        let cfg = Config::load();
+        if let Some(warning) = cfg.warning() {
+            log(&warning);
+        }
+        let mut daemon = Self::with(cfg, Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
         daemon.usage = crate::usage::Usage::open(paths::home().join("usage.sqlite"));
         Ok(daemon)
     }

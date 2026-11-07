@@ -943,7 +943,11 @@ impl Daemon {
             let name = name.as_str();
             // Where it went, said only once it is taken: not for a refusal or a "retry".
             let went = (msg.to != asked).then(|| msg.to.clone());
-            if key.is_none() && remembered.as_ref().is_none_or(|r| self.cfg.off_in(&r.cwd)) {
+            if key.is_none()
+                && remembered
+                    .as_ref()
+                    .is_none_or(|r| self.cfg.off_in(&r.cwd) && !(self.cfg.all_folders_off && policy == Policy::Hold))
+            {
                 return Ok(("refused".into(), format!("no session called {} on {}", msg.to, self.machine)));
             }
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.

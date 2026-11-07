@@ -416,6 +416,8 @@ pub struct Registered {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Directory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_warning: Option<String>,
     pub team: Option<String>,
     pub person: String,
     pub machine: String,

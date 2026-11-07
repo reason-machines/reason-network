@@ -3,7 +3,6 @@
 use crate::{
     agent::{self, ClaudeSocket},
     client::Link,
-    config::OFF_HERE,
     proto::*,
     render,
 };
@@ -388,8 +387,10 @@ impl ReasonNetworkMcp {
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
-        if off_here() {
-            anyhow::bail!(OFF_HERE);
+        let cfg = crate::config::Config::load();
+        let cwd = agent::cwd();
+        if cfg.off_in(&cwd) {
+            anyhow::bail!(cfg.off_message(&cwd));
         }
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
@@ -503,7 +504,7 @@ impl ReasonNetworkMcp {
 
 /// Whether this session's folder is off the network (read each time: `folder` may have changed it since).
 fn off_here() -> bool {
-    crate::config::Config::load_strict().unwrap_or_default().off_in(&agent::cwd())
+    crate::config::Config::load().off_in(&agent::cwd())
 }
 
 /// The files an agent asked to send, read only from its own folder: its repository (or where it works), none of its
@@ -520,7 +521,7 @@ pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachme
     let root = crate::git::lookup(cwd).root.unwrap_or_else(|| cwd.to_string());
     let confine =
         crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
-            .with_folders(crate::config::Config::load_strict().unwrap_or_default());
+            .with_folders(crate::config::Config::load());
     crate::files::read_within(paths, std::path::Path::new(&cwd), &confine)
 }
 
