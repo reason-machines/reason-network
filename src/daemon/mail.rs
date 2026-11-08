@@ -106,6 +106,38 @@ fn handoff_command(
     command
 }
 
+/// What goes to an agent's CLI in one command: the ids of the messages it carries, and their text.
+type Handoff = (Vec<String>, String);
+
+/// The most text one command to an agent's CLI carries, in bytes. It is one command-line argument, and Windows takes
+/// about 32,000 characters for a whole command line, half as many where the text is full of quotes (each needs a
+/// backslash).
+const HANDOFF_MAX: usize = if cfg!(windows) { 15_000 } else { 100_000 };
+
+const TOO_LONG_NOTE: &str = "queued: too long to hand to the session in one go; it is there when the session checks \
+                             its inbox";
+
+/// `msgs` as the texts that go to an agent's CLI (`agent` is its name), in order, as many messages in each as fit in
+/// `max` bytes. A message too long to go alone is left out: its hooks or its inbox show it.
+fn handoffs(msgs: &[Message], agent: &str, max: usize) -> Vec<Handoff> {
+    let text = |msgs: &[Message]| render::for_agent(msgs, Some(agent), false);
+    let carried = |msgs: &[Message]| -> Handoff { (msgs.iter().map(|m| m.id.clone()).collect(), text(msgs)) };
+    let mut out = Vec::new();
+    let mut next: Vec<Message> = Vec::new();
+    for m in msgs.iter().filter(|m| text(std::slice::from_ref(m)).len() <= max) {
+        next.push(m.clone());
+        if next.len() > 1 && text(&next).len() > max {
+            let last = next.pop();
+            out.push(carried(&next));
+            next = last.into_iter().collect();
+        }
+    }
+    if !next.is_empty() {
+        out.push(carried(&next));
+    }
+    out
+}
+
 /// A message to send to a teammate's machine now: where its result goes, the machine, its name, whether it is
 /// connected, and the message.
 type RemoteJob = (usize, EndpointId, String, bool, Message);
@@ -586,10 +618,15 @@ impl Daemon {
                 ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
             }
             Channel::Command(bin, args, codex_home) => {
-                for id in &ids {
+                // One command line carries only so much: a long batch goes in several commands, in order.
+                let batches = handoffs(&msgs, bin, HANDOFF_MAX);
+                if batches.is_empty() {
+                    return ("queued".into(), TOO_LONG_NOTE.into());
+                }
+                for id in batches.iter().flat_map(|(ids, _)| ids) {
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
-                self.send_with(bin, args, codex_home, key.to_string(), ids, text);
+                self.send_with(bin, args, codex_home, key.to_string(), batches);
                 (
                     "pushed".into(),
                     format!(
@@ -637,12 +674,14 @@ impl Daemon {
         let Some((r, (thread, codex_home))) = resumable.filter(|_| self.agent_bin("codex").is_some()) else {
             return ("queued".into(), offline_note(r, now));
         };
-        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
-        for id in &ids {
+        let batches = handoffs(&msgs, &r.agent, HANDOFF_MAX);
+        if batches.is_empty() {
+            return ("queued".into(), offline_note(Some(r), now));
+        }
+        for id in batches.iter().flat_map(|(ids, _)| ids) {
             g.in_flight.insert(id.clone(), Instant::now());
         }
-        let text = render::for_agent(&msgs, Some(&r.agent), false);
-        self.send_with("codex", codex_queue(&thread), codex_home, r.key.clone(), ids, text);
+        self.send_with("codex", codex_queue(&thread), codex_home, r.key.clone(), batches);
         let seen = util::ago(r.last_seen, now);
         (
             "pushed".into(),
@@ -765,31 +804,40 @@ impl Daemon {
         }
     }
 
-    /// Hands `text` to the agent's own CLI (`args` end with its message flag), against `codex_home` if set.
+    /// Hands `batches` one after another to the agent's own CLI (`args` end with its message flag), against `codex_home`
+    /// if set. When one fails, the rest are given up with it: see `handed`.
     fn send_with(
         self: &Arc<Self>,
         bin: &'static str,
         args: Vec<String>,
         codex_home: Option<String>,
         key: String,
-        ids: Vec<String>,
-        text: String,
+        batches: Vec<Handoff>,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            let run = async {
-                let program =
-                    this.agent_bin(bin).map(|b| agent::command_at(&b)).ok_or_else(|| format!("{bin} not found"))?;
-                let out = handoff_command(program, &args, &text, codex_home.as_deref()).output();
-                match tokio::time::timeout(Duration::from_secs(30), out).await {
-                    Ok(Ok(o)) if o.status.success() => Ok(()),
-                    Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("timed out".into()),
+            let mut rest = batches.into_iter();
+            while let Some((ids, text)) = rest.next() {
+                let run = async {
+                    let program =
+                        this.agent_bin(bin).map(|b| agent::command_at(&b)).ok_or_else(|| format!("{bin} not found"))?;
+                    let out = handoff_command(program, &args, &text, codex_home.as_deref()).output();
+                    match tokio::time::timeout(Duration::from_secs(30), out).await {
+                        Ok(Ok(o)) if o.status.success() => Ok(()),
+                        Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err("timed out".into()),
+                    }
+                };
+                let res: std::result::Result<(), String> = run.await;
+                if res.is_err() {
+                    // Once, with all that is left: `handed` backs off a Reason session each time it is told of a failure.
+                    let left: Vec<String> = ids.into_iter().chain(rest.flat_map(|(ids, _)| ids)).collect();
+                    this.handed(bin, &key, &left, res);
+                    return;
                 }
-            };
-            let res = run.await;
-            this.handed(bin, &key, &ids, res);
+                this.handed(bin, &key, &ids, res);
+            }
         });
     }
 
@@ -1497,6 +1545,27 @@ mod tests {
         assert_eq!(default.as_std().get_envs().count(), 0);
     }
 
+    #[test]
+    fn a_handoff_is_cut_into_texts_that_each_fit_and_leaves_out_a_message_that_cant() {
+        let msg = |body: usize| from_bob("alex/api", "x".repeat(body), Vec::new());
+        let (a, b, huge, c, d) = (msg(400), msg(400), msg(5000), msg(400), msg(400));
+        let text = |msgs: &[&Message]| {
+            render::for_agent(&msgs.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), Some("codex"), false)
+        };
+        // Room for two of them, not three.
+        let max = text(&[&a, &b]).len();
+        let all = [a.clone(), b.clone(), huge.clone(), c.clone(), d.clone()];
+        let got = handoffs(&all, "codex", max);
+        let ids = |msgs: &[&Message]| msgs.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert_eq!(got.iter().map(|(ids, _)| ids.clone()).collect::<Vec<_>>(), [ids(&[&a, &b]), ids(&[&c, &d])]);
+        assert!(got.iter().all(|(_, t)| t.len() <= max));
+        assert_eq!(got[0].1, text(&[&a, &b]));
+        assert_eq!(got[1].1, text(&[&c, &d]));
+        // All in one when it fits, and nothing to hand over when no message does.
+        assert_eq!(handoffs(&all[..2], "codex", 1 << 20).len(), 1);
+        assert!(handoffs(&[huge], "codex", max).is_empty());
+    }
+
     #[tokio::test]
     async fn an_offline_codex_thread_seen_within_a_day_takes_wake_mail_through_codex_queue_in_its_home() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
@@ -1699,6 +1768,48 @@ mod tests {
         // Taken: read, and the turn it starts doesn't show it again.
         assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
         assert_eq!(d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap().text, None);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mail_too_long_for_one_codex_queue_command_goes_in_several_or_waits_for_the_hooks() {
+        let (d, _, _) = with_teammate();
+        let log = fake_codex(&d, false);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let wake = |body: String| {
+            let mut m = from_bob(&to, body, Vec::new());
+            m.wake = true;
+            m
+        };
+        let hand = |msgs: Vec<Message>| {
+            let mut g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(&name).unwrap().unwrap();
+            for m in &msgs {
+                g.store.insert(&mut m.clone(), false).unwrap();
+            }
+            d.deliver_offline(&mut g, Some(&r), msgs, true)
+        };
+        // Four messages that fit a command each, not two together, and that no command line takes all at once: four
+        // commands, a message in each, and all taken.
+        let each = HANDOFF_MAX * 6 / 10;
+        let digits = ["1", "2", "3", "4"];
+        let (state, _) = hand(digits.iter().map(|digit| wake(digit.repeat(each))).collect());
+        assert_eq!(state, "pushed");
+        let queued = codex_queued(&d, &log, "t1").await;
+        assert_eq!(queued.len(), 4, "{:?}", queued.iter().map(String::len).collect::<Vec<_>>());
+        assert!(queued.iter().all(|q| q.len() <= "default|".len() + HANDOFF_MAX));
+        for digit in digits {
+            assert_eq!(queued.iter().filter(|q| q.contains(&digit.repeat(each))).count(), 1);
+        }
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // One too long for any command: nothing runs for it, and it waits, unread, for the hooks of the turn.
+        let (state, note) = hand(vec![wake("5".repeat(HANDOFF_MAX + 1))]);
+        assert!(state == "queued" && note.starts_with("queued: last seen 1h ago"), "{state}: {note}");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 4);
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
