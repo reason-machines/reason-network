@@ -15,7 +15,7 @@ use crate::{
     team::Signed,
     util,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
     sync::Arc,
@@ -115,6 +115,17 @@ const UPGRADE: &str =
 
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
+
+/// What a failure of this machine's own store or disk is marked with while it takes a teammate's message: not the
+/// message's fault, so the sender is asked to try again (see [`Daemon::receive_readdressed`]), not told it was refused.
+#[derive(Debug)]
+struct Unavailable;
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("couldn't store the message")
+    }
+}
 
 /// `codex queue`'s arguments for `thread`, up to its message flag.
 fn codex_queue(thread: &str) -> Vec<String> {
@@ -858,7 +869,14 @@ impl Daemon {
         msg: Message,
     ) -> Result<(String, String, Option<String>)> {
         let mut to = None;
-        let (state, note) = self.receive_to(peer, msg, &mut to)?;
+        let (state, note) = match self.receive_to(peer, msg, &mut to) {
+            // Its own store or disk failed (full, locked, gone): the sender keeps the message for another try.
+            Err(e) if e.is::<Unavailable>() => {
+                log(&format!("couldn't take a message from {}: {e:#}", peer.fmt_short()));
+                ("retry".into(), format!("queued: {} can't store it right now; retrying later", self.machine))
+            }
+            taken => taken?,
+        };
         Ok((state, note, to))
     }
 
@@ -916,7 +934,7 @@ impl Daemon {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
             // Sent again (word that it was taken got lost on the way): where it went then, not where its name leads now.
-            if let Some(had) = g.store.message(&msg.id)? {
+            if let Some(had) = g.store.message(&msg.id).context(Unavailable)? {
                 if render::without_machine(&had.from) == msg.from && had.to != asked {
                     *to = Some(had.to);
                 }
@@ -931,7 +949,7 @@ impl Daemon {
                 }
                 _ => name,
             };
-            let remembered = if key.is_none() { g.store.session_by_name(&name)? } else { None };
+            let remembered = if key.is_none() { g.store.session_by_name(&name).context(Unavailable)? } else { None };
             // To the default name an offline session went by before its title named it: at its name now.
             let name = match remembered.as_ref() {
                 Some(r) if r.name != name => {
@@ -953,7 +971,8 @@ impl Daemon {
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
             let bytes = files::size(&msg.files);
             if bytes > 0 {
-                let (kept, from_sender) = (g.store.files_kept()?, g.store.files_kept_from(&sender)?);
+                let kept = g.store.files_kept().context(Unavailable)?;
+                let from_sender = g.store.files_kept_from(&sender).context(Unavailable)?;
                 if let Err(why) = g.quota.admit(&sender, bytes, kept, from_sender, Instant::now()) {
                     return Ok((
                         "retry".into(),
@@ -976,9 +995,9 @@ impl Daemon {
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
             // Held for a session whose name is kept, it is that session's: it goes when the session does.
-            let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
+            let kept = held && g.store.session_by_name(name).context(Unavailable)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
-            if g.store.insert(&mut msg, held)? && !held {
+            if g.store.insert(&mut msg, held).context(Unavailable)? && !held {
                 self.record_remote_received(&msg);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
@@ -2343,5 +2362,39 @@ mod tests {
         assert_eq!(state, "queued");
         let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
         assert_eq!((got.len(), got[0].body.len(), got[0].files.len()), (1, MAX_BODY, MAX_FILES));
+    }
+
+    #[test]
+    fn a_message_this_machine_cant_store_is_asked_again_not_refused() {
+        let (d, db, home) = disk_daemon();
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        let unread = || d.inner.lock().unwrap().store.unread(&to).unwrap().len();
+
+        // A file where the inbox folder should be, as a full or a locked disk would leave it: the files can't be saved.
+        std::fs::write(home.join("inbox"), "").unwrap();
+        let file = Attachment { name: "a.md".into(), content: "x".into(), path: None };
+        let msg = from_bob(&to, "the logs".into(), vec![file]);
+        let (state, note) = d.receive(bob.public(), msg.clone()).unwrap();
+        assert_eq!(state, "retry", "{note}");
+        assert!(note.contains("retrying later"), "{note}");
+        assert_eq!(unread(), 0);
+        // The sender's machine keeps it and sends it again, as it does at its next flush: taken once the disk works.
+        std::fs::remove_file(home.join("inbox")).unwrap();
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "queued");
+        assert_eq!(unread(), 1);
+
+        // The same when the database fails, whatever the message carries.
+        db.execute_batch("ALTER TABLE messages RENAME TO messages_away").unwrap();
+        let text = from_bob(&to, "the logs, again".into(), Vec::new());
+        assert_eq!(d.receive(bob.public(), text.clone()).unwrap().0, "retry");
+        db.execute_batch("ALTER TABLE messages_away RENAME TO messages").unwrap();
+        assert_eq!(d.receive(bob.public(), text).unwrap().0, "queued");
+        assert_eq!(unread(), 2);
+        drop(db);
+        let _ = std::fs::remove_dir_all(home);
     }
 }
