@@ -6,6 +6,7 @@ import json, os, pathlib, select, socket, subprocess, tempfile, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / 'target/debug/reason-network'
+NOTE = 'Reason Network: the message below came over the team network'
 
 def main():
     with tempfile.TemporaryDirectory(prefix='rn-antigravity-', dir='/tmp') as directory:
@@ -36,8 +37,8 @@ def main():
                 if result:return result
                 time.sleep(.1)
             raise AssertionError('condition did not become true')
-        def hooks(sid,event,workspaces=None):
-            return cli('hook','antigravity',event,payload=dict(conversationId=sid,workspacePaths=workspaces or [str(project)],transcriptPath=str(root/'.gemini/antigravity/brain'/sid/'transcript.jsonl'),invocationNum=0,initialNumSteps=0))
+        def hooks(sid,event,workspaces=None,**extra):
+            return cli('hook','antigravity',event,payload=dict(conversationId=sid,workspacePaths=workspaces or [str(project)],transcriptPath=str(root/'.gemini/antigravity/brain'/sid/'transcript.jsonl'),invocationNum=0,initialNumSteps=0,**extra))
         def sessions():return call('who')['result']['sessions']
         def receipt(ids):return call('delivery_status',**{'from':'cli:sender','ids':ids})['result']
         def sent(to,body,key):
@@ -60,9 +61,20 @@ def main():
             assert hooks(first,'post-tool-use') == ''
             assert receipt(ids)[0]['stage']=='queued'
             injected=json.loads(hooks(first,'user-prompt-submit'))
-            assert 'Receive at the next invocation' in injected['injectSteps'][0]['userMessage']
+            step=injected['injectSteps'][0]['userMessage']
+            assert 'Receive at the next invocation' in step
+            assert step.startswith(NOTE),step
             assert receipt(ids)[0]['stage']=='handed_to_agent'
             print('PASS native PreInvocation injects; PostTool leaves mail unread')
+            ids=sent(recipient,'Continue after a normal finish','stop-message')
+            for held in [dict(terminationReason='USER_CANCELED'),dict(terminationReason='ERROR'),{}]:
+                assert hooks(first,'stop',**held) == '',held
+                assert receipt(ids)[0]['stage']=='queued',held
+            continued=json.loads(hooks(first,'stop',terminationReason='NO_TOOL_CALL'))
+            assert continued['decision']=='continue' and 'Continue after a normal finish' in continued['reason'],continued
+            assert continued['reason'].startswith(NOTE),continued
+            assert receipt(ids)[0]['stage']=='handed_to_agent'
+            print('PASS Stop continues with mail on a normal finish and holds it on any other')
             hooks(second,'user-prompt-submit')
             mcp=subprocess.Popen([str(BIN),'mcp'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(env,REASON_NETWORK_AGENT='antigravity'),cwd=project)
             def rpc(i,method,params):
@@ -88,6 +100,7 @@ def main():
             assert not call('send',**{'from':'cli:sender','to':recipient,'body':'Different content','idempotency_key':'idle-message'})['ok']
             lines=[json.loads(line) for line in log.read_text().splitlines()]
             assert len(lines)==1 and lines[0][0:2]==['send-message',first] and ids[0] in lines[0][2],lines
+            assert lines[0][2].startswith(NOTE),lines
             print('PASS idle sidecar hands off once; retry preserves id and different-content reuse is refused')
             fail.touch();ids=sent(recipient,'Retry the failed handoff','failure-message')
             wait(lambda:any(s['address']==recipient and s['tier']=='turn' for s in sessions()))
