@@ -541,7 +541,7 @@ Or paste the invite line into any agent.
 | `share_unmanaged` | `false` | show teammates Claude Code sessions that don't have Reason Network loaded |
 | `tray` | `true` | macOS: show the menu bar icon while the background service runs |
 | `lan` | `true` | find teammates on the local network (mDNS) |
-| `auto_update` | `true` | install new releases when they come out (checked every few hours) |
+| `auto_update` | `true` | install new releases when they come out (checked every few hours); only in a folder that has a `config.toml` |
 | `reason` | `false` | list your live Reason sessions (set by `reason-network setup`) |
 | `debug_log` | `false` | write the networking library's events to `debug.log`, on this computer only (read when the daemon starts) |
 | `inbound` | accept | see above |

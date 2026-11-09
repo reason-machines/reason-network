@@ -118,6 +118,11 @@ Teammates see your name, your computers, and what your agent sessions are workin
 Signed in with Reason, your name shows as verified: Reason signs that the computer is yours, every teammate's computer
 checks that itself, and nobody else can take the name. State lives in `~/.reason/network`. Details: [DESIGN.md](DESIGN.md).
 
+`REASON_NETWORK_HOME` moves that state folder, e.g. to run a second "computer" side by side. It names the state folder
+itself, not your home folder: a command run with it (`mcp`, `who`, …) starts a daemon that keeps its key, database and
+log right in that folder. Only a folder that has been set up (by `init`, `join` or the setup wizard, which write its
+`config.toml`) installs new releases over the shared binary.
+
 Direct connections use a random UDP port each time the daemon starts. To open or forward one port in a firewall or
 router instead, set it in `~/.reason/network/config.toml` (per computer; the daemon reads it when it starts):
 

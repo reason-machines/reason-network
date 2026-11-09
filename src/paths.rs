@@ -1,5 +1,7 @@
 //! Where Reason Network keeps its state: `~/.reason/network`, or `REASON_NETWORK_HOME` (handy for running two
-//! "machines" side by side). On Windows, `~` is the profile folder.
+//! "machines" side by side). `REASON_NETWORK_HOME` names that state folder itself, not your home folder: a client run
+//! with it starts a daemon that keeps its key, database, socket and log right in it. Only a folder that has been set up
+//! (has a `config.toml`) updates the binary. On Windows, `~` is the profile folder.
 //!
 //! Builds before 0.10.1 kept it in `~/.<LEGACY_NAME>` (or `TINCAN_HOME`) as `<LEGACY_NAME>.db` and `.sock`. [`migrate`]
 //! moves it here once, with the daemon that holds it stopped. Until that has happened, every path below still names
