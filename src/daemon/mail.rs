@@ -570,6 +570,9 @@ impl Daemon {
             "queued: delivered within seconds once the session is idle"
         } else if l.reg.agent == "cli" {
             "queued: it gets it the next time it listens"
+        } else if !codex_turn && l.status.as_ref().is_some_and(|(s, _)| s == "idle") {
+            // No turn is running, and its hooks only run inside one: nothing here starts the session.
+            "queued: the session is idle and nothing wakes it; it sees it in its next turn, once its user prompts it"
         } else {
             "queued: it sees it at its next tool call or when its turn ends"
         };
@@ -1268,6 +1271,29 @@ mod tests {
         assert_eq!(res.recipients[0].state, "queued");
         let days = d.inner.lock().unwrap().store.counts(util::now_ms()).unwrap();
         assert_eq!(days.iter().map(|d| (d.sent, d.received)).collect::<Vec<_>>(), [(1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn mail_for_an_idle_hook_session_says_only_its_next_prompt_shows_it() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap();
+        let cursor =
+            SessionReg { agent: "cursor".into(), tier: Tier::Turn, cwd: "/work/web".into(), ..codex("cursor:1") };
+        let to = d.register(Some(2), cursor, crate::git::GitInfo::default()).unwrap().address;
+        let set = |status: &str| {
+            let mut g = d.inner.lock().unwrap();
+            let l = g.live.get_mut("cursor:1").unwrap();
+            l.last_hook = Some(util::now_ms());
+            l.status = Some((status.into(), util::now_ms()));
+        };
+        set("busy");
+        let res = d.send("codex:1".into(), &to, "mid-turn", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        assert!(res.recipients[0].note.contains("next tool call"), "{}", res.recipients[0].note);
+        set("idle");
+        let res = d.send("codex:1".into(), &to, "while idle", None, true, false, None, Vec::new()).await.unwrap();
+        assert_eq!(res.recipients[0].state, "queued");
+        assert!(res.recipients[0].note.contains("idle and nothing wakes it"), "{}", res.recipients[0].note);
     }
 
     const HOUR: i64 = 3_600_000;
