@@ -538,6 +538,23 @@ starts = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read().cou
 check("…and doesn't race to start daemons", starts <= 3, f"{starts} duplicate starts")
 mcp.kill()
 
+# The Codex app runs short ephemeral threads of its own (naming a chat, for one) beside the chats people have: they keep no
+# rollout, so their hooks name no transcript. Never a session anyone can reach, nor a name taken from the chats that are.
+titles = os.path.join(D, "titles")
+os.makedirs(titles)
+eph = lambda event: hook("codex", event, {"session_id": "ephemeral-1", "cwd": titles, "transcript_path": None, "hook_event_name": event})
+eph_out = "".join(eph(event) for event in ("session-start", "user-prompt-submit", "post-tool-use", "stop"))
+out = run("who", "titles")
+check("a Codex ephemeral thread's hooks put no session on the network", "titles-codex" not in out and eph_out == "", out + eph_out)
+rollout = os.path.join(titles, "rollout-durable-1.jsonl")
+open(rollout, "w").close()
+intro = hook("codex", "session-start", {"session_id": "durable-1", "cwd": titles, "transcript_path": rollout, "hook_event_name": "SessionStart"})
+eph("post-tool-use")
+out = run("who", "titles")
+check("…while a chat with a rollout there is on it, by the folder's own name",
+      "alex/titles-codex." in intro and out.count("titles-codex") == 1 and "titles-codex-2" not in out, out + intro)
+eph("session-end")
+
 # The daemon being down never breaks the agent.
 run("stop")
 bad = dict(env, REASON_NETWORK_HOME="/nonexistent/dir/that/cannot/exist")

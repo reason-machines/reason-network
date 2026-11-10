@@ -66,7 +66,7 @@ async fn handle(
     let v: Value = serde_json::from_str(input.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
     let agent = agent::from_client_name(agent_name).unwrap_or(agent_name);
     let str_at = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
-    if agent == "grok" && grok_ignores(event, &v) {
+    if (agent == "grok" && grok_ignores(event, &v)) || (agent == "codex" && codex_ephemeral(&v)) {
         return None;
     }
 
@@ -168,6 +168,13 @@ fn grok_ignores(event: &str, v: &Value) -> bool {
     !v["subagentType"].is_null() || (event == "stop" && v["reason"] != "end_turn")
 }
 
+/// Codex's ephemeral threads (the Codex app names a chat with one, for instance) keep no rollout, so their hooks name no
+/// transcript: no chat anyone can come back to or reach, so never a session here, nor a name taken from the chats that
+/// are. Older Codex, whose hooks don't name one at all, is not this.
+fn codex_ephemeral(v: &Value) -> bool {
+    v.get("transcript_path").is_some_and(Value::is_null)
+}
+
 /// The JSON (or text) each agent expects from this hook to put `text` in front of the model.
 fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let specific = |name: &str| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
@@ -211,7 +218,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_home, format_for, grok_ignores, takes_mail};
+    use super::{codex_ephemeral, codex_home, format_for, grok_ignores, takes_mail};
     use serde_json::json;
 
     #[test]
@@ -251,6 +258,14 @@ mod tests {
         assert_eq!(codex_home(Some("".into())), None);
         assert_eq!(codex_home(None), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_codex_thread_without_a_transcript_is_ephemeral() {
+        assert!(codex_ephemeral(&json!({ "session_id": "t", "transcript_path": null })));
+        assert!(!codex_ephemeral(&json!({ "session_id": "t", "transcript_path": "/h/.codex/sessions/rollout-t.jsonl" })));
+        assert!(!codex_ephemeral(&json!({ "session_id": "t" })));
+        assert!(!codex_ephemeral(&serde_json::Value::Null));
     }
 
     #[test]
