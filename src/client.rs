@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, Weak,
@@ -52,7 +52,7 @@ fn patience(req: &Request) -> Duration {
 
 pub struct Link {
     conn: tokio::sync::Mutex<Option<Conn>>,
-    regs: Mutex<HashMap<String, SessionReg>>,
+    regs: Mutex<Regs>,
     /// Where pushed events go. `None` for one-shot clients, which also don't reconnect.
     events: Option<mpsc::UnboundedSender<Event>>,
     next_id: AtomicU64,
@@ -81,14 +81,18 @@ impl Link {
     }
 
     pub async fn register(self: &Arc<Self>, reg: SessionReg) -> Result<Registered> {
+        if self.regs.lock().unwrap().forgotten.contains(&reg.key) {
+            bail!(NO_TRANSCRIPT);
+        }
         let r = self.call(Request::Register { session: reg.clone() }).await?;
-        remember(&mut self.regs.lock().unwrap(), reg);
+        // The daemon may have said to forget it while this waited for its answer: then it stays forgotten.
+        self.regs.lock().unwrap().remember(reg);
         Ok(r)
     }
 
     /// How a registered session was said to be reached.
     pub fn registered_tier(&self, key: &str) -> Option<Tier> {
-        self.regs.lock().unwrap().get(key).map(|r| r.tier)
+        self.regs.lock().unwrap().live.get(key).map(|r| r.tier)
     }
 
     async fn raw(&self, conn: &Conn, req: &Request) -> Result<Value> {
@@ -125,7 +129,7 @@ impl Link {
             return Ok(c.clone());
         }
         let c = self.spawn_io(connect_or_start(self.start).await?);
-        let regs: Vec<SessionReg> = self.regs.lock().unwrap().values().cloned().collect();
+        let regs: Vec<SessionReg> = self.regs.lock().unwrap().live.values().cloned().collect();
         for reg in regs {
             if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone() }).await {
                 // Its folder was turned off meanwhile, or its hooks said it keeps no transcript: it stays off, and the
@@ -134,7 +138,7 @@ impl Link {
                 if said != crate::config::OFF_HERE && said != NO_TRANSCRIPT {
                     return Err(e);
                 }
-                self.regs.lock().unwrap().remove(&reg.key);
+                self.regs.lock().unwrap().live.remove(&reg.key);
             }
         }
         *slot = Some(c.clone());
@@ -166,7 +170,7 @@ impl Link {
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(key) = forgotten(&line) {
                     if let Some(link) = link.upgrade() {
-                        link.regs.lock().unwrap().remove(&key);
+                        link.regs.lock().unwrap().forget(key);
                     }
                     continue;
                 }
@@ -316,6 +320,34 @@ fn forgotten(line: &str) -> Option<String> {
     Some(v.get("key")?.as_str()?.to_string())
 }
 
+/// The sessions this client made, to make again after a reconnect, and those the daemon said to forget.
+#[derive(Default)]
+struct Regs {
+    live: HashMap<String, SessionReg>,
+    /// Never remembered again, even when a registration's answer was already on its way as the daemon said so; nor
+    /// registered again, which a restarted daemon would otherwise take. Codex thread ids aren't reused.
+    forgotten: HashSet<String>,
+}
+
+/// How many forgotten sessions are kept before starting over (each is short-lived; this only bounds the memory).
+const FORGOTTEN_KEPT: usize = 4096;
+
+impl Regs {
+    fn remember(&mut self, reg: SessionReg) {
+        if !self.forgotten.contains(&reg.key) {
+            remember(&mut self.live, reg);
+        }
+    }
+
+    fn forget(&mut self, key: String) {
+        self.live.remove(&key);
+        if self.forgotten.len() >= FORGOTTEN_KEPT {
+            self.forgotten.clear();
+        }
+        self.forgotten.insert(key);
+    }
+}
+
 /// Remembers a registration, to make again after a reconnect. An agent with an MCP server per session is in one
 /// conversation at a time: a new one (Claude Code's `/clear`) replaces the one before, which must not come back.
 fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
@@ -372,6 +404,29 @@ mod tests {
         let id = serde_json::from_str::<Value>(&line).unwrap()["id"].as_u64().unwrap();
         conn.dispatch(&serde_json::to_string(&Reply::ok(id, serde_json::json!(7))).unwrap(), None);
         assert_eq!(call.await.unwrap().unwrap(), serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn a_registration_answered_before_the_daemon_said_forget_is_not_remembered() {
+        let reg = crate::proto::SessionReg {
+            key: "codex:ephemeral".into(),
+            agent: "codex".into(),
+            cwd: "/".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: crate::proto::Tier::Pull,
+            name: None,
+            claude_dir: None,
+        };
+        let link = Link::existing();
+        // The reader takes the registration's answer and the daemon's forget line together, before the registering
+        // call resumes to remember it.
+        link.regs.lock().unwrap().forget(reg.key.clone());
+        link.regs.lock().unwrap().remember(reg.clone());
+        assert!(link.regs.lock().unwrap().live.is_empty(), "a reconnect would register it again");
+        assert_eq!(link.registered_tier(&reg.key), None);
+        // Nor does it register again, which a restarted daemon, its own list empty, would take.
+        assert_eq!(link.register(reg).await.unwrap_err().to_string(), NO_TRANSCRIPT);
     }
 
     #[test]
