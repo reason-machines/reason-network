@@ -64,7 +64,8 @@ pub struct HookCall {
     #[serde(default)]
     pub through_reason: Option<bool>,
     pub agent: String,
-    /// `start`, `prompt`, `tool`, `stop`, `end`, or `doing` (only reports what the session is doing).
+    /// `start`, `prompt`, `tool`, `stop`, `end`, `doing` (only reports what the session is doing), or `no_transcript`
+    /// (a Codex thread that keeps no local transcript: never a session, by its hooks or its MCP server).
     pub event: String,
     pub session_id: String,
     #[serde(default)]
