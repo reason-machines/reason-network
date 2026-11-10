@@ -27,9 +27,6 @@ const HOOK_TTL_MS: i64 = HOOK_TTL.as_millis() as i64;
 pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
 const OFF_TURN_MS: i64 = 10 * 60_000;
-/// What a Codex thread that keeps no local transcript hears when its MCP server asks to be a session.
-const NO_TRANSCRIPT: &str =
-    "This Codex thread keeps no transcript on this computer, so it isn't a session on Reason Network";
 /// How many such threads are remembered before starting over (each is short-lived; this only bounds the memory).
 const NO_TRANSCRIPT_KEPT: usize = 4096;
 
@@ -486,6 +483,10 @@ impl Daemon {
             }
             g.no_transcript.insert(key.clone());
             if let Some(l) = g.live.remove(&key) {
+                // Its MCP server stops re-registering it on reconnect, so a daemon restart doesn't bring it back.
+                if let Some(tx) = l.conn.and_then(|c| g.conns.get(&c)) {
+                    let _ = tx.send(serde_json::json!({ "event": FORGET, "key": key }).to_string());
+                }
                 log(&format!("session {} ended: it keeps no transcript", self.addr(&l.name)));
                 self.presence_changed();
             }
@@ -1141,10 +1142,14 @@ mod tests {
             name: None,
             claude_dir: None,
         };
-        // Its MCP server got in first: its hooks then end it.
+        // Its MCP server got in first: its hooks then end it, and tell its MCP server to stop re-registering it.
+        let (tx, mut told) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
         d.register(Some(7), mcp("eph-1"), GitInfo::default()).unwrap();
         d.hook(call("eph-1", "no_transcript")).await.unwrap();
         assert!(!d.inner.lock().unwrap().live.contains_key("codex:eph-1"));
+        let line: serde_json::Value = serde_json::from_str(&told.try_recv().unwrap()).unwrap();
+        assert_eq!(line, serde_json::json!({ "event": FORGET, "key": "codex:eph-1" }));
         // Its hooks first: its MCP server's calls (list_team) never make it one.
         d.hook(call("eph-2", "no_transcript")).await.unwrap();
         let err = d.register(Some(8), mcp("eph-2"), GitInfo::default()).unwrap_err();

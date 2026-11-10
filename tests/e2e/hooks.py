@@ -565,6 +565,29 @@ out = run("who", "titles")
 check("…while a chat with a rollout there is on it, by the folder's own name",
       "alex/titles-codex." in intro and out.count("titles-codex") == 1 and "titles-codex-2" not in out, out + intro)
 eph("session-end")
+# One MCP server serves the Codex app's chats and its ephemeral threads. One that got on through it first is off at its
+# hooks' word, and stays off when the daemon restarts and the server re-registers what it serves; the chat stays on.
+eph2 = lambda event: hook("codex", event, {"session_id": "ephemeral-2", "cwd": titles, "transcript_path": None, "hook_event_name": event})
+app = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=titles, text=True)
+rpc(app, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
+reply(app, 1)
+rpc(app, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+for i, thread in ((2, "durable-1"), (3, "ephemeral-2")):
+    rpc(app, {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": {"sessionId": thread, "threadId": thread}}})
+    reply(app, i)
+before = run("who", "titles")
+eph2("session-start")
+gone = run("who", "titles")
+run("stop")
+time.sleep(4)
+rpc(app, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": {"sessionId": "durable-1", "threadId": "durable-1"}}})
+chat_listing = json.dumps(reply(app, 4))
+after = run("who", "titles")
+app.kill()
+app.wait(timeout=5)
+check("an ephemeral thread its MCP server put on first is off at its hooks' word, and stays off across a daemon restart",
+      "titles-codex-2" in before and "titles-codex-2" not in gone and "titles-codex-2" not in after
+      and re.search(r"^  titles-codex ", after, re.M) and '"isError": true' not in chat_listing, before + gone + after + chat_listing)
 
 # The daemon being down never breaks the agent.
 run("stop")

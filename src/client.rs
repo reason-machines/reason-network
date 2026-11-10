@@ -128,8 +128,10 @@ impl Link {
         let regs: Vec<SessionReg> = self.regs.lock().unwrap().values().cloned().collect();
         for reg in regs {
             if let Err(e) = self.raw(&c, &Request::Register { session: reg.clone() }).await {
-                // Its folder was turned off meanwhile: it stays off, and the rest reconnect.
-                if e.to_string() != crate::config::OFF_HERE {
+                // Its folder was turned off meanwhile, or its hooks said it keeps no transcript: it stays off, and the
+                // rest reconnect.
+                let said = e.to_string();
+                if said != crate::config::OFF_HERE && said != NO_TRANSCRIPT {
                     return Err(e);
                 }
                 self.regs.lock().unwrap().remove(&reg.key);
@@ -162,6 +164,12 @@ impl Link {
         tokio::spawn(async move {
             let mut lines = BufReader::new(rd).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(key) = forgotten(&line) {
+                    if let Some(link) = link.upgrade() {
+                        link.regs.lock().unwrap().remove(&key);
+                    }
+                    continue;
+                }
                 reader.dispatch(&line, events.as_ref());
             }
             alive.store(false, Ordering::Relaxed);
@@ -299,6 +307,15 @@ fn detach(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| cmd.creation_flags(flags).spawn())
 }
 
+/// The session a daemon's [`FORGET`] line names.
+fn forgotten(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(line).ok()?;
+    if v.get("event")?.as_str()? != FORGET {
+        return None;
+    }
+    Some(v.get("key")?.as_str()?.to_string())
+}
+
 /// Remembers a registration, to make again after a reconnect. An agent with an MCP server per session is in one
 /// conversation at a time: a new one (Claude Code's `/clear`) replaces the one before, which must not come back.
 fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
@@ -311,6 +328,15 @@ fn remember(regs: &mut HashMap<String, SessionReg>, reg: SessionReg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_names_the_session_to_forget_in_a_line_no_event_reader_takes() {
+        assert_eq!(forgotten(r#"{"event":"forget","key":"codex:t"}"#).as_deref(), Some("codex:t"));
+        assert_eq!(forgotten(r#"{"event":"deliver","key":"codex:t","ids":[],"text":""}"#), None);
+        assert_eq!(forgotten(r#"{"id":1,"ok":true}"#), None);
+        // An MCP server of an earlier release reads it as an event it doesn't know, and ignores it.
+        assert!(serde_json::from_str::<Event>(r#"{"event":"forget","key":"codex:t"}"#).is_err());
+    }
 
     #[tokio::test]
     async fn a_request_an_older_daemon_cant_read_fails_instead_of_waiting_for_good() {
