@@ -278,7 +278,8 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         home = os.path.join(d, "codex-c")
         t = offline("resumed", home=home)
         out = t.send("while you were away")
-        check("offline, seen recently: the sender hears Codex resumes it", "Codex resumes the same thread" in out, out)
+        check("offline, seen recently: the sender hears Codex is asked to resume it",
+              "Codex is asked to load that same thread again" in out, out)
         check("offline, seen recently: queued into the thread", queued_within("while you were away", 5), queued())
         check("offline, seen recently: …with --resume, by its own id",
               f"queue --thread thread-{t.name} --resume --message" in open(queue_log).read(), queued())
@@ -299,7 +300,8 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         os.makedirs(os.path.join(home, "archived_sessions"), exist_ok=True)
         open(os.path.join(home, "archived_sessions", f"rollout-2026-11-10T09-00-00-thread-{t.name}.jsonl"), "w").close()
         out = t.send("archived thread message")
-        check("offline, archived: the sender hears it waits for the person", "it was archived" in out, out)
+        check("offline, archived: the sender hears an archived one waits for the person",
+              "unless the person archived it" in out, out)
         check("offline, archived: queued into the thread", queued_within("archived thread message", 5), queued())
         check("offline, archived: …without --resume",
               f"queue --thread thread-{t.name} --message" in open(queue_log).read(), queued())

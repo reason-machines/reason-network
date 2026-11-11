@@ -549,6 +549,7 @@ impl Daemon {
         // A Codex thread that starts again gets another try at `codex queue` once it is offline again.
         if event == "start" {
             g.codex_failed.remove(&key);
+            g.codex_unresumed.remove(&key);
         }
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {

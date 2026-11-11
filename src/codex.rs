@@ -47,11 +47,19 @@ pub fn archived(thread: &str, home: Option<&Path>) -> bool {
         .unwrap_or_else(|| crate::paths::user_home().join(".codex"))
         .join("archived_sessions");
     let Ok(entries) = std::fs::read_dir(dir) else { return false };
-    // `rollout-<YYYY-MM-DDThh-mm-ss>-<thread>.jsonl[.zst]`: the whole id, not one that merely ends the same way.
+    // `rollout-<YYYY-MM-DDThh-mm-ss>-<thread>[_<rollout>].jsonl[.zst]` (`_<rollout>` names a replacement rollout, after
+    // `thread/revert`): the whole thread id, not one that merely ends the same way.
     let id = |name: &str| {
         let rest = name.strip_prefix("rollout-")?;
         let rest = rest.strip_suffix(".jsonl.zst").or_else(|| rest.strip_suffix(".jsonl"))?;
-        rest.get(20..).filter(|_| rest.as_bytes().get(19) == Some(&b'-')).map(str::to_string)
+        let ids = rest.get(20..).filter(|_| rest.as_bytes().get(19) == Some(&b'-'))?;
+        match ids.split_once('_') {
+            Some((thread, rollout)) if !thread.is_empty() && !rollout.is_empty() && !rollout.contains('_') => {
+                Some(thread.to_string())
+            }
+            Some(_) => None,
+            None => Some(ids.to_string()),
+        }
     };
     entries.flatten().any(|e| e.file_name().to_str().and_then(id).is_some_and(|t| t == thread))
 }
@@ -144,6 +152,18 @@ mod tests {
         assert!(archived(zst, Some(&home)));
         // Only that thread's own rollout: not one whose id merely ends the same way.
         assert!(!archived("8000-000000000001", Some(&home)));
+        // A replacement rollout (after `thread/revert`) is named `<thread>_<rollout>`: still that thread's, plain or
+        // compressed; and never the rollout's own id.
+        let (reverted, reverted_zst, rollout) = (
+            "019a0000-0000-7000-8000-000000000003",
+            "019a0000-0000-7000-8000-000000000004",
+            "019a0000-0000-7000-8000-0000000000ff",
+        );
+        append(&archived_dir.join(format!("rollout-2026-11-10T09-00-00-{reverted}_{rollout}.jsonl")), "{}\n");
+        append(&archived_dir.join(format!("rollout-2026-11-10T09-00-00-{reverted_zst}_{rollout}.jsonl.zst")), "x");
+        assert!(archived(reverted, Some(&home)));
+        assert!(archived(reverted_zst, Some(&home)));
+        assert!(!archived(rollout, Some(&home)));
         // No Codex home there at all: nothing says it was archived.
         assert!(!archived(put_away, Some(&home.join("missing"))));
         std::fs::remove_dir_all(&home).unwrap();

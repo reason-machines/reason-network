@@ -176,6 +176,9 @@ struct Inner {
     /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
     /// their next SessionStart or a `codex queue` that works.
     codex_failed: HashSet<String>,
+    /// Codex threads whose last `codex queue --resume` queued their mail but could not load them again: senders are
+    /// told so, until a later one loads them or their next SessionStart.
+    codex_unresumed: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -282,6 +285,7 @@ impl Daemon {
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
                 codex_failed: HashSet::new(),
+                codex_unresumed: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
