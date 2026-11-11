@@ -103,7 +103,9 @@ class Mcp:
 
 
 with open(FAKE_CODEX, "w") as f:
-    f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {QUEUE_LOG}\necho "Queued message"\n')
+    # A current Codex: its `codex queue --help` names `--resume` (the daemon asks it, not logged here).
+    f.write(f'#!/bin/sh\n[ "$*" = "queue --help" ] && {{ echo "  --resume"; exit 0; }}\n'
+            f'printf "%s\\n" "$*" >> {QUEUE_LOG}\necho "Queued message"\n')
 os.chmod(FAKE_CODEX, 0o755)
 with open(FAKE_NOTIFY, "w") as f:
     f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$NOTIFY_LOG"\n')
@@ -584,7 +586,7 @@ out = cli("alex", "send", f"alice/{codex_name}", "please rebase on main")
 check("message to a hooked codex session goes to codex queue", "queued into the Codex session" in out, out)
 time.sleep(1.5)
 log = open(QUEUE_LOG).read() if os.path.exists(QUEUE_LOG) else ""
-check("codex queue got the thread and the message", "queue --thread 22222222-bbbb --message" in log and "please rebase on main" in log, log)
+check("codex queue got the thread and the message", "queue --thread 22222222-bbbb --resume --message" in log and "please rebase on main" in log, log)
 out = hook("alice", "codex", "post-tool-use", {"session_id": "22222222-bbbb", "cwd": SESSION_REPO, "hook_event_name": "PostToolUse"})
 check("a message delivered by codex queue isn't injected again by the hook", out == "", out)
 

@@ -646,6 +646,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn unset(&self, key: &str) -> Result<()> {
+        self.db.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn prefixed(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let mut st = self.db.prepare_cached("SELECT key, value FROM kv WHERE key >= ?1 AND key < ?1 || x'ff'")?;
         let rows = st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;

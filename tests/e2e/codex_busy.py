@@ -13,6 +13,7 @@ Codex does (`task_started`, then `task_complete` or `turn_aborted`); the fake CL
 import json
 import os
 import queue
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -41,7 +42,9 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
     off_dir = os.path.join(d, "personal")
     fake = os.path.join(d, "codex")
     with open(fake, "w") as f:
-        f.write('#!/bin/sh\nprintf "%s\\n" "$3" >> "$CODEX_ATTEMPT_LOG"\n'
+        # A current Codex: its `codex queue --help` names `--resume` (the daemon asks it, not logged here).
+        f.write('#!/bin/sh\n[ "$*" = "queue --help" ] && { echo "  --resume"; exit 0; }\n'
+                'printf "%s\\n" "$3" >> "$CODEX_ATTEMPT_LOG"\n'
                 'case "$*" in *"refuse this"*) echo "no app-server" >&2; exit 1;; esac\n'
                 'printf "%s\\n" "$*" >> "$CODEX_QUEUE_LOG"\n'
                 'printf "%s %s\\n" "${CODEX_HOME:-default}" "$3" >> "$CODEX_HOME_LOG"\n')
@@ -51,6 +54,19 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_MACHINE="box",
                REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue_log, CODEX_HOME_LOG=home_log,
                CODEX_ATTEMPT_LOG=attempt_log)
+
+    # Codex homes with an app-server daemon answering on their control socket, which `codex queue --resume` loads a
+    # thread through: offline wake mail goes to Codex only then. Short paths: a socket's path must fit ~100 bytes.
+    short = tempfile.mkdtemp(prefix="rnc-", dir="/tmp")
+    app_servers = []
+
+    def app_server(home):
+        os.makedirs(os.path.join(home, "app-server-control"), exist_ok=True)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(os.path.join(home, "app-server-control", "app-server-control.sock"))
+        s.listen(64)
+        app_servers.append(s)
+        return s
 
     def run(*args, payload=None, cwd=d, home=None):
         e = dict(env, CODEX_HOME=home) if home else env
@@ -273,12 +289,24 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
 
     def resumed():
         # #197: mail for a thread seen within the day starts its turn when it is resumed; its hooks don't show it too.
-        home = os.path.join(d, "codex-c")
+        # Codex unloads an idle thread (SessionEnd) though the app is still running: the mail asks Codex to resume
+        # that same thread (`codex queue --resume`), never a new chat.
+        home = os.path.join(short, "c")
         t = offline("resumed", home=home)
+        # Review of #218: with no app-server to load it, the mail is kept here, not handed to Codex to sit in.
         out = t.send("while you were away")
-        check("offline, seen recently: the sender hears it starts a turn on resume", "starts a turn when the thread is "
-              "resumed" in out, out)
-        check("offline, seen recently: queued into the thread", queued_within("while you were away", 5), queued())
+        check("offline, no app-server: the mail is kept here, unread",
+              not queued_within("while you were away", 2) and not read("while you were away", secs=1), queued())
+        check("offline, no app-server: the next sender hears it is kept and tried again",
+              "kept here and tried again" in t.send("still away"), queued())
+        app_server(home)
+        check("offline, seen recently: the sender hears Codex is asked to resume it",
+              "Codex is asked to load that same thread again" in out, out)
+        # Tried again 30 s after the first was kept.
+        check("offline, seen recently: queued into the thread once an app-server answers",
+              queued_within("while you were away", 45) and queued("still away") == 1, queued())
+        check("offline, seen recently: …with --resume, by its own id",
+              f"queue --thread thread-{t.name} --resume --message" in open(queue_log).read(), queued())
         check("offline, seen recently: …against its CODEX_HOME", f"{os.path.realpath(home)} thread-{t.name}" in homes(),
               homes())
         check("offline, seen recently: counts as delivered", read("while you were away"))
@@ -289,9 +317,24 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         out = t.send("now that you're back")
         check("offline, seen recently: back online at its first turn", "queued into the Codex session" in out, out)
 
+    def archived():
+        # A thread the person archived in Codex (its rollout moved to archived_sessions/): never brought back.
+        home = os.path.join(d, "codex-d")
+        t = offline("archived", home=home)
+        os.makedirs(os.path.join(home, "archived_sessions"), exist_ok=True)
+        open(os.path.join(home, "archived_sessions", f"rollout-2026-11-10T09-00-00-thread-{t.name}.jsonl"), "w").close()
+        out = t.send("archived thread message")
+        check("offline, archived: the sender hears an archived one waits for the person",
+              "unless the person archived it" in out, out)
+        check("offline, archived: queued into the thread", queued_within("archived thread message", 5), queued())
+        check("offline, archived: …without --resume",
+              f"queue --thread thread-{t.name} --message" in open(queue_log).read(), queued())
+
     def refused():
         # `codex queue` fails: the mail stays unread and the first hook of the resumed thread shows it, once.
-        t = offline("refused")
+        home = os.path.join(short, "r")
+        app_server(home)
+        t = offline("refused", home=home)
         t.send("refuse this message")
         time.sleep(2)
         check("offline, codex queue fails: the mail stays unread", not read("refuse this message", secs=1))
@@ -444,7 +487,7 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
             cx.wait()
 
         scenarios = [busy, idle, ending, interrupted, interrupted_pending, unconfirmed, failed, continued, no_rollout,
-                     other_home, resumed, refused, off_folder, stale, long_call, long_gap, long_turn]
+                     other_home, resumed, archived, refused, off_folder, stale, long_call, long_gap, long_turn]
         print(f"Running {len(scenarios)} scenarios at once; the long ones wait {LONG} seconds", flush=True)
         threads = [threading.Thread(target=s) for s in scenarios]
         for th in threads:
@@ -463,6 +506,9 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         check("restart: …and is not queued", queued("across a restart") == 0, queued())
     finally:
         run("stop")
+        for s in app_servers:
+            s.close()
+        shutil.rmtree(short, ignore_errors=True)
 
     failed_count = results.count(False)
     print(f"\n{len(results) - failed_count}/{len(results)} passed")
