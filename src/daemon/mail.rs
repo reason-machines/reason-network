@@ -2197,7 +2197,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_thread_codex_took_mail_for_is_loaded_again_after_a_restart_and_past_the_cutoff() {
-        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let mut d = super::super::test_daemon(crate::config::Config::default());
+        // Past the startup grace: day-old sessions are forgotten on each prune.
+        d.startup_grace_ends = std::time::Instant::now();
+        let d = Arc::new(d);
         let log = fake_codex_ending(
             &d,
             "case \"$*\" in *--resume*) echo 'Warning: message was queued, but could not resume thread t1: no \
@@ -2229,6 +2232,12 @@ mod tests {
         assert!(pending() && stored());
         // Past the cutoff for new wakes: the accepted handoff is still finished.
         d.inner.lock().unwrap().store.touch_session(&name, util::now_ms() - CODEX_RESUME_MS - HOUR).unwrap();
+        // Review of #218: pruning day-old sessions keeps the row of a thread still to be loaded again.
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.prune(&mut g);
+            assert!(g.store.session_by_key("codex:t1").unwrap().is_some(), "pruned a thread still to be loaded");
+        }
         let asked = resumes();
         assert!(asked_more(asked).await, "no resume once past the cutoff");
         assert!(pending());

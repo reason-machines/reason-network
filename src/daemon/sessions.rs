@@ -141,7 +141,7 @@ impl Daemon {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
             }
-            let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
+            let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(g, r, now))?;
             // Its title named it before this daemon started (an update restarts it), or before it went offline: the
             // default name it went by is still its own (see `Live::former`), unless another session has taken it since.
             // By its key: also when it comes back under another name (its own was taken on another of my machines).
@@ -232,7 +232,7 @@ impl Daemon {
                 if others.terminals || !others.live.contains(&l.name) {
                     return Ok(());
                 }
-                pick_name(&g, &l.reg, &l.git, others, &self.person, |r| self.holds(r, now))?
+                pick_name(&g, &l.reg, &l.git, others, &self.person, |r| self.holds(&g, r, now))?
             };
             log(&format!(
                 "{} is on another machine too, and an older engine is in the team: now {name}",
@@ -246,9 +246,14 @@ impl Daemon {
     }
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
-    /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
-    pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
-        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting())
+    /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten, nor a
+    /// Codex thread that took mail and is still to be loaded again (`codex_unresumed`).
+    pub(super) fn holds(&self, g: &Inner, r: &Remembered, now: i64) -> bool {
+        r.kept()
+            && (r.mailbox
+                || now - r.last_seen <= FORGET_MS
+                || !self.forgetting()
+                || g.codex_unresumed.contains_key(&r.key))
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
@@ -367,7 +372,7 @@ impl Daemon {
             if others.kept.contains(n) {
                 bail!("'{n}' belongs to a session on another of your machines that is offline; pick another name");
             }
-            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
+            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(g, r, now)) {
                 if rename == Rename::Automatic || r.mailbox || key.starts_with("proc:") || key.starts_with("cli:") {
                     bail!(
                         "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
@@ -745,7 +750,14 @@ impl Daemon {
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
         if self.forgetting() {
             g.seen_since_start.clear();
-            let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
+            // A Codex thread that took mail but is still to be loaded again keeps its row: the retry needs it.
+            let unresumed: Vec<String> = g
+                .codex_unresumed
+                .keys()
+                .filter_map(|k| g.store.session_by_key(k).ok().flatten().map(|r| r.name))
+                .collect();
+            let live: HashSet<&str> =
+                g.live.values().map(|l| l.name.as_str()).chain(unresumed.iter().map(String::as_str)).collect();
             let _ = g.store.forget_sessions(now - FORGET_MS, &live, &self.person);
         }
         // Files of messages that are gone, or were read a day ago.
