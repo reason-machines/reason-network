@@ -189,6 +189,9 @@ struct Inner {
     /// mail, so it isn't queued again; the daemon asks Codex to load the thread (only that) with backoff until it does,
     /// the thread starts again or is archived, and senders are told so meanwhile.
     codex_unresumed: HashMap<String, mail::CodexRetry>,
+    /// Offline Codex threads whose wake mail is being handed to `codex queue --resume` right now (how many handoffs):
+    /// like `codex_unresumed`, their session and name are kept meanwhile, so the outcome still has a thread to load.
+    codex_handing: HashMap<String, usize>,
     /// Offline Codex threads whose wake mail is kept here, unread, because Codex could not have loaded them (no
     /// app-server answered on their home's control socket, or whether the person archived them was not known in
     /// time): tried again with backoff until it goes through, they start again, or the mail is read.
@@ -300,6 +303,7 @@ impl Daemon {
                 codex_watch: HashSet::new(),
                 codex_failed: HashSet::new(),
                 codex_unresumed: HashMap::new(),
+                codex_handing: HashMap::new(),
                 codex_retry: HashMap::new(),
             }),
             arrived: Notify::new(),

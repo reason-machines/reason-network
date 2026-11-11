@@ -247,13 +247,10 @@ impl Daemon {
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
     /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten, nor a
-    /// Codex thread that took mail and is still to be loaded again (`codex_unresumed`).
+    /// Codex thread that took mail, or is being handed it, and is still to be loaded again ([`Inner::resume_owed`]):
+    /// that one keeps its name even if it was never reached before, so no other session takes over its row.
     pub(super) fn holds(&self, g: &Inner, r: &Remembered, now: i64) -> bool {
-        r.kept()
-            && (r.mailbox
-                || now - r.last_seen <= FORGET_MS
-                || !self.forgetting()
-                || g.codex_unresumed.contains_key(&r.key))
+        g.resume_owed(&r.key) || (r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting()))
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
@@ -750,10 +747,12 @@ impl Daemon {
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
         if self.forgetting() {
             g.seen_since_start.clear();
-            // A Codex thread that took mail but is still to be loaded again keeps its row: the retry needs it.
+            // A Codex thread that took mail, or is being handed it, and is still to be loaded again keeps its row (and the
+            // mail still unread for it): the handoff's outcome and the retry need it.
             let unresumed: Vec<String> = g
                 .codex_unresumed
                 .keys()
+                .chain(g.codex_handing.keys())
                 .filter_map(|k| g.store.session_by_key(k).ok().flatten().map(|r| r.name))
                 .collect();
             let live: HashSet<&str> =

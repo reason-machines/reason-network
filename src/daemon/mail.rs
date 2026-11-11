@@ -108,6 +108,22 @@ impl Inner {
         true
     }
 
+    /// Whether Codex may hold, or is being handed, offline thread `key`'s mail that it still has to load the thread
+    /// for: its session and name are kept until that is settled, however long it has been gone.
+    pub(super) fn resume_owed(&self, key: &str) -> bool {
+        self.codex_unresumed.contains_key(key) || self.codex_handing.contains_key(key)
+    }
+
+    /// One handoff of offline thread `key`'s wake mail to `codex queue --resume` ended (see `codex_handing`).
+    pub(super) fn handed_off(&mut self, key: &str) {
+        if let Some(n) = self.codex_handing.get_mut(key) {
+            *n -= 1;
+            if *n == 0 {
+                self.codex_handing.remove(key);
+            }
+        }
+    }
+
     /// Thread `key` no longer needs loading again (see [`Self::unresumed`]).
     pub(super) fn resumed(&mut self, key: &str) {
         self.codex_unresumed.remove(key);
@@ -737,6 +753,7 @@ impl Daemon {
         }
         let text = render::for_agent(&msgs, Some(&r.agent), false);
         let (retrying, unresumed) = (g.codex_retry.contains_key(&r.key), g.codex_unresumed.contains_key(&r.key));
+        *g.codex_handing.entry(r.key.clone()).or_default() += 1;
         self.send_with("codex", codex_queue(&thread, true), codex_home, r.key.clone(), ids, text, true);
         let seen = util::ago(r.last_seen, now);
         let then = if retrying {
@@ -921,6 +938,9 @@ impl Daemon {
                 };
                 if let Some(why) = keep {
                     this.keep_for_codex(&key, &ids, why);
+                    if offline {
+                        this.inner.lock().unwrap().handed_off(&key);
+                    }
                     return;
                 }
             }
@@ -936,6 +956,10 @@ impl Daemon {
                 _ => None,
             };
             this.handed(bin, &key, &ids, res.map(drop), unresumed);
+            // Only now: had the thread reached Codex, `handed` has recorded that it still has to be loaded.
+            if offline {
+                this.inner.lock().unwrap().handed_off(&key);
+            }
         });
     }
 
@@ -2264,6 +2288,69 @@ mod tests {
         d.retry_kept_codex_mail();
         assert!(!pending());
         assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// Review of #218 (P2s at b18380f): a thread whose wake mail is being handed to `codex queue --resume` keeps its
+    /// session and name while the command runs, even once it is a day old and was never reached before: a prune that
+    /// lands meanwhile, or another session wanting the name, would otherwise leave Codex's mail with no thread to load.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_thread_being_handed_mail_keeps_its_session_and_name_until_codex_answers() {
+        let mut d = super::super::test_daemon(crate::config::Config::default());
+        d.startup_grace_ends = std::time::Instant::now();
+        let d = Arc::new(d);
+        let gate = std::env::temp_dir().join(format!("reason-network-gate-{}", Ulid::generate()));
+        let log = fake_codex_ending(
+            &d,
+            &format!(
+                "case \"$*\" in *--resume*) while [ ! -f '{}' ]; do sleep 0.02; done; echo 'Warning: message was \
+                 queued, but could not resume thread t1: no app-server daemon' >&2;; esac; exit 0",
+                gate.display()
+            ),
+        );
+        d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", CODEX_RESUME_MS - 10_000);
+        let res = d.send("gemini:1".into(), &name, "held by codex", None, true, false, None, Vec::new());
+        res.await.unwrap();
+        // The command runs; meanwhile the thread passes a day gone, was never reached, and the sessions are pruned.
+        for _ in 0..400 {
+            if std::fs::read_dir(&log).unwrap().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let mut g = d.inner.lock().unwrap();
+            assert!(g.resume_owed("codex:t1"));
+            g.store.touch_session(&name, util::now_ms() - CODEX_RESUME_MS - HOUR).unwrap();
+            let mut r = g.store.session_by_key("codex:t1").unwrap().unwrap();
+            r.attached = false;
+            g.store.upsert_session(&r, &d.person).unwrap();
+            d.prune(&mut g);
+            let r = g.store.session_by_key("codex:t1").unwrap();
+            assert!(r.is_some(), "pruned a thread whose mail is being handed to Codex");
+            assert!(d.holds(&g, &r.unwrap(), util::now_ms()), "another session could take its name");
+        }
+        std::fs::write(&gate, "").unwrap();
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
+        let asked = d.fake_codex_resume.lock().unwrap().0;
+        for _ in 0..400 {
+            if d.fake_codex_resume.lock().unwrap().0 > asked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(d.fake_codex_resume.lock().unwrap().0 > asked, "no resume after the handoff");
+        {
+            let mut g = d.inner.lock().unwrap();
+            assert!(g.codex_unresumed.contains_key("codex:t1") && g.codex_handing.is_empty());
+            d.prune(&mut g);
+            let r = g.store.session_by_key("codex:t1").unwrap().expect("pruned a thread still to be loaded");
+            assert!(d.holds(&g, &r, util::now_ms()));
+        }
+        let _ = std::fs::remove_file(&gate);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
