@@ -81,6 +81,7 @@ pub async fn run(service: bool) -> Result<()> {
     }
     tokio::spawn(crate::migrate::run(log));
     tokio::spawn(daemon.clone().relays_loop());
+    daemon.retry_kept_codex_mail();
     if update::allowed(daemon.cfg.auto_update) {
         tokio::spawn(daemon.clone().update_loop());
     }
@@ -145,12 +146,17 @@ pub struct Daemon {
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
+    /// Whether the `codex` at this path, as last modified then, has `codex queue --resume`.
+    codex_resume_flag: Mutex<Option<(std::path::PathBuf, Option<std::time::SystemTime>, bool)>>,
     /// Agent CLIs a test runs in place of the ones on this machine.
     #[cfg(test)]
     fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
     /// Whether a test's Codex app-server answers (`None`: look on this machine, as outside tests).
     #[cfg(test)]
     fake_codex_app_server: Mutex<Option<bool>>,
+    /// A test's Codex `thread/resume`: how many times it was asked, and whether it loads the thread.
+    #[cfg(test)]
+    fake_codex_resume: Mutex<(usize, bool)>,
 }
 
 struct Inner {
@@ -179,9 +185,10 @@ struct Inner {
     /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
     /// their next SessionStart or a `codex queue` that works.
     codex_failed: HashSet<String>,
-    /// Codex threads whose last `codex queue --resume` queued their mail but could not load them again: senders are
-    /// told so, until a later one loads them or their next SessionStart.
-    codex_unresumed: HashSet<String>,
+    /// Codex threads whose last `codex queue --resume` queued their mail but could not load them again: Codex holds the
+    /// mail, so it isn't queued again; the daemon asks Codex to load the thread (only that) with backoff until it does,
+    /// the thread starts again or is archived, and senders are told so meanwhile.
+    codex_unresumed: HashMap<String, mail::CodexRetry>,
     /// Offline Codex threads whose wake mail is kept here, unread, because Codex could not have loaded them (no
     /// app-server answered on their home's control socket, or whether the person archived them was not known in
     /// time): tried again with backoff until it goes through, they start again, or the mail is read.
@@ -292,7 +299,7 @@ impl Daemon {
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
                 codex_failed: HashSet::new(),
-                codex_unresumed: HashSet::new(),
+                codex_unresumed: HashMap::new(),
                 codex_retry: HashMap::new(),
             }),
             arrived: Notify::new(),
@@ -304,11 +311,14 @@ impl Daemon {
             asks: Mutex::new(HashMap::new()),
             startup_grace_ends: Instant::now() + sessions::HOOK_TTL,
             plain_until: Mutex::new(None),
+            codex_resume_flag: Mutex::new(None),
             capped: Default::default(),
             #[cfg(test)]
             fake_bins: Default::default(),
             #[cfg(test)]
             fake_codex_app_server: Mutex::new(Some(true)),
+            #[cfg(test)]
+            fake_codex_resume: Mutex::new((0, false)),
         })
     }
 

@@ -42,7 +42,9 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
     off_dir = os.path.join(d, "personal")
     fake = os.path.join(d, "codex")
     with open(fake, "w") as f:
-        f.write('#!/bin/sh\nprintf "%s\\n" "$3" >> "$CODEX_ATTEMPT_LOG"\n'
+        # A current Codex: its `codex queue --help` names `--resume` (the daemon asks it, not logged here).
+        f.write('#!/bin/sh\n[ "$*" = "queue --help" ] && { echo "  --resume"; exit 0; }\n'
+                'printf "%s\\n" "$3" >> "$CODEX_ATTEMPT_LOG"\n'
                 'case "$*" in *"refuse this"*) echo "no app-server" >&2; exit 1;; esac\n'
                 'printf "%s\\n" "$*" >> "$CODEX_QUEUE_LOG"\n'
                 'printf "%s %s\\n" "${CODEX_HOME:-default}" "$3" >> "$CODEX_HOME_LOG"\n')

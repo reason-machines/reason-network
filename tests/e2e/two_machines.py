@@ -103,7 +103,9 @@ class Mcp:
 
 
 with open(FAKE_CODEX, "w") as f:
-    f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {QUEUE_LOG}\necho "Queued message"\n')
+    # A current Codex: its `codex queue --help` names `--resume` (the daemon asks it, not logged here).
+    f.write(f'#!/bin/sh\n[ "$*" = "queue --help" ] && {{ echo "  --resume"; exit 0; }}\n'
+            f'printf "%s\\n" "$*" >> {QUEUE_LOG}\necho "Queued message"\n')
 os.chmod(FAKE_CODEX, 0o755)
 with open(FAKE_NOTIFY, "w") as f:
     f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$NOTIFY_LOG"\n')
