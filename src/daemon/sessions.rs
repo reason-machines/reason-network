@@ -550,6 +550,7 @@ impl Daemon {
         if event == "start" {
             g.codex_failed.remove(&key);
             g.codex_unresumed.remove(&key);
+            g.codex_retry.remove(&key);
         }
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {

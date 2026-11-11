@@ -37,15 +37,36 @@ pub fn turn_running(path: &Path) -> Option<bool> {
     Some(running)
 }
 
+/// The Codex home: `home` (the `CODEX_HOME` a thread's hooks ran with), else the daemon's own, else `~/.codex`.
+fn codex_home(home: Option<&Path>) -> PathBuf {
+    home.map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| crate::paths::user_home().join(".codex"))
+}
+
+/// Whether a Codex app-server daemon answers on the control socket of the Codex home (`home` as in [`archived`]),
+/// `app-server-control/app-server-control.sock`: the shared server `codex queue --resume` loads a thread through. With
+/// none, `codex queue` queues through a server of its own, which can't load the thread (it warns "could not resume
+/// thread" and exits 0), so the mail would wait in Codex until the person opens the thread.
+pub async fn app_server_up(home: Option<&Path>) -> bool {
+    let socket = codex_home(home).join("app-server-control").join("app-server-control.sock");
+    #[cfg(unix)]
+    {
+        let connect = tokio::net::UnixStream::connect(socket);
+        matches!(tokio::time::timeout(std::time::Duration::from_secs(1), connect).await, Ok(Ok(_)))
+    }
+    // Codex's socket there is an AF_UNIX one too, which tokio can't open on Windows: one that exists counts.
+    #[cfg(not(unix))]
+    {
+        tokio::fs::metadata(socket).await.is_ok()
+    }
+}
+
 /// Whether the person archived Codex thread `thread`: archiving moves its rollout into `archived_sessions/` of the
 /// Codex home (`home`, the `CODEX_HOME` its hooks ran with; else the daemon's own, else `~/.codex`), plain or
 /// compressed. A thread Codex only unloaded (idle, or its app-server shut down) keeps its rollout in `sessions/`.
 pub fn archived(thread: &str, home: Option<&Path>) -> bool {
-    let dir = home
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
-        .unwrap_or_else(|| crate::paths::user_home().join(".codex"))
-        .join("archived_sessions");
+    let dir = codex_home(home).join("archived_sessions");
     let Ok(entries) = std::fs::read_dir(dir) else { return false };
     // `rollout-<YYYY-MM-DDThh-mm-ss>-<thread>[_<rollout>].jsonl[.zst]` (`_<rollout>` names a replacement rollout, after
     // `thread/revert`): the whole thread id, not one that merely ends the same way.

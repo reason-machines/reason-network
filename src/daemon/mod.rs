@@ -148,6 +148,9 @@ pub struct Daemon {
     /// Agent CLIs a test runs in place of the ones on this machine.
     #[cfg(test)]
     fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
+    /// Whether a test's Codex app-server answers (`None`: look on this machine, as outside tests).
+    #[cfg(test)]
+    fake_codex_app_server: Mutex<Option<bool>>,
 }
 
 struct Inner {
@@ -179,6 +182,10 @@ struct Inner {
     /// Codex threads whose last `codex queue --resume` queued their mail but could not load them again: senders are
     /// told so, until a later one loads them or their next SessionStart.
     codex_unresumed: HashSet<String>,
+    /// Offline Codex threads whose wake mail is kept here, unread, because Codex could not have loaded them (no
+    /// app-server answered on their home's control socket, or whether the person archived them was not known in
+    /// time): tried again with backoff until it goes through, they start again, or the mail is read.
+    codex_retry: HashMap<String, mail::CodexRetry>,
 }
 
 /// A session running on this machine.
@@ -286,6 +293,7 @@ impl Daemon {
                 codex_watch: HashSet::new(),
                 codex_failed: HashSet::new(),
                 codex_unresumed: HashSet::new(),
+                codex_retry: HashMap::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -299,6 +307,8 @@ impl Daemon {
             capped: Default::default(),
             #[cfg(test)]
             fake_bins: Default::default(),
+            #[cfg(test)]
+            fake_codex_app_server: Mutex::new(Some(true)),
         })
     }
 
