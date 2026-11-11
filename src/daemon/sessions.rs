@@ -505,7 +505,10 @@ impl Daemon {
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
-                log(&format!("session {} ended", self.addr(&l.name)));
+                // Codex runs SessionEnd when its app-server unloads an idle thread too: the conversation is there to
+                // come back to, and its wake mail resumes it (`deliver_offline`).
+                let how = if agent == "codex" { "went offline; mail resumes it" } else { "ended" };
+                log(&format!("session {} {how}", self.addr(&l.name)));
                 self.presence_changed();
             }
             return Ok(HookReply::default());

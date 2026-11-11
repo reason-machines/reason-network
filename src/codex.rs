@@ -37,6 +37,25 @@ pub fn turn_running(path: &Path) -> Option<bool> {
     Some(running)
 }
 
+/// Whether the person archived Codex thread `thread`: archiving moves its rollout into `archived_sessions/` of the
+/// Codex home (`home`, the `CODEX_HOME` its hooks ran with; else the daemon's own, else `~/.codex`), plain or
+/// compressed. A thread Codex only unloaded (idle, or its app-server shut down) keeps its rollout in `sessions/`.
+pub fn archived(thread: &str, home: Option<&Path>) -> bool {
+    let dir = home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| crate::paths::user_home().join(".codex"))
+        .join("archived_sessions");
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    // `rollout-<YYYY-MM-DDThh-mm-ss>-<thread>.jsonl[.zst]`: the whole id, not one that merely ends the same way.
+    let id = |name: &str| {
+        let rest = name.strip_prefix("rollout-")?;
+        let rest = rest.strip_suffix(".jsonl.zst").or_else(|| rest.strip_suffix(".jsonl"))?;
+        rest.get(20..).filter(|_| rest.as_bytes().get(19) == Some(&b'-')).map(str::to_string)
+    };
+    entries.flatten().any(|e| e.file_name().to_str().and_then(id).is_some_and(|t| t == thread))
+}
+
 /// The last turn event in `from..to` (whole lines from `from`, which starts one), and where the last whole line in it
 /// ends: a line still being written is read next time.
 fn last_turn_event(file: &mut File, from: u64, to: u64) -> std::io::Result<(u64, Option<bool>)> {
@@ -105,6 +124,29 @@ mod tests {
 
     fn append(path: &Path, s: &str) {
         std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(s.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn only_a_thread_whose_rollout_codex_moved_to_archived_sessions_is_archived() {
+        let home = std::env::temp_dir().join(format!("reason-network-codex-archived-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (live, archived_dir) = (home.join("sessions/2026/11/11"), home.join("archived_sessions"));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let kept = "01a1384b-f90e-75a0-a6f7-a23c9a50e216";
+        let (put_away, zst) = ("019a0000-0000-7000-8000-000000000001", "019a0000-0000-7000-8000-000000000002");
+        append(&live.join(format!("rollout-2026-11-11T02-32-20-{kept}.jsonl")), "{}\n");
+        append(&archived_dir.join(format!("rollout-2026-11-10T09-00-00-{put_away}.jsonl")), "{}\n");
+        append(&archived_dir.join(format!("rollout-2026-11-10T09-00-00-{zst}.jsonl.zst")), "x");
+        // Unloaded, not archived: its rollout is where Codex keeps live threads.
+        assert!(!archived(kept, Some(&home)));
+        assert!(archived(put_away, Some(&home)));
+        assert!(archived(zst, Some(&home)));
+        // Only that thread's own rollout: not one whose id merely ends the same way.
+        assert!(!archived("8000-000000000001", Some(&home)));
+        // No Codex home there at all: nothing says it was archived.
+        assert!(!archived(put_away, Some(&home.join("missing"))));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

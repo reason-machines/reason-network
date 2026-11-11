@@ -273,12 +273,15 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
 
     def resumed():
         # #197: mail for a thread seen within the day starts its turn when it is resumed; its hooks don't show it too.
+        # Codex unloads an idle thread (SessionEnd) though the app is still running: the mail asks Codex to resume
+        # that same thread (`codex queue --resume`), never a new chat.
         home = os.path.join(d, "codex-c")
         t = offline("resumed", home=home)
         out = t.send("while you were away")
-        check("offline, seen recently: the sender hears it starts a turn on resume", "starts a turn when the thread is "
-              "resumed" in out, out)
+        check("offline, seen recently: the sender hears Codex resumes it", "Codex resumes the same thread" in out, out)
         check("offline, seen recently: queued into the thread", queued_within("while you were away", 5), queued())
+        check("offline, seen recently: …with --resume, by its own id",
+              f"queue --thread thread-{t.name} --resume --message" in open(queue_log).read(), queued())
         check("offline, seen recently: …against its CODEX_HOME", f"{os.path.realpath(home)} thread-{t.name}" in homes(),
               homes())
         check("offline, seen recently: counts as delivered", read("while you were away"))
@@ -288,6 +291,18 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         check("offline, seen recently: queued once", queued("while you were away") == 1, queued())
         out = t.send("now that you're back")
         check("offline, seen recently: back online at its first turn", "queued into the Codex session" in out, out)
+
+    def archived():
+        # A thread the person archived in Codex (its rollout moved to archived_sessions/): never brought back.
+        home = os.path.join(d, "codex-d")
+        t = offline("archived", home=home)
+        os.makedirs(os.path.join(home, "archived_sessions"), exist_ok=True)
+        open(os.path.join(home, "archived_sessions", f"rollout-2026-11-10T09-00-00-thread-{t.name}.jsonl"), "w").close()
+        out = t.send("archived thread message")
+        check("offline, archived: the sender hears it waits for the person", "it was archived" in out, out)
+        check("offline, archived: queued into the thread", queued_within("archived thread message", 5), queued())
+        check("offline, archived: …without --resume",
+              f"queue --thread thread-{t.name} --message" in open(queue_log).read(), queued())
 
     def refused():
         # `codex queue` fails: the mail stays unread and the first hook of the resumed thread shows it, once.
@@ -444,7 +459,7 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
             cx.wait()
 
         scenarios = [busy, idle, ending, interrupted, interrupted_pending, unconfirmed, failed, continued, no_rollout,
-                     other_home, resumed, refused, off_folder, stale, long_call, long_gap, long_turn]
+                     other_home, resumed, archived, refused, off_folder, stale, long_call, long_gap, long_turn]
         print(f"Running {len(scenarios)} scenarios at once; the long ones wait {LONG} seconds", flush=True)
         threads = [threading.Thread(target=s) for s in scenarios]
         for th in threads:
