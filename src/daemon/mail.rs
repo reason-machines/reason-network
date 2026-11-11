@@ -2269,7 +2269,9 @@ mod tests {
         }
         let queued = codex_queued(&d, &log, "t1").await;
         assert_eq!(queued.len(), 2, "{queued:?}");
-        assert!(queued[1].contains("kept again") && !queued[1].contains("after it"), "{queued:?}");
+        // The fake logs one file per call, named by its pid: read_dir order says nothing about which came first.
+        let again: Vec<&String> = queued.iter().filter(|q| q.contains("kept again")).collect();
+        assert!(again.len() == 1 && !again[0].contains("after it"), "{queued:?}");
         assert!(!kept());
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
