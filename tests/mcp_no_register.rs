@@ -287,3 +287,50 @@ fn no_register_keeps_a_hook_known_session_in_an_off_folder_off() {
     let got = run(&home.0, &["listen", "--as", "role", "--wait", "0"]);
     assert!(!got.contains("leak"), "{got}");
 }
+
+/// Two rounds, each side doing just what it is told: the asker's follow-up goes by its own send_message, so the answer
+/// to that comes back to it too.
+#[test]
+fn no_register_follow_ups_sent_as_instructed_get_their_replies() {
+    let (home, folder) = team("two-rounds");
+    let mut a = Mcp::start(&home.0, &folder, &["--no-register"], &[]);
+    let reply_as_told = |home: &Path, text: &str| {
+        let got = run(home, &["listen", "--as", "role", "--wait", "0"]);
+        let line = got.lines().find_map(|l| l.split_once("Reply if useful: ").map(|(_, c)| c)).expect(&got);
+        let words: Vec<&str> = line.strip_suffix("\"<reply>\"").expect(line).split_whitespace().skip(1).collect();
+        run(home, &[&words[..], &[text]].concat());
+    };
+    a.send(2, "alice/role", "first question");
+    reply_as_told(&home.0, "first answer");
+    let got = a.call(3, "check_inbox", json!({"wait_secs": 5}));
+    assert!(got.contains("first answer"), "{got}");
+    // What the asker is told to do: its own tool, to the one that answered.
+    let told = got.lines().find_map(|l| l.split_once("Reply if useful with ").map(|(_, t)| t)).expect(&got);
+    assert!(told.starts_with("mcp__reason_network__send_message"), "{told}");
+    let to = told.split_once(" to \"").and_then(|(_, t)| t.split_once('"')).map(|(t, _)| t).expect(told);
+    a.send(4, to, "follow-up");
+    reply_as_told(&home.0, "second answer");
+    let got = a.call(5, "check_inbox", json!({"wait_secs": 5}));
+    assert!(got.contains("second answer"), "{got}");
+}
+
+/// A conversation in a folder that is off, then a new one in the same agent process in a folder that is on, with no
+/// end hook between (Command Code has none): the new one isn't refused for the old one.
+#[test]
+fn no_register_lets_a_new_conversation_past_an_old_off_one() {
+    let (home, folder) = team("hooks-replaced");
+    let off = home.0.join("private");
+    fs::create_dir_all(&off).unwrap();
+    run(&home.0, &["folder", off.to_str().unwrap(), "off"]);
+    for (session, dir) in [("g1", &off), ("g2", &folder)] {
+        let mut hook = reason_network(&home.0);
+        hook.args(["hook", "gemini", "user-prompt-submit"]).current_dir(dir).stdin(Stdio::piped());
+        let mut hook = hook.spawn().unwrap();
+        let input = json!({"session_id": session, "cwd": dir.to_str().unwrap()});
+        writeln!(hook.stdin.take().unwrap(), "{input}").unwrap();
+        assert!(hook.wait().unwrap().success());
+    }
+    let mut mcp = Mcp::start_as("gemini-cli-mcp-client", &home.0, &folder, &["--no-register"], &[]);
+    let r = mcp.request(2, "tools/call", json!({"name": "list_team", "arguments": {}}));
+    assert_ne!(r["result"]["isError"], true, "{r}");
+}

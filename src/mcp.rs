@@ -578,7 +578,10 @@ impl ReasonNetworkMcp {
             if !mine.is_empty() {
                 let ids = mine.iter().map(|m| m.id.clone()).collect();
                 self.link.call::<Value>(Request::Delivered { key: key.to_string(), ids }).await?;
-                return Ok(render::for_agent(&mine, Some("cli"), true));
+                // Its reply instructions name this client's own send_message tool, never the CLI: a follow-up sent
+                // here is noted in `sent`, so the answer to it comes back through check_inbox too.
+                let agent = self.agent(&ctx.peer, Some(&ctx.meta));
+                return Ok(render::for_agent(&mine, Some(agent), false));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok("No messages.".to_string());

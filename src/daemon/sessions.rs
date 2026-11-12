@@ -492,7 +492,16 @@ impl Daemon {
             bail!(OFF_HERE);
         }
         // Only in folders that are on (again): it left the one that is off.
-        self.inner.lock().unwrap().off.remove(&key);
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.off.remove(&key);
+            // An agent known by its hooks runs one conversation per process: a new one there replaced any that was
+            // in a folder that is off, whose end no hook may say (Command Code has no end hook).
+            if let Some(p) = pid.filter(|_| event != "end" && agent::session_from_hooks(agent)) {
+                let prefix = format!("{agent}:");
+                g.off.retain(|k, (_, _, op)| *op != Some(p) || !k.starts_with(&prefix));
+            }
+        }
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             if agent == "antigravity" {
