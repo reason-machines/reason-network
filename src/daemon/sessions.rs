@@ -485,7 +485,7 @@ impl Daemon {
                 }
                 "doing" => {}
                 _ => {
-                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now));
+                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now, pid));
                 }
             }
             // Hooks print nothing either way; `listen --as` says why.
@@ -634,11 +634,16 @@ impl Daemon {
     }
 
     /// Refuses as registering `key` would for a folder that is off, without registering it (`mcp --no-register`). With
-    /// no key, an agent with one MCP server for all its sessions may be calling from one in an off folder: refused
-    /// while one is mid-turn, as `attach` is.
-    pub(super) fn off_for(&self, agent: &str, key: Option<&str>) -> Result<()> {
+    /// no key, an agent known by its hooks (Gemini) is asked by its process `pid`, whose sessions in an off folder its
+    /// hooks noted; an agent with one MCP server for all its sessions may be calling from one in an off folder: refused
+    /// while one is mid-turn, as `attach` is. So is an agent known by its hooks whose process isn't known.
+    pub(super) fn off_for(&self, agent: &str, key: Option<&str>, pid: Option<u32>) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         self.prune(&mut g);
+        let (now, prefix) = (util::now_ms(), format!("{agent}:"));
+        let busy_off = |g: &Inner| {
+            g.off.iter().any(|(k, (busy, at, _))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix))
+        };
         match key {
             Some(key) => {
                 let cwd_off = g.live.get(key).is_some_and(|l| self.cfg.off_in(&l.reg.cwd));
@@ -646,12 +651,20 @@ impl Daemon {
                     bail!(OFF_HERE);
                 }
             }
-            None if agent::multiplexed(agent) => {
-                let (now, prefix) = (util::now_ms(), format!("{agent}:"));
-                if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
-                    bail!(BUSY_OFF);
+            None if agent::session_from_hooks(agent) => match pid {
+                Some(pid) => {
+                    let off = g.off.iter().any(|(k, (_, _, p))| *p == Some(pid) && k.starts_with(&prefix))
+                        || g.live
+                            .values()
+                            .any(|l| l.reg.agent == agent && l.reg.pid == Some(pid) && self.cfg.off_in(&l.reg.cwd));
+                    if off {
+                        bail!(OFF_HERE);
+                    }
                 }
-            }
+                None if busy_off(&g) => bail!(BUSY_OFF),
+                None => {}
+            },
+            None if agent::multiplexed(agent) && busy_off(&g) => bail!(BUSY_OFF),
             None => {}
         }
         Ok(())
@@ -665,7 +678,7 @@ impl Daemon {
         self.prune(&mut g);
         let now = util::now_ms();
         let prefix = format!("{agent}:");
-        if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
+        if g.off.iter().any(|(k, (busy, at, _))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
             bail!(BUSY_OFF);
         }
         let busy: Vec<(&String, &Live)> = g
@@ -761,7 +774,7 @@ impl Daemon {
                 let _ = g.store.touch_session(&l.name, now);
             }
         }
-        g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
+        g.off.retain(|_, (_, at, _)| now - *at <= HOOK_TTL_MS);
         if self.forgetting() {
             g.seen_since_start.clear();
             let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();

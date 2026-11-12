@@ -58,6 +58,9 @@ struct Mcp {
 }
 impl Mcp {
     fn start(home: &Path, folder: &Path, args: &[&str], env: &[(&str, &str)]) -> Mcp {
+        Self::start_as("codex-mcp-client", home, folder, args, env)
+    }
+    fn start_as(client: &str, home: &Path, folder: &Path, args: &[&str], env: &[(&str, &str)]) -> Mcp {
         let mut server = reason_network(home);
         server.arg("mcp").args(args).envs(env.iter().copied()).current_dir(folder);
         let mut server =
@@ -71,7 +74,7 @@ impl Mcp {
             }
         });
         let mut mcp = Mcp { _server: server, stdin, replies, instructions: String::new() };
-        let client = json!({"name": "codex-mcp-client", "version": "1"});
+        let client = json!({"name": client, "version": "1"});
         let init = json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": client});
         let reply = mcp.request(1, "initialize", init);
         mcp.instructions = reply["result"]["instructions"].as_str().unwrap_or_default().to_string();
@@ -226,4 +229,61 @@ fn no_register_keeps_a_session_in_an_off_folder_off() {
     let ok =
         mcp.request(5, "tools/call", json!({"name": "list_team", "arguments": {}, "_meta": {"sessionId": "fine"}}));
     assert_ne!(ok["result"]["isError"], true, "{ok}");
+}
+
+/// The reply a recipient is told to send reaches the agent that asked, and an idempotency key two such agents happen to
+/// share sends two messages, each answered to its own sender.
+#[test]
+fn no_register_replies_sent_as_instructed_reach_the_asker() {
+    let (home, folder) = team("instructed");
+    let mut a = Mcp::start(&home.0, &folder, &["--no-register"], &[]);
+    let mut b = Mcp::start(&home.0, &folder, &["--no-register"], &[]);
+    let args = json!({"to": "alice/role", "message": "same request", "idempotency_key": "request-1"});
+    let ids: Vec<String> = [&mut a, &mut b]
+        .into_iter()
+        .map(|m| {
+            let sent = m.call(2, "send_message", args.clone());
+            assert!(sent.contains("Sent from alice/tasks"), "{sent}");
+            sent.lines().find_map(|l| l.strip_prefix("message id ")).expect(&sent).trim().to_string()
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1], "one agent's key answered for the other");
+    let got = run(&home.0, &["listen", "--as", "role", "--wait", "0"]);
+    // The command the recipient is told to run, as it says it.
+    let line = got.lines().find_map(|l| l.split_once("Reply if useful: ").map(|(_, c)| c)).expect(&got);
+    let command = line.strip_suffix("\"<reply>\"").expect(line);
+    let words: Vec<&str> = command.split_whitespace().skip(1).collect();
+    assert!(words.contains(&"--reply-to"), "{line}");
+    run(&home.0, &[&words[..], &["the reply"]].concat());
+    // It answers the last message listed: B's.
+    let got_b = b.call(3, "check_inbox", json!({"wait_secs": 5}));
+    assert!(got_b.contains("the reply"), "{got_b}");
+    assert_eq!(a.call(3, "check_inbox", json!({})), "No messages.");
+}
+
+/// An agent known only by its hooks (Gemini) gives its MCP server no session id: its process's off-folder session is
+/// still refused.
+#[test]
+fn no_register_keeps_a_hook_known_session_in_an_off_folder_off() {
+    let (home, folder) = team("hooks-off");
+    let off = home.0.join("private");
+    fs::create_dir_all(&off).unwrap();
+    run(&home.0, &["folder", off.to_str().unwrap(), "off"]);
+    // The hook and the MCP server are both this test's children: one agent process.
+    let mut hook = reason_network(&home.0);
+    hook.args(["hook", "gemini", "user-prompt-submit"]).current_dir(&off).stdin(Stdio::piped());
+    let mut hook = hook.spawn().unwrap();
+    let input = json!({"session_id": "g1", "cwd": off.to_str().unwrap()});
+    writeln!(hook.stdin.take().unwrap(), "{input}").unwrap();
+    assert!(hook.wait().unwrap().success());
+    let mut mcp = Mcp::start_as("gemini-cli-mcp-client", &home.0, &folder, &["--no-register"], &[]);
+    for (id, tool, args) in
+        [(2, "list_team", json!({})), (3, "send_message", json!({"to": "alice/role", "message": "leak"}))]
+    {
+        let r = mcp.request(id, "tools/call", json!({"name": tool, "arguments": args}));
+        assert_eq!(r["result"]["isError"], true, "{tool}: {r}");
+        assert!(Mcp::tool_text(&r).contains("turned Reason Network off"), "{tool}: {r}");
+    }
+    let got = run(&home.0, &["listen", "--as", "role", "--wait", "0"]);
+    assert!(!got.contains("leak"), "{got}");
 }

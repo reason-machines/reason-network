@@ -321,7 +321,7 @@ The key is `<agent>:<id>`, and it is what a name is kept for (above). Where each
 | Reason | session id | `reason session list` |
 | `listen --as <name>`, `terminal` | the name | `cli:<name>` |
 | DeepSeek Harness, ZCode, other MCP clients | none | `proc:<pid>` (`REASON_NETWORK_SESSION`, when set, gives one) |
-| any agent's `mcp --no-register` (`REASON_NETWORK_NO_REGISTER`) | none | no session of its own: `list_team` reads the directory as no one, and the other tools go by the kept mailbox `cli:tasks` (an agent's, so no group sends); `check_inbox` reads only replies to what that process sent, `ask_user` is off, and the caller's off folder still refuses (`OffFor`) |
+| any agent's `mcp --no-register` (`REASON_NETWORK_NO_REGISTER`) | none | no session of its own: `list_team` reads the directory as no one, and the other tools go by the kept mailbox `cli:tasks` (an agent's, so no group sends); `check_inbox` reads only replies (`reply_to`, which reply instructions to a tasks sender include) to what that process sent, idempotency keys are namespaced per process, `ask_user` is off, and the caller's off folder still refuses (`OffFor`, by the hooks' process for agents known by their hooks) |
 
 A conversation keeps its name across a resume as long as its agent keeps the id (Claude Code does unless told to fork
 the session; `/clear` starts a new one).

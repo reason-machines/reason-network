@@ -193,6 +193,9 @@ pub enum Request {
     OffFor {
         agent: String,
         key: Option<String>,
+        /// With no key: the agent's process, for an agent known by its hooks (Gemini).
+        #[serde(default)]
+        pid: Option<u32>,
     },
     /// For agents that give their MCP servers no session id, only their hooks (Gemini): the session id the hooks of
     /// agent process `pid` registered, if any.

@@ -169,8 +169,9 @@ struct Inner {
     swept: i64,
     /// Teammates' files taken in the last hour, for the quota.
     quota: crate::files::Quota,
-    /// Sessions whose hooks say they are in a folder that is off: whether each is mid-turn, and when it last said.
-    off: HashMap<String, (bool, i64)>,
+    /// Sessions whose hooks say they are in a folder that is off: whether each is mid-turn, when it last said, and its
+    /// agent's process (which `mcp --no-register` for an agent known by its hooks asks by).
+    off: HashMap<String, (bool, i64, Option<u32>)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
     /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
@@ -455,8 +456,8 @@ impl Daemon {
             }
             Request::Hook(h) => json!(self.hook(h).await?),
             Request::Attach { agent, cwd } => json!(self.attach(&agent, &cwd)?),
-            Request::OffFor { agent, key } => {
-                self.off_for(&agent, key.as_deref())?;
+            Request::OffFor { agent, key, pid } => {
+                self.off_for(&agent, key.as_deref(), pid)?;
                 Value::Null
             }
             Request::Linked { agent, pid } => json!(self.linked(&agent, pid)),

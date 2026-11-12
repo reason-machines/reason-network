@@ -35,7 +35,8 @@ use tokio::sync::mpsc;
 const SKILL: &str = include_str!("skill.md");
 
 const NO_REGISTER_NOTE: &str = "This server runs with --no-register: you are not a session in the team's directory. \
-What you send comes from <you>/tasks, a mailbox every such agent on this computer shares. check_inbox gives you only \
+What you send comes from your user's tasks mailbox (<you>/tasks; send_message's result names the exact address), \
+which every such agent on this computer shares. check_inbox gives you only \
 the replies to messages you sent; other mail to <you>/tasks stays for `reason-network listen --as tasks`. ask_user \
 is off: a pop-up's answer couldn't tell this agent from the others sharing the mailbox.";
 
@@ -130,6 +131,10 @@ pub struct ReasonNetworkMcp {
     no_register: bool,
     /// `--no-register`: what this process sent from the shared mailbox, so it reads only the replies to those.
     sent: Arc<Mutex<HashSet<String>>>,
+    /// `--no-register`: this process's own, so an idempotency key it reuses retries its message, never another's.
+    nonce: String,
+    /// `--no-register`: the shared mailbox's address, as the daemon gave it.
+    address: Arc<Mutex<Option<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -148,6 +153,8 @@ pub async fn run(no_register: bool) -> Result<()> {
         hooks_linked: Default::default(),
         no_register,
         sent: Default::default(),
+        nonce: process_nonce(),
+        address: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
     let service = server.clone().serve(stdio()).await?;
@@ -259,8 +266,15 @@ impl ReasonNetworkMcp {
             Ok(f) => f,
             Err(e) => return Ok(failure(e)),
         };
+        // The mailbox is shared: each process's keys are its own (hashed, within the daemon's length limit).
+        let idempotency_key = match a.idempotency_key {
+            Some(k) if self.no_register && !k.is_empty() && k.len() <= 200 => {
+                Some(blake3::hash(format!("{}:{k}", self.nonce).as_bytes()).to_hex().to_string())
+            }
+            k => k,
+        };
         let req = Request::Send {
-            idempotency_key: a.idempotency_key,
+            idempotency_key,
             purpose: None,
             from: key.clone(),
             to: a.to,
@@ -275,7 +289,13 @@ impl ReasonNetworkMcp {
             if self.no_register {
                 self.sent.lock().unwrap().extend(r.ids.iter().cloned());
             }
-            render::defang(&render::send_result(&r))
+            let mut text = render::defang(&render::send_result(&r));
+            if let Some(a) = self.address.lock().unwrap().as_deref().filter(|_| self.no_register) {
+                text.push_str(&format!(
+                    "\n\nSent from {a}, the tasks mailbox --no-register agents on this computer share."
+                ));
+            }
+            text
         });
         Ok(self.finish(&key, res, true).await)
     }
@@ -504,7 +524,9 @@ impl ReasonNetworkMcp {
             .or_else(|| agent::meta_session_id(&ctx.meta))
             .or_else(|| agent::env_session_id(agent));
         let key = id.map(|id| format!("{agent}:{id}"));
-        self.link.call::<Value>(Request::OffFor { agent: agent.into(), key }).await?;
+        // An agent known only by its hooks is asked by its process, whose off-folder sessions its hooks noted.
+        let pid = if key.is_none() && agent::session_from_hooks(agent) { agent::agent_process() } else { None };
+        self.link.call::<Value>(Request::OffFor { agent: agent.into(), key, pid }).await?;
         Ok(())
     }
 
@@ -525,7 +547,10 @@ impl ReasonNetworkMcp {
             keep: true,
             codex_home: None,
         };
-        self.link.call::<HookReply>(Request::Hook(hook)).await?;
+        let reply = self.link.call::<HookReply>(Request::Hook(hook)).await?;
+        if let Some(a) = reply.address {
+            *self.address.lock().unwrap() = Some(a);
+        }
         Ok(format!("cli:{MAILBOX}"))
     }
 
@@ -546,6 +571,10 @@ impl ReasonNetworkMcp {
                 let sent = self.sent.lock().unwrap();
                 got.messages.into_iter().filter(|m| m.reply_to.as_ref().is_some_and(|r| sent.contains(r))).collect()
             };
+            // Given up on meanwhile: left unread, for the next look.
+            if ctx.ct.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
             if !mine.is_empty() {
                 let ids = mine.iter().map(|m| m.id.clone()).collect();
                 self.link.call::<Value>(Request::Delivered { key: key.to_string(), ids }).await?;
@@ -651,6 +680,18 @@ pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachme
 }
 
 /// A failure, defanged: it can quote teammates (their names, their machines' words).
+/// Unique to this process, for `--no-register`'s idempotency keys.
+fn process_nonce() -> String {
+    let mut b = [0u8; 16];
+    let _ = getrandom::fill(&mut b);
+    format!(
+        "{}:{}:{}",
+        std::process::id(),
+        crate::util::now_ms(),
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    )
+}
+
 fn failure(e: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(render::defang(&format!("{e:#}")))])
 }
