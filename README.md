@@ -94,6 +94,11 @@ reason-network setup                                           # which agents ar
 reason-network folder ~/personal off                           # sessions in ~/personal stay off the network (on undoes it)
 ```
 
+An agent that runs on a schedule, or any other one-off agent you don't want listed for teammates to message, can
+start its MCP server as `reason-network mcp --no-register` (or with `REASON_NETWORK_NO_REGISTER=1` in the server's
+environment). It is then no session of its own: `list_team` still shows the team, and what it sends comes from
+`<you>/tasks`, one mailbox all such agents on that computer share, which `check_inbox` reads for replies.
+
 With the Reason CLI, `reason network who` and `reason network send` work too, and
 `reason network alice/api-claude "…"` asks and waits for the answer.
 
