@@ -310,7 +310,12 @@ enum Cmd {
         wait: u64,
     },
     /// Run the MCP server on stdio (what agents launch)
-    Mcp,
+    Mcp {
+        /// Don't register this agent as a session in the team's directory (also REASON_NETWORK_NO_REGISTER=1), e.g.
+        /// for scheduled tasks: list_team still works, and messages go from and come to the shared <you>/tasks
+        #[arg(long)]
+        no_register: bool,
+    },
     /// Local JSON-lines transport for native agent adapters
     Bridge,
     /// Run the App-managed Antigravity delivery sidecar
@@ -332,7 +337,7 @@ async fn main() -> Result<()> {
             debuglog::flush();
             r
         }
-        Some(Cmd::Mcp) => mcp::run().await,
+        Some(Cmd::Mcp { no_register }) => mcp::run(no_register || paths::env_var_os("NO_REGISTER").is_some()).await,
         Some(Cmd::AntigravitySidecar) => antigravity::run().await,
         Some(Cmd::Bridge) => bridge::run().await,
         // Blocks this (the main) thread with AppKit's event loop; its daemon calls run on the runtime's workers.
@@ -718,7 +723,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Daemon { .. }
-        | Cmd::Mcp
+        | Cmd::Mcp { .. }
         | Cmd::Bridge
         | Cmd::AntigravitySidecar
         | Cmd::Hook { .. }

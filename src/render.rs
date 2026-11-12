@@ -305,11 +305,17 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
         format!("From {person}'s agent.")
     };
     // No Reason Network tools (Reason's agent; a Claude session from before Reason Network), but commands run on this computer.
+    // A shared tasks mailbox (`mcp --no-register`) gives each of its agents only the replies to what it sent: so the
+    // reply says which message it answers.
+    let tasks =
+        without_machine(&last.from).rsplit_once('/').is_some_and(|(_, s)| s == "tasks" || s.starts_with("tasks-"));
     let reply = if cli || agent == Some("reason") {
-        format!("Reply if useful: {ENGINE} send {} --from {} \"<reply>\"", last.from, last.to)
+        let to = if tasks { format!(" --reply-to {}", last.id) } else { String::new() };
+        format!("Reply if useful: {ENGINE} send {} --from {}{to} \"<reply>\"", last.from, last.to)
     } else if agent == Some("hermes") {
         // Hermes's plugin names its tools for the toolset.
-        format!("Reply if useful with reason_network_send_message to \"{}\".", last.from)
+        let to = if tasks { format!(" with reply_to \"{}\"", last.id) } else { String::new() };
+        format!("Reply if useful with reason_network_send_message to \"{}\"{to}.", last.from)
     } else {
         // By its MCP server too: an agent can have a `send_message` of its own (Codex's `collaboration.send_message`).
         let tool = match agent {
@@ -320,7 +326,8 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
             }
             _ => format!("the {AGENT_NAME} send_message tool"),
         };
-        format!("Reply if useful with {tool} to \"{}\".", last.from)
+        let to = if tasks { format!(" with reply_to \"{}\"", last.id) } else { String::new() };
+        format!("Reply if useful with {tool} to \"{}\"{to}.", last.from)
     };
     let _ = write!(out, "{who} {reply}");
     out
@@ -666,6 +673,14 @@ mod tests {
             for_agent(std::slice::from_ref(&m), Some("codex"), true)
                 .ends_with(&format!("Reply if useful: {ENGINE} send alice/api --from alex/web \"<reply>\""))
         );
+        // A shared tasks mailbox reads only the replies to what it sent: the reply names the message it answers.
+        let t = Message { from: "alice/tasks@box".into(), ..m.clone() };
+        assert!(for_agent(std::slice::from_ref(&t), None, true).ends_with(&format!(
+            "Reply if useful: {ENGINE} send alice/tasks@box --from alex/web --reply-to 01X \"<reply>\""
+        )));
+        assert!(for_agent(std::slice::from_ref(&t), Some("cursor"), false).ends_with(
+            "Reply if useful with the reason-network send_message tool to \"alice/tasks@box\" with reply_to \"01X\"."
+        ));
     }
 
     #[test]

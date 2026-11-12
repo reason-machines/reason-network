@@ -22,6 +22,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +33,12 @@ use tokio::sync::mpsc;
 
 /// How agents should use Reason Network, kept once: in the skill, for agents with the tools and without.
 const SKILL: &str = include_str!("skill.md");
+
+const NO_REGISTER_NOTE: &str = "This server runs with --no-register: you are not a session in the team's directory. \
+What you send comes from your user's tasks mailbox (<you>/tasks; send_message's result names the exact address), \
+which every such agent on this computer shares. check_inbox gives you only \
+the replies to messages you sent; other mail to <you>/tasks stays for `reason-network listen --as tasks`. ask_user \
+is off: a pop-up's answer couldn't tell this agent from the others sharing the mailbox.";
 
 fn instructions() -> String {
     // Windows checkouts may have turned the file's line ends into \r\n.
@@ -120,10 +127,23 @@ pub struct ReasonNetworkMcp {
     client_agent: Arc<Mutex<Option<&'static str>>>,
     /// Gemini: it has gone by its hooks' session (so between two conversations, the next is waited for).
     hooks_linked: Arc<AtomicBool>,
+    /// `--no-register`: this process is never a session of its own, so it adds nothing to the team's directory.
+    no_register: bool,
+    /// `--no-register`: what this process sent from the shared mailbox, so it reads only the replies to those.
+    sent: Arc<Mutex<HashSet<String>>>,
+    /// `--no-register`: this process's own, so an idempotency key it reuses retries its message, never another's.
+    nonce: String,
+    /// `--no-register`: the shared mailbox's address, as the daemon gave it.
+    address: Arc<Mutex<Option<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
-pub async fn run() -> Result<()> {
+/// The one mailbox `--no-register` processes on this machine share to send from and read: kept for good, as one made with
+/// `reason-network listen --as tasks` is, and an agent's (not `terminal`, which says a person typed it and may message a
+/// group).
+const MAILBOX: &str = "tasks";
+
+pub async fn run(no_register: bool) -> Result<()> {
     let (tx, mut events) = mpsc::unbounded_channel();
     let server = ReasonNetworkMcp {
         link: Link::new(Some(tx)),
@@ -131,6 +151,10 @@ pub async fn run() -> Result<()> {
         claude: Default::default(),
         client_agent: Default::default(),
         hooks_linked: Default::default(),
+        no_register,
+        sent: Default::default(),
+        nonce: process_nonce(),
+        address: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
     let service = server.clone().serve(stdio()).await?;
@@ -148,7 +172,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let agent = s.agent(&peer, None);
-        if agent::multiplexed(agent) || off_here() {
+        if s.no_register || agent::multiplexed(agent) || off_here() {
             return;
         }
         let hooks = agent::session_from_hooks(agent);
@@ -210,13 +234,21 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<ListArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
-            Ok(k) => k,
-            Err(e) => return Ok(failure(e)),
+        // Reading the directory needs no session: without one, this process stays out of it.
+        let me = if self.no_register {
+            if let Err(e) = self.caller_on(&ctx, a.session_id.as_deref()).await {
+                return Ok(failure(e));
+            }
+            None
+        } else {
+            match self.session_for(&ctx, a.session_id.as_deref()).await {
+                Ok(k) => Some(k),
+                Err(e) => return Ok(failure(e)),
+            }
         };
-        let req = Request::Who { me: Some(key.clone()), filter: a.filter, all: a.all.unwrap_or(false) };
+        let req = Request::Who { me: me.clone(), filter: a.filter, all: a.all.unwrap_or(false) };
         let res = self.link.call::<Directory>(req).await.map(|d| render::directory_for_agent(&d));
-        Ok(self.finish(&key, res, true).await)
+        Ok(self.finish(me.as_deref().unwrap_or_default(), res, me.is_some()).await)
     }
 
     #[tool(description = "Send a message to one teammate's agent session, optionally with small text files.")]
@@ -234,8 +266,15 @@ impl ReasonNetworkMcp {
             Ok(f) => f,
             Err(e) => return Ok(failure(e)),
         };
+        // The mailbox is shared: each process's keys are its own (hashed, within the daemon's length limit).
+        let idempotency_key = match a.idempotency_key {
+            Some(k) if self.no_register && !k.is_empty() && k.len() <= 200 => {
+                Some(blake3::hash(format!("{}:{k}", self.nonce).as_bytes()).to_hex().to_string())
+            }
+            k => k,
+        };
         let req = Request::Send {
-            idempotency_key: a.idempotency_key,
+            idempotency_key,
             purpose: None,
             from: key.clone(),
             to: a.to,
@@ -246,7 +285,18 @@ impl ReasonNetworkMcp {
             files,
         };
         // Notes are teammates' machines' words.
-        let res = self.link.call::<SendResult>(req).await.map(|r| render::defang(&render::send_result(&r)));
+        let res = self.link.call::<SendResult>(req).await.map(|r| {
+            if self.no_register {
+                self.sent.lock().unwrap().extend(r.ids.iter().cloned());
+            }
+            let mut text = render::defang(&render::send_result(&r));
+            if let Some(a) = self.address.lock().unwrap().as_deref().filter(|_| self.no_register) {
+                text.push_str(&format!(
+                    "\n\nSent from {a}, the tasks mailbox --no-register agents on this computer share."
+                ));
+            }
+            text
+        });
         Ok(self.finish(&key, res, true).await)
     }
 
@@ -258,6 +308,12 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<AskArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // The daemon keeps one pending question per session: agents sharing the mailbox would share its answer.
+        if self.no_register {
+            return Ok(failure(anyhow::anyhow!(
+                "ask_user is off with --no-register: run the agent without it to ask your user"
+            )));
+        }
         let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
@@ -289,6 +345,10 @@ impl ReasonNetworkMcp {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
+        if self.no_register {
+            let res = self.own_replies(&key, a.wait_secs.unwrap_or(0), &ctx).await;
+            return Ok(self.finish(&key, res, false).await);
+        }
         let req = Request::Inbox { key: key.clone(), wait_secs: a.wait_secs.unwrap_or(0), peek: true };
         let got = tokio::select! {
             r = self.link.call::<Inbox>(req) => r,
@@ -318,7 +378,11 @@ impl ServerHandler for ReasonNetworkMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(crate::AGENT_NAME, env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions())
+            .with_instructions(if self.no_register {
+                format!("{}\n\n{NO_REGISTER_NOTE}", instructions())
+            } else {
+                instructions()
+            })
     }
 
     /// A session that gets its messages pushed never needs check_inbox, so it isn't shown one: fewer tokens.
@@ -328,7 +392,9 @@ impl ServerHandler for ReasonNetworkMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
-        if self.pushed(self.agent(&ctx.peer, None)) {
+        if self.no_register {
+            tools.retain(|t| t.name != "ask_user");
+        } else if self.pushed(self.agent(&ctx.peer, None)) {
             tools.retain(|t| t.name != "check_inbox");
         }
         Ok(ListToolsResult::with_all_items(tools))
@@ -373,6 +439,10 @@ impl ReasonNetworkMcp {
     }
 
     async fn session_for(&self, ctx: &RequestContext<RoleServer>, explicit: Option<&str>) -> Result<String> {
+        if self.no_register {
+            self.caller_on(ctx, explicit).await?;
+            return self.mailbox().await;
+        }
         let agent = self.agent(&ctx.peer, Some(&ctx.meta));
         if agent == "antigravity" {
             let id = explicit.map(str::to_string).or_else(|| agent::meta_session_id(&ctx.meta));
@@ -387,11 +457,7 @@ impl ReasonNetworkMcp {
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
-        let cfg = crate::config::Config::load();
-        let cwd = agent::cwd();
-        if cfg.off_in(&cwd) {
-            anyhow::bail!(cfg.off_message(&cwd));
-        }
+        on_here()?;
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
                 Ok(Some(key)) => return Ok(key),
@@ -444,6 +510,88 @@ impl ReasonNetworkMcp {
         };
         self.link.register(reg).await?;
         Ok(key)
+    }
+
+    /// `--no-register`'s session: the shared [`MAILBOX`], not one of its own.
+    /// `--no-register`: an error when the calling session's folder is off, as registering it would give. This server's
+    /// own folder is checked here; the caller's (which a server several sessions share can't know) by the daemon, from
+    /// the session's hooks.
+    async fn caller_on(&self, ctx: &RequestContext<RoleServer>, explicit: Option<&str>) -> Result<()> {
+        on_here()?;
+        let agent = self.agent(&ctx.peer, Some(&ctx.meta));
+        let id = explicit
+            .map(str::to_string)
+            .or_else(|| agent::meta_session_id(&ctx.meta))
+            .or_else(|| agent::env_session_id(agent));
+        let key = id.map(|id| format!("{agent}:{id}"));
+        // An agent known only by its hooks is asked by its process, whose off-folder sessions its hooks noted.
+        let pid = if key.is_none() && agent::session_from_hooks(agent) { agent::agent_process() } else { None };
+        self.link.call::<Value>(Request::OffFor { agent: agent.into(), key, pid }).await?;
+        Ok(())
+    }
+
+    async fn mailbox(&self) -> Result<String> {
+        on_here()?;
+        let hook = HookCall {
+            through_reason: Some(false),
+            agent: "cli".into(),
+            event: "stop".into(),
+            session_id: MAILBOX.into(),
+            cwd: Some(agent::cwd()),
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: Some(MAILBOX.into()),
+            dirs: Vec::new(),
+            keep: true,
+            codex_home: None,
+        };
+        let reply = self.link.call::<HookReply>(Request::Hook(hook)).await?;
+        if let Some(a) = reply.address {
+            *self.address.lock().unwrap() = Some(a);
+        }
+        Ok(format!("cli:{MAILBOX}"))
+    }
+
+    /// `--no-register`'s `check_inbox`: the replies to what this process sent, waiting up to `wait_secs` for one. Only
+    /// those are marked read, so agents sharing the mailbox never get each other's, and other mail stays for
+    /// `listen --as tasks`. Each wait is this process's alone: giving up on it ends no one else's (no `StopWaiting`,
+    /// which ends every wait on the mailbox), and the daemon's wait it leaves behind only peeks.
+    async fn own_replies(&self, key: &str, wait_secs: u64, ctx: &RequestContext<RoleServer>) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs.min(600));
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs();
+            let req = Request::Inbox { key: key.to_string(), wait_secs: left, peek: true };
+            let got = tokio::select! {
+                r = self.link.call::<Inbox>(req) => r?,
+                _ = ctx.ct.cancelled() => anyhow::bail!("cancelled"),
+            };
+            let mine: Vec<Message> = {
+                let sent = self.sent.lock().unwrap();
+                got.messages.into_iter().filter(|m| m.reply_to.as_ref().is_some_and(|r| sent.contains(r))).collect()
+            };
+            // Given up on meanwhile: left unread, for the next look.
+            if ctx.ct.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if !mine.is_empty() {
+                let ids = mine.iter().map(|m| m.id.clone()).collect();
+                self.link.call::<Value>(Request::Delivered { key: key.to_string(), ids }).await?;
+                // Its reply instructions name this client's own send_message tool, never the CLI: a follow-up sent
+                // here is noted in `sent`, so the answer to it comes back through check_inbox too.
+                let agent = self.agent(&ctx.peer, Some(&ctx.meta));
+                return Ok(render::for_agent(&mine, Some(agent), false));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok("No messages.".to_string());
+            }
+            // Mail for someone else is waiting, so the daemon answers at once: look again in a moment.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1).min(deadline - tokio::time::Instant::now())) => {}
+                _ = ctx.ct.cancelled() => anyhow::bail!("cancelled"),
+            }
+        }
     }
 
     /// The session id the hooks of our agent process registered, if any (an older daemon doesn't know the request).
@@ -507,6 +655,15 @@ fn off_here() -> bool {
     crate::config::Config::load().off_in(&agent::cwd())
 }
 
+/// An error saying why, when this session's folder is off the network.
+fn on_here() -> Result<()> {
+    let (cfg, cwd) = (crate::config::Config::load(), agent::cwd());
+    if cfg.off_in(&cwd) {
+        anyhow::bail!(cfg.off_message(&cwd));
+    }
+    Ok(())
+}
+
 /// The files an agent asked to send, read only from its own folder: its repository (or where it works), none of its
 /// hidden files, nothing where credentials or Reason Network's state are kept. A person's `send --file` has no such
 /// limit; an agent can be talked into sending what its harness wouldn't let it read.
@@ -526,6 +683,18 @@ pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachme
 }
 
 /// A failure, defanged: it can quote teammates (their names, their machines' words).
+/// Unique to this process, for `--no-register`'s idempotency keys.
+fn process_nonce() -> String {
+    let mut b = [0u8; 16];
+    let _ = getrandom::fill(&mut b);
+    format!(
+        "{}:{}:{}",
+        std::process::id(),
+        crate::util::now_ms(),
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    )
+}
+
 fn failure(e: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(render::defang(&format!("{e:#}")))])
 }

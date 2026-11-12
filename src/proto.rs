@@ -188,6 +188,15 @@ pub enum Request {
         agent: String,
         cwd: String,
     },
+    /// `mcp --no-register`, which registers no session: refused (as registering would be) when the calling session's
+    /// hooks said its folder is off, or, with no session id, while a session of `agent` in an off folder is mid-turn.
+    OffFor {
+        agent: String,
+        key: Option<String>,
+        /// With no key: the agent's process, for an agent known by its hooks (Gemini).
+        #[serde(default)]
+        pid: Option<u32>,
+    },
     /// For agents that give their MCP servers no session id, only their hooks (Gemini): the session id the hooks of
     /// agent process `pid` registered, if any.
     Linked {

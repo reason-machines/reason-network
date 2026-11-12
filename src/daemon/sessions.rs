@@ -485,14 +485,23 @@ impl Daemon {
                 }
                 "doing" => {}
                 _ => {
-                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now));
+                    g.off.insert(key, (matches!(event, "prompt" | "tool"), now, pid));
                 }
             }
             // Hooks print nothing either way; `listen --as` says why.
             bail!(OFF_HERE);
         }
         // Only in folders that are on (again): it left the one that is off.
-        self.inner.lock().unwrap().off.remove(&key);
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.off.remove(&key);
+            // An agent known by its hooks runs one conversation per process: a new one there replaced any that was
+            // in a folder that is off, whose end no hook may say (Command Code has no end hook).
+            if let Some(p) = pid.filter(|_| event != "end" && agent::session_from_hooks(agent)) {
+                let prefix = format!("{agent}:");
+                g.off.retain(|k, (_, _, op)| *op != Some(p) || !k.starts_with(&prefix));
+            }
+        }
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
             if agent == "antigravity" {
@@ -633,6 +642,43 @@ impl Daemon {
         Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
+    /// Refuses as registering `key` would for a folder that is off, without registering it (`mcp --no-register`). With
+    /// no key, an agent known by its hooks (Gemini) is asked by its process `pid`, whose sessions in an off folder its
+    /// hooks noted; an agent with one MCP server for all its sessions may be calling from one in an off folder: refused
+    /// while one is mid-turn, as `attach` is. So is an agent known by its hooks whose process isn't known.
+    pub(super) fn off_for(&self, agent: &str, key: Option<&str>, pid: Option<u32>) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        self.prune(&mut g);
+        let (now, prefix) = (util::now_ms(), format!("{agent}:"));
+        let busy_off = |g: &Inner| {
+            g.off.iter().any(|(k, (busy, at, _))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix))
+        };
+        match key {
+            Some(key) => {
+                let cwd_off = g.live.get(key).is_some_and(|l| self.cfg.off_in(&l.reg.cwd));
+                if cwd_off || g.off.contains_key(key) {
+                    bail!(OFF_HERE);
+                }
+            }
+            None if agent::session_from_hooks(agent) => match pid {
+                Some(pid) => {
+                    let off = g.off.iter().any(|(k, (_, _, p))| *p == Some(pid) && k.starts_with(&prefix))
+                        || g.live
+                            .values()
+                            .any(|l| l.reg.agent == agent && l.reg.pid == Some(pid) && self.cfg.off_in(&l.reg.cwd));
+                    if off {
+                        bail!(OFF_HERE);
+                    }
+                }
+                None if busy_off(&g) => bail!(BUSY_OFF),
+                None => {}
+            },
+            None if agent::multiplexed(agent) && busy_off(&g) => bail!(BUSY_OFF),
+            None => {}
+        }
+        Ok(())
+    }
+
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
     /// busy one in `cwd` (the caller is mid-turn), else the only busy one at all. None while a session of `agent` in a
     /// folder that is off is mid-turn: the caller may be that one, which must never get another session's key.
@@ -641,7 +687,7 @@ impl Daemon {
         self.prune(&mut g);
         let now = util::now_ms();
         let prefix = format!("{agent}:");
-        if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
+        if g.off.iter().any(|(k, (busy, at, _))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
             bail!(BUSY_OFF);
         }
         let busy: Vec<(&String, &Live)> = g
@@ -737,7 +783,7 @@ impl Daemon {
                 let _ = g.store.touch_session(&l.name, now);
             }
         }
-        g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
+        g.off.retain(|_, (_, at, _)| now - *at <= HOOK_TTL_MS);
         if self.forgetting() {
             g.seen_since_start.clear();
             let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
