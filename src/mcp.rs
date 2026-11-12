@@ -22,6 +22,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -34,8 +35,9 @@ use tokio::sync::mpsc;
 const SKILL: &str = include_str!("skill.md");
 
 const NO_REGISTER_NOTE: &str = "This server runs with --no-register: you are not a session in the team's directory. \
-What you send comes from <you>/tasks, a mailbox every such agent on this computer shares, and check_inbox reads it, \
-which is where replies arrive.";
+What you send comes from <you>/tasks, a mailbox every such agent on this computer shares. check_inbox gives you only \
+the replies to messages you sent; other mail to <you>/tasks stays for `reason-network listen --as tasks`. ask_user \
+is off: a pop-up's answer couldn't tell this agent from the others sharing the mailbox.";
 
 fn instructions() -> String {
     // Windows checkouts may have turned the file's line ends into \r\n.
@@ -126,6 +128,8 @@ pub struct ReasonNetworkMcp {
     hooks_linked: Arc<AtomicBool>,
     /// `--no-register`: this process is never a session of its own, so it adds nothing to the team's directory.
     no_register: bool,
+    /// `--no-register`: what this process sent from the shared mailbox, so it reads only the replies to those.
+    sent: Arc<Mutex<HashSet<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -143,6 +147,7 @@ pub async fn run(no_register: bool) -> Result<()> {
         client_agent: Default::default(),
         hooks_linked: Default::default(),
         no_register,
+        sent: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
     let service = server.clone().serve(stdio()).await?;
@@ -224,7 +229,7 @@ impl ReasonNetworkMcp {
     ) -> Result<CallToolResult, McpError> {
         // Reading the directory needs no session: without one, this process stays out of it.
         let me = if self.no_register {
-            if let Err(e) = on_here() {
+            if let Err(e) = self.caller_on(&ctx, a.session_id.as_deref()).await {
                 return Ok(failure(e));
             }
             None
@@ -266,7 +271,12 @@ impl ReasonNetworkMcp {
             files,
         };
         // Notes are teammates' machines' words.
-        let res = self.link.call::<SendResult>(req).await.map(|r| render::defang(&render::send_result(&r)));
+        let res = self.link.call::<SendResult>(req).await.map(|r| {
+            if self.no_register {
+                self.sent.lock().unwrap().extend(r.ids.iter().cloned());
+            }
+            render::defang(&render::send_result(&r))
+        });
         Ok(self.finish(&key, res, true).await)
     }
 
@@ -278,6 +288,12 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<AskArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // The daemon keeps one pending question per session: agents sharing the mailbox would share its answer.
+        if self.no_register {
+            return Ok(failure(anyhow::anyhow!(
+                "ask_user is off with --no-register: run the agent without it to ask your user"
+            )));
+        }
         let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
@@ -309,6 +325,10 @@ impl ReasonNetworkMcp {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
+        if self.no_register {
+            let res = self.own_replies(&key, a.wait_secs.unwrap_or(0), &ctx).await;
+            return Ok(self.finish(&key, res, false).await);
+        }
         let req = Request::Inbox { key: key.clone(), wait_secs: a.wait_secs.unwrap_or(0), peek: true };
         let got = tokio::select! {
             r = self.link.call::<Inbox>(req) => r,
@@ -352,7 +372,9 @@ impl ServerHandler for ReasonNetworkMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
-        if !self.no_register && self.pushed(self.agent(&ctx.peer, None)) {
+        if self.no_register {
+            tools.retain(|t| t.name != "ask_user");
+        } else if self.pushed(self.agent(&ctx.peer, None)) {
             tools.retain(|t| t.name != "check_inbox");
         }
         Ok(ListToolsResult::with_all_items(tools))
@@ -398,6 +420,7 @@ impl ReasonNetworkMcp {
 
     async fn session_for(&self, ctx: &RequestContext<RoleServer>, explicit: Option<&str>) -> Result<String> {
         if self.no_register {
+            self.caller_on(ctx, explicit).await?;
             return self.mailbox().await;
         }
         let agent = self.agent(&ctx.peer, Some(&ctx.meta));
@@ -470,6 +493,21 @@ impl ReasonNetworkMcp {
     }
 
     /// `--no-register`'s session: the shared [`MAILBOX`], not one of its own.
+    /// `--no-register`: an error when the calling session's folder is off, as registering it would give. This server's
+    /// own folder is checked here; the caller's (which a server several sessions share can't know) by the daemon, from
+    /// the session's hooks.
+    async fn caller_on(&self, ctx: &RequestContext<RoleServer>, explicit: Option<&str>) -> Result<()> {
+        on_here()?;
+        let agent = self.agent(&ctx.peer, Some(&ctx.meta));
+        let id = explicit
+            .map(str::to_string)
+            .or_else(|| agent::meta_session_id(&ctx.meta))
+            .or_else(|| agent::env_session_id(agent));
+        let key = id.map(|id| format!("{agent}:{id}"));
+        self.link.call::<Value>(Request::OffFor { agent: agent.into(), key }).await?;
+        Ok(())
+    }
+
     async fn mailbox(&self) -> Result<String> {
         on_here()?;
         let hook = HookCall {
@@ -489,6 +527,39 @@ impl ReasonNetworkMcp {
         };
         self.link.call::<HookReply>(Request::Hook(hook)).await?;
         Ok(format!("cli:{MAILBOX}"))
+    }
+
+    /// `--no-register`'s `check_inbox`: the replies to what this process sent, waiting up to `wait_secs` for one. Only
+    /// those are marked read, so agents sharing the mailbox never get each other's, and other mail stays for
+    /// `listen --as tasks`. Each wait is this process's alone: giving up on it ends no one else's (no `StopWaiting`,
+    /// which ends every wait on the mailbox), and the daemon's wait it leaves behind only peeks.
+    async fn own_replies(&self, key: &str, wait_secs: u64, ctx: &RequestContext<RoleServer>) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs.min(600));
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs();
+            let req = Request::Inbox { key: key.to_string(), wait_secs: left, peek: true };
+            let got = tokio::select! {
+                r = self.link.call::<Inbox>(req) => r?,
+                _ = ctx.ct.cancelled() => anyhow::bail!("cancelled"),
+            };
+            let mine: Vec<Message> = {
+                let sent = self.sent.lock().unwrap();
+                got.messages.into_iter().filter(|m| m.reply_to.as_ref().is_some_and(|r| sent.contains(r))).collect()
+            };
+            if !mine.is_empty() {
+                let ids = mine.iter().map(|m| m.id.clone()).collect();
+                self.link.call::<Value>(Request::Delivered { key: key.to_string(), ids }).await?;
+                return Ok(render::for_agent(&mine, Some("cli"), true));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok("No messages.".to_string());
+            }
+            // Mail for someone else is waiting, so the daemon answers at once: look again in a moment.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1).min(deadline - tokio::time::Instant::now())) => {}
+                _ = ctx.ct.cancelled() => anyhow::bail!("cancelled"),
+            }
+        }
     }
 
     /// The session id the hooks of our agent process registered, if any (an older daemon doesn't know the request).

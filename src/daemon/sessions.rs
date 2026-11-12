@@ -633,6 +633,30 @@ impl Daemon {
         Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
+    /// Refuses as registering `key` would for a folder that is off, without registering it (`mcp --no-register`). With
+    /// no key, an agent with one MCP server for all its sessions may be calling from one in an off folder: refused
+    /// while one is mid-turn, as `attach` is.
+    pub(super) fn off_for(&self, agent: &str, key: Option<&str>) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        self.prune(&mut g);
+        match key {
+            Some(key) => {
+                let cwd_off = g.live.get(key).is_some_and(|l| self.cfg.off_in(&l.reg.cwd));
+                if cwd_off || g.off.contains_key(key) {
+                    bail!(OFF_HERE);
+                }
+            }
+            None if agent::multiplexed(agent) => {
+                let (now, prefix) = (util::now_ms(), format!("{agent}:"));
+                if g.off.iter().any(|(k, (busy, at))| *busy && now - at < OFF_TURN_MS && k.starts_with(&prefix)) {
+                    bail!(BUSY_OFF);
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
     /// busy one in `cwd` (the caller is mid-turn), else the only busy one at all. None while a session of `agent` in a
     /// folder that is off is mid-turn: the caller may be that one, which must never get another session's key.
