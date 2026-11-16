@@ -293,6 +293,8 @@ async fn endpoint(
         let relay_mode = RelayMode::custom(relays.to_vec());
         let mut b = if own { Endpoint::builder(presets::Minimal) } else { Endpoint::builder(presets::N0) }
             .secret_key(key.clone())
+            // Trust the system's roots so relay TLS works through a proxy whose CA is installed there.
+            .ca_tls_config(iroh::tls::CaTlsConfig::system())
             .relay_mode(relay_mode);
         if let Some(at) = &at {
             b = b.proxy_url(at.clone().into());
