@@ -75,6 +75,26 @@ async fn handle(
         .or_else(|| str_at("conversation_id"))
         .or_else(|| str_at("conversationId"))
         .or_else(|| str_at("sessionId"))?;
+    // Never a session: the daemon is told, so nothing else (its MCP server's calls) makes it one either. Nothing printed.
+    if agent == "codex" && codex_keeps_no_transcript(&v) {
+        let req = Request::Hook(HookCall {
+            through_reason: Some(false),
+            agent: agent.to_string(),
+            event: "no_transcript".into(),
+            session_id,
+            cwd: None,
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+            codex_home: None,
+        });
+        let _ = link.call::<HookReply>(req).await;
+        return None;
+    }
     // Every folder the agent names for the session, the one it works in first.
     let mut dirs: Vec<String> = str_at("cwd").into_iter().collect();
     dirs.extend(v["workspace_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
@@ -168,6 +188,14 @@ fn grok_ignores(event: &str, v: &Value) -> bool {
     !v["subagentType"].is_null() || (event == "stop" && v["reason"] != "end_turn")
 }
 
+/// A Codex thread whose hooks name its transcript as null keeps no local rollout: an ephemeral thread (the Codex app
+/// names a chat with one, for instance), or one kept in storage that isn't on this disk (in memory, for testing). No
+/// chat on this computer anyone can come back to or reach, so never a session here, nor a name taken from the chats
+/// that are. Older Codex, whose hooks don't name a transcript at all, is not this.
+fn codex_keeps_no_transcript(v: &Value) -> bool {
+    v.get("transcript_path").is_some_and(Value::is_null)
+}
+
 /// The JSON (or text) each agent expects from this hook to put `text` in front of the model.
 fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let specific = |name: &str| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
@@ -211,7 +239,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_home, format_for, grok_ignores, takes_mail};
+    use super::{codex_home, codex_keeps_no_transcript, format_for, grok_ignores, takes_mail};
     use serde_json::json;
 
     #[test]
@@ -251,6 +279,16 @@ mod tests {
         assert_eq!(codex_home(Some("".into())), None);
         assert_eq!(codex_home(None), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_codex_thread_whose_transcript_is_null_keeps_none() {
+        assert!(codex_keeps_no_transcript(&json!({ "session_id": "t", "transcript_path": null })));
+        assert!(!codex_keeps_no_transcript(
+            &json!({ "session_id": "t", "transcript_path": "/h/.codex/sessions/rollout-t.jsonl" })
+        ));
+        assert!(!codex_keeps_no_transcript(&json!({ "session_id": "t" })));
+        assert!(!codex_keeps_no_transcript(&serde_json::Value::Null));
     }
 
     #[test]

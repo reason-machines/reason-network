@@ -176,6 +176,8 @@ struct Inner {
     /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
     /// their next SessionStart or a `codex queue` that works.
     codex_failed: HashSet<String>,
+    /// Codex threads whose hooks say they keep no local transcript (`no_transcript`): never registered, by any route.
+    no_transcript: HashSet<String>,
 }
 
 /// A session running on this machine.
@@ -282,6 +284,7 @@ impl Daemon {
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
                 codex_failed: HashSet::new(),
+                no_transcript: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),

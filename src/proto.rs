@@ -64,7 +64,8 @@ pub struct HookCall {
     #[serde(default)]
     pub through_reason: Option<bool>,
     pub agent: String,
-    /// `start`, `prompt`, `tool`, `stop`, `end`, or `doing` (only reports what the session is doing).
+    /// `start`, `prompt`, `tool`, `stop`, `end`, `doing` (only reports what the session is doing), or `no_transcript`
+    /// (a Codex thread that keeps no local transcript: never a session, by its hooks or its MCP server).
     pub event: String,
     pub session_id: String,
     #[serde(default)]
@@ -344,6 +345,14 @@ pub fn error_code(error: &str) -> Option<&'static str> {
         None
     }
 }
+
+/// What a Codex thread that keeps no local transcript hears when its MCP server asks to be a session.
+pub const NO_TRANSCRIPT: &str =
+    "This Codex thread keeps no transcript on this computer, so it isn't a session on Reason Network";
+
+/// The daemon's line `{"event": "forget", "key": ...}`: the MCP server stops re-registering session `key` when it
+/// reconnects. Not an [`Event`]: an MCP server of an earlier release reads it as one it doesn't know, and ignores it.
+pub const FORGET: &str = "forget";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
