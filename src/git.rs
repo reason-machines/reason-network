@@ -36,7 +36,13 @@ pub fn repo_slug(url: &str) -> Option<String> {
     let url = url.strip_suffix(".git").unwrap_or(url);
     let mut parts = url.rsplit(['/', ':']).filter(|p| !p.is_empty());
     let name = parts.next()?;
-    match parts.next() {
+    // Azure DevOps HTTPS remotes put `_git` between the project and the repository
+    // (`.../acme/_git/api`); the project is the owner, as in its SSH remote (`v3/org/acme/api`).
+    let owner = match parts.next() {
+        Some("_git") => parts.next(),
+        owner => owner,
+    };
+    match owner {
         Some(owner) if !owner.contains('@') && !owner.contains('.') => Some(format!("{owner}/{name}")),
         _ => Some(name.to_string()),
     }
@@ -54,5 +60,14 @@ mod tests {
         assert_eq!(repo_slug("ssh://git@host:22/acme/api.git").as_deref(), Some("acme/api"));
         assert_eq!(repo_slug("/srv/git/api.git").as_deref(), Some("git/api"));
         assert_eq!(repo_slug("git@host.com:api.git").as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn azure_devops_https_is_named_for_its_project() {
+        // The SSH remote of the same repository, for comparison.
+        assert_eq!(repo_slug("git@ssh.dev.azure.com:v3/org/acme/api").as_deref(), Some("acme/api"));
+        assert_eq!(repo_slug("https://dev.azure.com/org/acme/_git/api").as_deref(), Some("acme/api"));
+        assert_eq!(repo_slug("https://org@dev.azure.com/org/acme/_git/api").as_deref(), Some("acme/api"));
+        assert_eq!(repo_slug("https://org.visualstudio.com/acme/_git/api").as_deref(), Some("acme/api"));
     }
 }
