@@ -1,4 +1,5 @@
-//! Native contracts: antigravity.google/docs/{hooks,mcp,sidecars}. PostTool cannot inject messages.
+//! Native contracts: antigravity.google/docs/{hooks,mcp,sidecars}. PostTool cannot inject messages. Hooks run with
+//! `sh -c` on Unix and `cmd /c` on Windows.
 use super::*;
 
 fn config_dir() -> PathBuf {
@@ -34,7 +35,7 @@ pub(super) fn apply(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report
     } else {
         let enabled =
             definitions.get(AGENT_NAME).and_then(|value| value.get("enabled")).cloned().unwrap_or(json!(true));
-        let handler = |event| json!({"type":"command","command":shell_cmd(exe,&format!("hook antigravity {event}")),"timeout":15});
+        let handler = |event| json!({"type":"command","command":cmd_shell_cmd(exe,&format!("hook antigravity {event}")),"timeout":15});
         definitions.insert(
             AGENT_NAME.into(),
             json!({
