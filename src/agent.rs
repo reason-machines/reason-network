@@ -127,7 +127,7 @@ pub fn meta_session_id(meta: &serde_json::Map<String, Value>) -> Option<String> 
 }
 
 /// Finds an executable on `PATH` or in the usual install places (a launchd/systemd daemon has a bare `PATH`). On
-/// Windows that is `<name>.exe`, or the `<name>.cmd` npm installs.
+/// Windows that is `<name>.exe`, the `<name>.cmd` npm installs, or a `<name>.bat` (Antigravity's `agentapi`).
 pub fn find_bin(name: &str) -> Option<PathBuf> {
     if let Some(p) = crate::paths::env_var_os(&format!("{}_BIN", name.to_uppercase())) {
         let p = PathBuf::from(p);
@@ -139,7 +139,7 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
 
 /// [`find_bin`] with `PATH` and the home folder given: the folders on `path`, then [`install_dirs`] under `home`.
 fn find_in(name: &str, path: &std::ffi::OsStr, home: &Path) -> Option<PathBuf> {
-    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
     std::env::split_paths(path)
         .chain(install_dirs(home, cfg!(windows)))
         .flat_map(|d| exts.iter().map(move |ext| d.join(format!("{name}{ext}"))))
@@ -173,7 +173,8 @@ fn install_dirs(home: &Path, windows: bool) -> Vec<PathBuf> {
 
 /// How to run `name`, for the caller to add its arguments to. On Windows the `<name>.cmd` npm (or pnpm) installs runs
 /// through cmd.exe, which can't be handed an argument with a line break (Rust refuses one rather than let cmd.exe cut it
-/// short), and a message has them: its Node script is run with node instead, when the shim names one.
+/// short), and a message has them: its Node script is run with node instead, when the shim names one, and a shim that
+/// only hands its arguments to an exe (Antigravity's `agentapi.bat`) runs that exe.
 pub fn command_for(name: &str) -> Option<std::process::Command> {
     find_bin(name).map(|bin| command_at(&bin))
 }
@@ -181,13 +182,20 @@ pub fn command_for(name: &str) -> Option<std::process::Command> {
 /// [`command_for`] for the program at `bin`.
 pub fn command_at(bin: &Path) -> std::process::Command {
     #[cfg(windows)]
-    if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
+    if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
         && let Some(dir) = bin.parent()
-        && let Some((node, script)) = std::fs::read_to_string(bin).ok().and_then(|shim| node_shim(&shim, dir))
+        && let Ok(shim) = std::fs::read_to_string(bin)
     {
-        let mut command = std::process::Command::new(node);
-        command.args(script);
-        return command;
+        if let Some((node, script)) = node_shim(&shim, dir) {
+            let mut command = std::process::Command::new(node);
+            command.args(script);
+            return command;
+        }
+        if let Some((exe, args)) = exe_shim(&shim, dir) {
+            let mut command = std::process::Command::new(exe);
+            command.args(args);
+            return command;
+        }
     }
     std::process::Command::new(bin)
 }
@@ -229,6 +237,48 @@ fn node_shim(shim: &str, dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     let beside = dir.join("node.exe");
     let node = if beside.is_file() { beside } else { find_bin("node")? };
     Some((node, vec![script]))
+}
+
+/// The exe and leading arguments a `.bat` or `.cmd` shim in `dir` hands its own arguments to, as Antigravity's
+/// `agentapi.bat` does (`"C:\\…\\language_server.exe" agentapi %*`). Only when that one line is all it does, after an
+/// optional `@echo off`: an exe given by its full path or `%~dp0`, plain or quoted arguments, and `%*` last.
+#[cfg(any(windows, test))]
+fn exe_shim(shim: &str, dir: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let mut lines = shim.lines().map(str::trim).filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("@echo off"));
+    let line = lines.next()?.trim_start_matches('@');
+    if lines.next().is_some() {
+        return None;
+    }
+    let mut rest = line.strip_suffix("%*").filter(|r| r.ends_with([' ', '\t']))?;
+    let mut words = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        // A shim that has cmd.exe do more than pass text on (expand a variable; unquoted, start a second command or
+        // redirect) is left to cmd.exe. `%~dp0` is read only in the exe's path.
+        let (word, after, special) = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split_once('"').map(|(word, after)| (word, after, &['%'][..]))?,
+            None => {
+                let (word, after) = rest.split_at(rest.find([' ', '\t']).unwrap_or(rest.len()));
+                (word, after, &['"', '%', '&', '|', '<', '>', '^', '(', ')'][..])
+            }
+        };
+        let text = if words.is_empty() { word.strip_prefix("%~dp0\\").unwrap_or(word) } else { word };
+        if text.contains(special) || !after.is_empty() && !after.starts_with([' ', '\t']) {
+            return None;
+        }
+        words.push(word);
+        rest = after;
+    }
+    let (exe, args) = words.split_first()?;
+    let exe = match exe.strip_prefix("%~dp0\\") {
+        Some(rel) => rel.split(['\\', '/']).fold(dir.to_path_buf(), |p, c| p.join(c)),
+        None => Some(PathBuf::from(exe)).filter(|p| p.is_absolute())?,
+    };
+    let is_exe = exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    (is_exe && exe.is_file()).then(|| (exe, args.iter().map(|a| a.to_string()).collect()))
 }
 
 #[cfg(unix)]
@@ -680,6 +730,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn a_shim_that_only_passes_its_arguments_to_an_exe_is_run_as_that_exe() {
+        let d = std::env::temp_dir().join(format!("reason-network-exe-shim-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = d.join("language_server.exe");
+        std::fs::write(&exe, "").unwrap();
+        // What Antigravity puts in ~/.gemini/antigravity/bin as agentapi.bat (#229).
+        let agentapi = format!("@echo off\r\n\"{}\" agentapi %*\r\n", exe.display());
+        assert_eq!(exe_shim(&agentapi, &d), Some((exe.clone(), vec!["agentapi".to_string()])));
+        let beside = "@\"%~dp0\\language_server.exe\" agentapi \"two words\" %*";
+        assert_eq!(exe_shim(beside, &d), Some((exe.clone(), vec!["agentapi".to_string(), "two words".to_string()])));
+        // Anything that needs cmd.exe for more than passing the arguments on is left to run as it is.
+        let quoted = format!("\"{}\"", exe.display());
+        for shim in [
+            format!("{quoted} agentapi\r\n"),
+            format!("{quoted} \"%*\"\r\n"),
+            format!("{quoted} %LOCALAPPDATA% %*\r\n"),
+            format!("{quoted} a & b %*\r\n"),
+            format!("{quoted} a\"b\" %*\r\n"),
+            format!("@echo off\r\nset X=1\r\n{quoted} agentapi %*\r\n"),
+            format!("{quoted} agentapi %*\r\n{quoted} again %*\r\n"),
+            format!("\"{}\" agentapi %*\r\n", d.join("gone.exe").display()),
+            format!("\"{}\" agentapi %*\r\n", d.display()),
+            "\"language_server.exe\" agentapi %*\r\n".to_string(),
+            "\"%~dp0\\node_modules\\x\\bin\\x.js\" %*\r\n".to_string(),
+        ] {
+            assert_eq!(exe_shim(&shim, &d), None, "{shim}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A Windows daemon the Reason app's CLI started has only System32 on its `PATH`; it still finds the Reason CLI
     /// where the CLI's installer puts it, so it can keep `reason network __relay` (Reason's hosted tools) running.
     #[test]
@@ -701,6 +782,20 @@ mod tests {
         let system32 = std::ffi::OsString::from(r"C:\Windows\System32");
         assert_eq!(find_in("reason", &system32, &home), Some(bin.join("reason.exe")));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Antigravity on Windows ships `agentapi.bat`, not an `.exe` or `.cmd`: the sidecar must still find it (#229).
+    #[cfg(windows)]
+    #[test]
+    fn a_bat_on_path_is_found_on_windows() {
+        let d = std::env::temp_dir().join(format!("reason-network-find-bat-{}", ulid::Ulid::generate()));
+        let bin = d.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("agentapi.bat"), b"").unwrap();
+        assert_eq!(find_in("agentapi", bin.as_os_str(), &d.join("home")), Some(bin.join("agentapi.bat")));
+        std::fs::write(bin.join("agentapi.exe"), b"").unwrap();
+        assert_eq!(find_in("agentapi", bin.as_os_str(), &d.join("home")), Some(bin.join("agentapi.exe")));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -739,6 +834,35 @@ mod tests {
         assert!(status.success());
         let got: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(got, ["queue", "--message", text]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same through a `.bat` that hands its arguments to an exe, as Antigravity's `agentapi.bat` does (#229).
+    #[cfg(windows)]
+    #[test]
+    fn a_message_with_line_breaks_reaches_the_exe_a_bat_shim_runs() {
+        let Some(node) = find_bin("node") else {
+            assert!(std::env::var_os("CI").is_none(), "CI must run this with node installed");
+            return;
+        };
+        let d = std::env::temp_dir().join(format!("reason-network-bat-run-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&d).unwrap();
+        let out = d.join("args.json");
+        let script = d.join("x.js");
+        std::fs::write(
+            &script,
+            format!("require('fs').writeFileSync({:?}, JSON.stringify(process.argv.slice(2)))", out.to_str().unwrap()),
+        )
+        .unwrap();
+        let shim = format!("@echo off\r\n\"{}\" \"{}\" %*\r\n", node.display(), script.display());
+        std::fs::write(d.join("agentapi.bat"), shim).unwrap();
+        let mut command = command_at(&d.join("agentapi.bat"));
+        assert_eq!(command.get_program(), node.as_os_str());
+        let text = "<reason-message from=\"a\">\r\nline & two %PATH% ^ | < > \"quoted\"\n</reason-message>";
+        let status = command.args(["send-message", "c1", text]).status().unwrap();
+        assert!(status.success());
+        let got: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(got, ["send-message", "c1", text]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
