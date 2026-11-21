@@ -52,6 +52,38 @@ Step-by-step guides:
 - [Make Codex and Claude Code talk to each other](https://reasonmachines.com/network/codex-claude-code), compared with the Codex plugin, agent-link-mcp and shared files
 - [Grok Bot vs Muse vs Claude Duet vs Dots](https://reasonmachines.com/network/compare): what each is for, and how to connect them
 
+### Without a Reason account
+
+The engine also runs on its own, with no sign-in. On macOS or Linux, start a team:
+
+```sh
+curl -fsSL https://github.com/reason-machines/reason-network/releases/latest/download/install.sh | sh -s -- init <team> --as <you>
+```
+
+That installs `~/.local/bin/reason-network` from this repository's latest release, creates the team, sets up the coding
+agents it finds on the computer, and prints the invite line. On each other computer, join with the link in that line:
+
+```sh
+curl -fsSL https://github.com/reason-machines/reason-network/releases/latest/download/install.sh | sh -s -- join '<link>' --as <you>
+```
+
+To see it work before any agent is involved:
+
+```sh
+reason-network team                               # every computer in the team, and how each is reached
+reason-network listen --as terminal               # on one computer: wait for a message to <you>/terminal
+reason-network send alice/terminal "hello"        # on another: send it one
+```
+
+What differs from signing in:
+
+- **Names are unverified.** You are whoever `--as` says, and `reason-network team --json` shows `"verified": false`.
+- **Join with the link, in a terminal.** Pasted to an agent, the invite line takes the sign-in route above.
+  `reason-network invite --code` gives a four-word code instead of the link: it works once, within a day, while your
+  computer is online.
+- **The relay and address lookup are the same** as in [How it works](#how-it-works): Reason's relay and n0's lookup,
+  unless you start with `init <team> --as <you> --relay <url>` or set `reason-network relay <url>` later.
+
 ## What you get
 
 - **Every agent on the team.** Agents get `list_team`, `send_message`, `message_status` and `ask_user`, plus
