@@ -271,8 +271,27 @@ impl Daemon {
             log(&warning);
         }
         let mut daemon = Self::with(cfg, Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
+        if let Some(note) = daemon.unused_machine_name() {
+            log(&note);
+        }
         daemon.usage = crate::usage::Usage::open(paths::home().join("usage.sqlite"));
         Ok(daemon)
+    }
+
+    /// What the log says when the config file names this machine and its team calls it something else: in a team the
+    /// roster's name stands (see `with`), so the setting does nothing until this machine leaves and joins again.
+    fn unused_machine_name(&self) -> Option<String> {
+        let set = self.cfg.machine.as_deref().map(util::slug).filter(|n| !n.is_empty())?;
+        let inner = self.inner.lock().unwrap();
+        let member = inner.team.as_ref()?.member(&self.key.public())?;
+        (member.machine != set).then(|| {
+            format!(
+                "`machine` in config.toml ({set}) is not used: this machine is in a team as {}, and a team's name for a \
+                 machine stands. To change it, run `{} leave` and join again",
+                member.machine,
+                crate::CLI
+            )
+        })
     }
 
     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
@@ -283,7 +302,7 @@ impl Daemon {
         Ok(Daemon {
             usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
-            machine: member.map_or_else(util::hostname, |m| m.machine),
+            machine: member.map_or_else(|| util::hostname(cfg.machine.as_deref()), |m| m.machine),
             key,
             cfg,
             inner: Mutex::new(Inner {
@@ -576,6 +595,50 @@ fn test_daemon(cfg: Config) -> Daemon {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A daemon whose stored team has this machine in it as `machine`.
+    fn in_team_as(machine: &str, cfg: Config) -> Daemon {
+        let key = SecretKey::generate();
+        let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
+        let store = Store::open(std::path::Path::new(":memory:"), inbox).unwrap();
+        let team = TeamState::found("acme", "alex", machine, &key);
+        store.set("team", &serde_json::to_string(&team).unwrap()).unwrap();
+        Daemon::with(cfg, store, key).unwrap()
+    }
+
+    fn named(machine: &str) -> Config {
+        Config { machine: Some(machine.into()), ..Config::default() }
+    }
+
+    /// `util::hostname` owns the order and has its own test; this is that the daemon hands it the config's name.
+    #[test]
+    fn outside_a_team_the_machine_name_is_the_configs() {
+        let d = test_daemon(named("Studio Box"));
+        assert_eq!(d.machine, util::hostname(Some("Studio Box")));
+        // With `REASON_NETWORK_MACHINE` set where the tests run, that name wins over both.
+        if paths::env_var("MACHINE").is_err() {
+            assert_eq!(d.machine, "studio-box");
+        }
+    }
+
+    #[test]
+    fn in_a_team_the_rosters_machine_name_stands_whatever_the_config_says() {
+        assert_eq!(in_team_as("mbp", named("studio")).machine, "mbp");
+        assert_eq!(in_team_as("mbp", Config::default()).machine, "mbp");
+    }
+
+    #[test]
+    fn a_config_machine_name_the_team_overrides_is_noted_and_only_then() {
+        let note = in_team_as("mbp", named("Studio Box")).unused_machine_name().expect("a name the team overrides");
+        assert!(note.contains("(studio-box)") && note.contains("as mbp") && !note.contains('\n'), "{note}");
+        // The same name (as it would be taken: slugged), no name, or no team: nothing to say.
+        assert_eq!(in_team_as("mbp", named("MBP")).unused_machine_name(), None);
+        assert_eq!(in_team_as("mbp", named("!!!")).unused_machine_name(), None);
+        assert_eq!(in_team_as("mbp", Config::default()).unused_machine_name(), None);
+        assert_eq!(test_daemon(named("studio")).unused_machine_name(), None);
+    }
+
     #[test]
     fn a_request_this_daemon_cant_read_is_answered_under_its_id() {
         let line = r#"{"id":42,"op":"something_newer","key":"x"}"#;

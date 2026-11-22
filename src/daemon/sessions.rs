@@ -129,7 +129,10 @@ impl Daemon {
                 l.attached = true;
                 l.mcp_push = reg.tier == Tier::Push;
             }
-            l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+            // A hosted assistant the relay carries stays `pull`, whatever tier it is registered with again.
+            if !l.relayed() {
+                l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+            }
             l.attached |= l.reg.tier == Tier::Push;
             if l.last_hook.is_none() {
                 l.reg.cwd = reg.cwd;
@@ -573,7 +576,8 @@ impl Daemon {
         }
         l.through_reason = through_reason;
         l.last_hook = Some(now);
-        l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
+        // These hooks are the relay's, not the assistant's: they don't make it any faster to reach.
+        l.reg.tier = if l.relayed() { Tier::Pull } else { l.reg.tier.min(self.hook_tier(agent, l.push_failed)) };
         if pid.is_some() {
             l.reg.pid = pid;
         }
@@ -777,6 +781,15 @@ impl Live {
     /// Whether `name` reaches this session: its name, or the default one it went by before its title named it.
     pub(super) fn goes_by(&self, name: &str) -> bool {
         self.name == name || self.former.as_deref() == Some(name)
+    }
+
+    /// A hosted assistant the Reason CLI's relay carries (an app connected through Reason), as its hooks say
+    /// ([`HookCall::through_reason`]). The relay's `check_inbox` waits on it only hand its mail to Reason's inbox,
+    /// where the assistant sees it at its next `check_inbox` (or when its wake webhook starts it). Never one of the
+    /// person's own Reason sessions: those carry the same flag from their registration (see `register_quiet`), but
+    /// their mail is sent into them with `reason session send`.
+    pub(super) fn relayed(&self) -> bool {
+        self.through_reason == Some(true) && self.reg.agent != "reason"
     }
 }
 
@@ -1585,6 +1598,37 @@ mod tests {
         let id = key.strip_prefix("gemini:").map(str::to_string);
         let reg = SessionReg { agent_session_id: id, pid: Some(pid), ..named(key, "gemini", None) };
         d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap();
+    }
+
+    /// A hook the Reason CLI's relay sends for a hosted assistant it carries (an app connected through Reason).
+    fn relay_hook(id: &str, event: &str) -> HookCall {
+        HookCall { through_reason: Some(true), agent: "grok".into(), ..gemini(id, event) }
+    }
+
+    #[tokio::test]
+    async fn an_app_connected_through_reason_stays_pull_across_its_relays_hooks() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let tier = |key: &str| d.inner.lock().unwrap().live[key].reg.tier;
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            d.hook(relay_hook("app", event)).await.unwrap();
+            assert_eq!(tier("grok:app"), Tier::Pull, "{event}");
+            // The same agent running here, whose hooks are its own: they show it its mail at its turns.
+            d.hook(HookCall { through_reason: Some(false), ..relay_hook("own", event) }).await.unwrap();
+            assert_eq!(tier("grok:own"), Tier::Turn, "{event}");
+        }
+        // Only reporting what it is doing says nothing of how it is reached, either way.
+        d.hook(HookCall { doing: Some("reading mail".into()), ..relay_hook("app", "doing") }).await.unwrap();
+        assert_eq!(tier("grok:app"), Tier::Pull);
+        // Registered again as faster to reach: still pull, where a session of its own would be raised.
+        for (id, raised) in [("app", Tier::Pull), ("own", Tier::Push)] {
+            let key = format!("grok:{id}");
+            let again = SessionReg { tier: Tier::Push, agent_session_id: Some(id.into()), ..named(&key, "grok", None) };
+            d.register_quiet(Some(conn_of(&key)), again, GitInfo::default()).unwrap();
+            assert_eq!(tier(&key), raised, "{id}");
+        }
+        // And across the relay's hooks after that.
+        d.hook(relay_hook("app", "stop")).await.unwrap();
+        assert_eq!(tier("grok:app"), Tier::Pull);
     }
 
     fn live_sessions(d: &Daemon) -> Vec<(String, String, Tier)> {

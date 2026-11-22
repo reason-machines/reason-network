@@ -15,7 +15,7 @@ use crate::{
     team::Signed,
     util,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
     sync::Arc,
@@ -165,6 +165,38 @@ fn handoff_command(
     command
 }
 
+/// What goes to an agent's CLI in one command: the ids of the messages it carries, and their text.
+type Handoff = (Vec<String>, String);
+
+/// The most text one command to an agent's CLI carries, in bytes. It is one command-line argument, and Windows takes
+/// about 32,000 characters for a whole command line, half as many where the text is full of quotes (each needs a
+/// backslash).
+const HANDOFF_MAX: usize = if cfg!(windows) { 15_000 } else { 100_000 };
+
+const TOO_LONG_NOTE: &str = "queued: too long to hand to the session in one go; it is there when the session checks \
+                             its inbox";
+
+/// `msgs` as the texts that go to an agent's CLI (`agent` is its name), in order, as many messages in each as fit in
+/// `max` bytes. A message too long to go alone is left out: its hooks or its inbox show it.
+fn handoffs(msgs: &[Message], agent: &str, max: usize) -> Vec<Handoff> {
+    let text = |msgs: &[Message]| render::for_agent(msgs, Some(agent), false);
+    let carried = |msgs: &[Message]| -> Handoff { (msgs.iter().map(|m| m.id.clone()).collect(), text(msgs)) };
+    let mut out = Vec::new();
+    let mut next: Vec<Message> = Vec::new();
+    for m in msgs.iter().filter(|m| text(std::slice::from_ref(m)).len() <= max) {
+        next.push(m.clone());
+        if next.len() > 1 && text(&next).len() > max {
+            let last = next.pop();
+            out.push(carried(&next));
+            next = last.into_iter().collect();
+        }
+    }
+    if !next.is_empty() {
+        out.push(carried(&next));
+    }
+    out
+}
+
 /// A message to send to a teammate's machine now: where its result goes, the machine, its name, whether it is
 /// connected, and the message.
 type RemoteJob = (usize, EndpointId, String, bool, Message);
@@ -172,8 +204,23 @@ type RemoteJob = (usize, EndpointId, String, bool, Message);
 const UPGRADE: &str =
     "update Reason Network (with the Reason CLI, `reason update`): messages go between agent sessions now";
 
+/// The note for mail to a hosted assistant reached through Reason, as Reason's own `send_message` words it.
+const THROUGH_REASON: &str = "queued: this agent is connected through Reason and only sees it the next time it calls \
+                              check_inbox (or its wake webhook starts it); it hasn't read it yet";
+
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
+
+/// What a failure of this machine's own store or disk is marked with while it takes a teammate's message: not the
+/// message's fault, so the sender is asked to try again (see [`Daemon::receive_readdressed`]), not told it was refused.
+#[derive(Debug)]
+struct Unavailable;
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("couldn't store the message")
+    }
+}
 
 /// `codex queue`'s arguments for `thread`, up to its message flag. With `resume`, `--resume`: once the message is
 /// queued, Codex loads that same thread again if it isn't loaded (`thread/resume`, a no-op for a loaded one), so mail
@@ -623,6 +670,11 @@ impl Daemon {
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
         }
+        // The waits on it are the relay's, which only hand the mail to Reason's inbox for the assistant. Only the
+        // relay's sessions (see `Live::relayed`): a Reason session's mail still goes out below.
+        if l.relayed() {
+            return ("queued".into(), THROUGH_REASON.into());
+        }
         if g.polling.get(key).is_some_and(|n| *n > 0) {
             return ("delivered".into(), "delivered: the session was waiting for messages".into());
         }
@@ -684,10 +736,15 @@ impl Daemon {
                 ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
             }
             Channel::Command(bin, args, codex_home) => {
-                for id in &ids {
+                // One command line carries only so much: a long batch goes in several commands, in order.
+                let batches = handoffs(&msgs, bin, HANDOFF_MAX);
+                if batches.is_empty() {
+                    return ("queued".into(), TOO_LONG_NOTE.into());
+                }
+                for id in batches.iter().flat_map(|(ids, _)| ids) {
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
-                self.send_with(bin, args, codex_home, key.to_string(), ids, text, false);
+                self.send_with(bin, args, codex_home, key.to_string(), batches, false);
                 (
                     "pushed".into(),
                     format!(
@@ -747,26 +804,30 @@ impl Daemon {
             kept.extend(new);
             kept
         };
-        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
-        for id in &ids {
+        // One command line carries only so much: a long batch goes in several commands, in order.
+        let batches = handoffs(&msgs, &r.agent, HANDOFF_MAX);
+        if batches.is_empty() {
+            return ("queued".into(), offline_note(Some(r), now));
+        }
+        for id in batches.iter().flat_map(|(ids, _)| ids) {
             g.in_flight.insert(id.clone(), Instant::now());
         }
-        let text = render::for_agent(&msgs, Some(&r.agent), false);
         let (retrying, unresumed) = (g.codex_retry.contains_key(&r.key), g.codex_unresumed.contains_key(&r.key));
         *g.codex_handing.entry(r.key.clone()).or_default() += 1;
-        self.send_with("codex", codex_queue(&thread, true), codex_home, r.key.clone(), ids, text, true);
+        self.send_with("codex", codex_queue(&thread, true), codex_home, r.key.clone(), batches, true);
         let seen = util::ago(r.last_seen, now);
         let then = if retrying {
-            "Codex could not be reached to load it last time, so the mail is kept here and tried again until it can \
-             be (or the thread's hooks show it if the person opens it first)"
+            "whether the person archived it could not be told in time last time, so the mail is kept here and tried \
+             again (or the thread's hooks show it if the person opens it first)"
         } else if unresumed {
             "Codex took earlier mail but could not load it again, so it is asked to load that same thread again until \
              it can (or the mail waits in the thread for the person to open it)"
         } else {
-            "Codex is asked to load that same thread again, which starts a turn with it (unless the person archived it: \
-             then when they open it)"
+            "Codex is asked to load that same thread again, which starts a turn with it; with no app-server to load \
+             it (Codex Desktop), it starts when they open it. If the person archived it, it waits here until they \
+             unarchive it"
         };
-        ("pushed".into(), format!("queued into the Codex thread, which is offline (last seen {seen} ago): {then}"))
+        ("pushed".into(), format!("for the Codex thread, which is offline (last seen {seen} ago): {then}"))
     }
 
     /// Codex runs no Stop hook when a turn is interrupted or fails: until the turn `key` is in ends, checks its
@@ -881,9 +942,10 @@ impl Daemon {
         }
     }
 
-    /// Hands `text` to the agent's own CLI (`args` end with its message flag), against `codex_home` if set. With
-    /// `offline`, wake mail for a thread that isn't loaded: only handed to Codex when Codex can load the thread
-    /// again, else kept here and tried again (see [`Self::keep_for_codex`]).
+    /// Hands `batches` one after another to the agent's own CLI (`args` end with its message flag), against `codex_home`
+    /// if set. When one fails, the rest are given up with it: see `handed`. With `offline`, wake mail for a thread
+    /// that isn't loaded: what to ask of Codex is decided once for the thread, before the first command (see the
+    /// comments below), and `--resume` goes only with the last command, so Codex loads the thread once, with all of it.
     #[allow(clippy::too_many_arguments)]
     fn send_with(
         self: &Arc<Self>,
@@ -891,18 +953,17 @@ impl Daemon {
         args: Vec<String>,
         codex_home: Option<String>,
         key: String,
-        ids: Vec<String>,
-        text: String,
+        batches: Vec<Handoff>,
         offline: bool,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            let run = |args: Vec<String>| {
-                let (this, text, codex_home) = (&this, &text, &codex_home);
+            let run = |args: Vec<String>, text: String| {
+                let (this, codex_home) = (&this, &codex_home);
                 async move {
                     let program =
                         this.agent_bin(bin).map(|b| agent::command_at(&b)).ok_or_else(|| format!("{bin} not found"))?;
-                    let out = handoff_command(program, &args, text, codex_home.as_deref()).output();
+                    let out = handoff_command(program, &args, &text, codex_home.as_deref()).output();
                     match tokio::time::timeout(Duration::from_secs(30), out).await {
                         Ok(Ok(o)) if o.status.success() => Ok(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                         Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
@@ -918,17 +979,31 @@ impl Daemon {
             }
             if args.iter().any(|a| a == RESUME) {
                 let home = codex_home.as_deref();
-                // A thread the person archived is only queued into, for when they open it: never brought back. One
-                // offline whose app-server isn't there, or not known in time to be unarchived, isn't handed to Codex
-                // yet: it would hold the mail with no turn to start, and Codex can't be asked to load it later
-                // without queueing it again.
+                // One offline whose home has no app-server on its control socket (Codex Desktop runs its own over
+                // stdio, so there this is the usual case): Codex holds the mail and starts a turn with it when the
+                // person opens the thread, as before `--resume`. One offline not known in time to be unarchived isn't
+                // handed to Codex yet: it is kept here and tried again.
                 let keep = match archived_target(&args, home, ARCHIVE_LOOKUP).await {
-                    Some(true) => {
+                    Some(false) if !offline || this.codex_app_server_up(home).await => None,
+                    // Codex refuses to queue into an archived thread ("session ... is archived"), and the person chose
+                    // to put it away: nothing is run, and the mail waits here, unread, for the thread's hooks once they
+                    // unarchive and use it. Not a failure: no warning, no retry, and later mail isn't held back.
+                    Some(true) if offline => {
+                        let ids: Vec<String> = batches.into_iter().flat_map(|(ids, _)| ids).collect();
+                        let mut g = this.inner.lock().unwrap();
+                        for id in &ids {
+                            g.in_flight.remove(id);
+                        }
+                        g.codex_retry.remove(&key);
+                        g.handed_off(&key);
+                        drop(g);
+                        this.arrived.notify_waiters();
+                        return;
+                    }
+                    Some(_) => {
                         args.retain(|a| a != RESUME);
                         None
                     }
-                    Some(false) if !offline || this.codex_app_server_up(home).await => None,
-                    Some(false) => Some("no Codex app-server answers on its home's control socket"),
                     None if offline => Some("whether the person archived it was not known in time"),
                     // Loaded already: it takes the mail either way; just never brought back unsure.
                     None => {
@@ -937,6 +1012,7 @@ impl Daemon {
                     }
                 };
                 if let Some(why) = keep {
+                    let ids: Vec<String> = batches.into_iter().flat_map(|(ids, _)| ids).collect();
                     this.keep_for_codex(&key, &ids, why);
                     if offline {
                         this.inner.lock().unwrap().handed_off(&key);
@@ -944,18 +1020,31 @@ impl Daemon {
                     return;
                 }
             }
-            let mut res = run(args.clone()).await;
-            if let Err(why) = &res
-                && refused_resume(&args, why)
-            {
-                res = run(args.iter().filter(|a| *a != RESUME).cloned().collect()).await;
+            // `--resume` only with the last command: Codex loads the thread once, with all of the mail queued.
+            let plain: Vec<String> = args.iter().filter(|a| *a != RESUME).cloned().collect();
+            let last = batches.len().saturating_sub(1);
+            let mut rest = batches.into_iter().enumerate();
+            while let Some((i, (ids, text))) = rest.next() {
+                let args = if i == last { args.clone() } else { plain.clone() };
+                let mut res = run(args.clone(), text.clone()).await;
+                if let Err(why) = &res
+                    && refused_resume(&args, why)
+                {
+                    res = run(plain.clone(), text).await;
+                }
+                if res.is_err() {
+                    // Once, with all that is left: `handed` backs off a Reason session each time it is told of a failure.
+                    let left: Vec<String> = ids.into_iter().chain(rest.flat_map(|(_, (ids, _))| ids)).collect();
+                    this.handed(bin, &key, &left, res.map(drop), None);
+                    break;
+                }
+                // Queued, but not loaded again: the mail is Codex's, not to be queued twice; it says so from now on.
+                let unresumed = match &res {
+                    Ok(warn) if warn.contains(NOT_RESUMED) => Some(warn.clone()),
+                    _ => None,
+                };
+                this.handed(bin, &key, &ids, res.map(drop), unresumed);
             }
-            // Queued, but not loaded again: the mail is Codex's, not to be queued twice; it says so from now on.
-            let unresumed = match &res {
-                Ok(warn) if warn.contains(NOT_RESUMED) => Some(warn.clone()),
-                _ => None,
-            };
-            this.handed(bin, &key, &ids, res.map(drop), unresumed);
             // Only now: had the thread reached Codex, `handed` has recorded that it still has to be loaded.
             if offline {
                 this.inner.lock().unwrap().handed_off(&key);
@@ -1116,9 +1205,9 @@ impl Daemon {
         let res = match archived_target(&codex_queue(&thread, false), home.as_deref(), ARCHIVE_LOOKUP).await {
             Some(true) => None,
             None => Some(Err("whether the person archived it was not known in time".to_string())),
-            Some(false) if !self.codex_app_server_up(home.as_deref()).await => {
-                Some(Err("no Codex app-server answers on its home's control socket".to_string()))
-            }
+            // No app-server on its home's control socket (Codex Desktop has none): nothing can load it, and asking
+            // again would never end; the mail waits in the thread for the person to open it.
+            Some(false) if !self.codex_app_server_up(home.as_deref()).await => None,
             Some(false) => Some(self.codex_resume(&thread, home.as_deref()).await),
         };
         let mut g = self.inner.lock().unwrap();
@@ -1126,7 +1215,7 @@ impl Daemon {
             return;
         }
         match res {
-            // Archived meanwhile: its mail waits in the thread for when the person opens it.
+            // Archived meanwhile, or nothing to load it: its mail waits in the thread for when the person opens it.
             None => g.resumed(key),
             Some(Ok(_)) => {
                 g.resumed(key);
@@ -1174,7 +1263,7 @@ impl Daemon {
                 ));
             }
             self.schedule_resume(&mut g, key);
-        } else if res.is_ok() {
+        } else if res.is_ok() && g.codex_unresumed.contains_key(key) {
             g.resumed(key);
         }
         if bin == "codex" && res.is_ok() {
@@ -1237,7 +1326,14 @@ impl Daemon {
         msg: Message,
     ) -> Result<(String, String, Option<String>)> {
         let mut to = None;
-        let (state, note) = self.receive_to(peer, msg, &mut to)?;
+        let (state, note) = match self.receive_to(peer, msg, &mut to) {
+            // Its own store or disk failed (full, locked, gone): the sender keeps the message for another try.
+            Err(e) if e.is::<Unavailable>() => {
+                log(&format!("couldn't take a message from {}: {e:#}", peer.fmt_short()));
+                ("retry".into(), format!("queued: {} can't store it right now; retrying later", self.machine))
+            }
+            taken => taken?,
+        };
         Ok((state, note, to))
     }
 
@@ -1295,7 +1391,7 @@ impl Daemon {
             let mut g = self.inner.lock().unwrap();
             self.prune(&mut g);
             // Sent again (word that it was taken got lost on the way): where it went then, not where its name leads now.
-            if let Some(had) = g.store.message(&msg.id)? {
+            if let Some(had) = g.store.message(&msg.id).context(Unavailable)? {
                 if render::without_machine(&had.from) == msg.from && had.to != asked {
                     *to = Some(had.to);
                 }
@@ -1310,7 +1406,7 @@ impl Daemon {
                 }
                 _ => name,
             };
-            let remembered = if key.is_none() { g.store.session_by_name(&name)? } else { None };
+            let remembered = if key.is_none() { g.store.session_by_name(&name).context(Unavailable)? } else { None };
             // To the default name an offline session went by before its title named it: at its name now.
             let name = match remembered.as_ref() {
                 Some(r) if r.name != name => {
@@ -1332,7 +1428,8 @@ impl Daemon {
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
             let bytes = files::size(&msg.files);
             if bytes > 0 {
-                let (kept, from_sender) = (g.store.files_kept()?, g.store.files_kept_from(&sender)?);
+                let kept = g.store.files_kept().context(Unavailable)?;
+                let from_sender = g.store.files_kept_from(&sender).context(Unavailable)?;
                 if let Err(why) = g.quota.admit(&sender, bytes, kept, from_sender, Instant::now()) {
                     return Ok((
                         "retry".into(),
@@ -1355,9 +1452,9 @@ impl Daemon {
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
             // Held for a session whose name is kept, it is that session's: it goes when the session does.
-            let kept = held && g.store.session_by_name(name)?.is_some_and(|r| r.kept());
+            let kept = held && g.store.session_by_name(name).context(Unavailable)?.is_some_and(|r| r.kept());
             // Counted once, when it is new here; a held one once approved.
-            if g.store.insert(&mut msg, held)? && !held {
+            if g.store.insert(&mut msg, held).context(Unavailable)? && !held {
                 self.record_remote_received(&msg);
                 let _ = g.store.count(util::now_ms(), Counted::Received);
             }
@@ -1892,6 +1989,27 @@ mod tests {
         assert!(!refused_resume(&codex_queue("t1", false), clap));
     }
 
+    #[test]
+    fn a_handoff_is_cut_into_texts_that_each_fit_and_leaves_out_a_message_that_cant() {
+        let msg = |body: usize| from_bob("alex/api", "x".repeat(body), Vec::new());
+        let (a, b, huge, c, d) = (msg(400), msg(400), msg(5000), msg(400), msg(400));
+        let text = |msgs: &[&Message]| {
+            render::for_agent(&msgs.iter().map(|m| (*m).clone()).collect::<Vec<_>>(), Some("codex"), false)
+        };
+        // Room for two of them, not three.
+        let max = text(&[&a, &b]).len();
+        let all = [a.clone(), b.clone(), huge.clone(), c.clone(), d.clone()];
+        let got = handoffs(&all, "codex", max);
+        let ids = |msgs: &[&Message]| msgs.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        assert_eq!(got.iter().map(|(ids, _)| ids.clone()).collect::<Vec<_>>(), [ids(&[&a, &b]), ids(&[&c, &d])]);
+        assert!(got.iter().all(|(_, t)| t.len() <= max));
+        assert_eq!(got[0].1, text(&[&a, &b]));
+        assert_eq!(got[1].1, text(&[&c, &d]));
+        // All in one when it fits, and nothing to hand over when no message does.
+        assert_eq!(handoffs(&all[..2], "codex", 1 << 20).len(), 1);
+        assert!(handoffs(&[huge], "codex", max).is_empty());
+    }
+
     #[tokio::test]
     async fn an_offline_codex_thread_seen_within_a_day_takes_wake_mail_through_codex_queue_in_its_home() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
@@ -2034,6 +2152,139 @@ mod tests {
         assert!(!failed());
     }
 
+    /// A hook the Reason CLI's relay sends for a hosted assistant it carries (an app connected through Reason), or,
+    /// with `through_reason` false, one of the same agent running here.
+    fn app_hook(id: &str, event: &str, through_reason: bool) -> HookCall {
+        HookCall { through_reason: Some(through_reason), agent: "grok".into(), ..codex_hook(id, event, None) }
+    }
+
+    #[tokio::test]
+    async fn wake_mail_to_an_app_connected_through_reason_is_queued_while_the_relay_waits_and_reaches_that_wait() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        // The relay's session for the app, and the same agent in a session of its own: each waits in `check_inbox`.
+        for (id, through_reason) in [("app", true), ("own", false)] {
+            let to = d.hook(app_hook(id, "start", through_reason)).await.unwrap().address.unwrap();
+            let key = format!("grok:{id}");
+            let waiting = tokio::spawn({
+                let (d, key) = (d.clone(), key.clone());
+                async move { d.inbox(key, 5, false).await.unwrap() }
+            });
+            for _ in 0..500 {
+                if d.inner.lock().unwrap().polling.get(&key).is_some_and(|n| *n > 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let res = d.send("codex:s".into(), &to, "are you there?", None, true, false, None, Vec::new());
+            let sent = res.await.unwrap().recipients.remove(0);
+            if through_reason {
+                // The wait is the relay's: the app hasn't seen it, and its sender is told so.
+                assert_eq!((sent.state.as_str(), sent.note.as_str()), ("queued", THROUGH_REASON), "{id}");
+            } else {
+                assert_eq!(sent.state, "delivered", "{id}: {}", sent.note);
+            }
+            // Either way the wait gets it, at once: the relay hands it on to Reason's inbox for the app.
+            let t0 = std::time::Instant::now();
+            let got: Vec<String> = waiting.await.unwrap().messages.into_iter().map(|m| m.body).collect();
+            assert_eq!(got, ["are you there?"], "{id}");
+            assert!(t0.elapsed() < Duration::from_secs(2), "{id}");
+            assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty(), "{id}");
+            // Between the relay's waits too, and after its later hooks: queued for its next `check_inbox`.
+            d.hook(app_hook(id, "stop", through_reason)).await.unwrap();
+            let res = d.send("codex:s".into(), &to, "and now?", None, true, false, None, Vec::new());
+            let later = res.await.unwrap().recipients.remove(0);
+            assert_eq!(later.state, "queued", "{id}: {}", later.note);
+            assert_eq!(later.note == THROUGH_REASON, through_reason, "{id}: {}", later.note);
+            assert_eq!(d.inbox(key, 0, false).await.unwrap().messages.len(), 1, "{id}");
+            // FYI mail reads as it does for any session.
+            let res = d.send("codex:s".into(), &to, "fyi", None, false, false, None, Vec::new());
+            let fyi = res.await.unwrap().recipients.remove(0);
+            assert!(fyi.state == "queued" && fyi.note.starts_with("queued as FYI"), "{id}: {}", fyi.note);
+        }
+    }
+
+    /// A fake `reason` for `d` to run: it records each command's arguments in a file of its own in the folder returned.
+    #[cfg(unix)]
+    fn fake_reason(d: &Daemon) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-fake-reason-{}", Ulid::generate()));
+        let log = dir.join("commands");
+        std::fs::create_dir_all(&log).unwrap();
+        let bin = dir.join("reason");
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}/'$$\n", log.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d.fake_bins.lock().unwrap().insert("reason", bin);
+        log
+    }
+
+    /// The `reason session send` commands the fake recorded in `log`, once every one started has finished.
+    #[cfg(unix)]
+    async fn reason_sent(d: &Daemon, log: &std::path::Path) -> Vec<String> {
+        for _ in 0..1000 {
+            if d.inner.lock().unwrap().in_flight.is_empty() {
+                return std::fs::read_dir(log)
+                    .unwrap()
+                    .map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap())
+                    .collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("reason session send never finished");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wake_mail_to_a_reason_session_is_still_sent_into_it() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let log = fake_reason(&d);
+        d.register(Some(1), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        // As the sync with `reason session list` registers one: without a connection, to push into.
+        let reg = SessionReg {
+            agent: "reason".into(),
+            agent_session_id: Some("r1".into()),
+            tier: Tier::Push,
+            cwd: "~".into(),
+            ..codex("reason:r1")
+        };
+        let to = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
+        // It carries the flag an app connected through Reason has, and is not one.
+        {
+            let mut g = d.inner.lock().unwrap();
+            let l = g.live.get_mut("reason:r1").unwrap();
+            assert_eq!(l.through_reason, Some(true));
+            // Seen in that list just now, which keeps it.
+            l.last_hook = Some(util::now_ms());
+        }
+        let res = d.send("codex:s".into(), &to, "review this", None, true, false, None, Vec::new());
+        let sent = res.await.unwrap().recipients.remove(0);
+        assert!(sent.state == "pushed" && sent.note.starts_with("queued into the Reason session"), "{}", sent.note);
+        let commands = reason_sent(&d, &log).await;
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].starts_with("session send r1 --message "), "{commands:?}");
+        assert!(commands[0].contains("review this"), "{commands:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // Mail a failed push left behind goes out the same way, when its sync sends it again.
+        let wait = Duration::from_secs(60);
+        d.inner.lock().unwrap().live.get_mut("reason:r1").unwrap().retry = Some((Instant::now() + wait, wait));
+        let res = d.send("codex:s".into(), &to, "left behind", None, true, false, None, Vec::new());
+        let held = res.await.unwrap().recipients.remove(0);
+        assert!(held.state == "queued" && held.note.starts_with("queued: Reason didn't take"), "{}", held.note);
+        let state = {
+            let mut g = d.inner.lock().unwrap();
+            g.live.get_mut("reason:r1").unwrap().retry = None;
+            let waiting = g.pending(&to).unwrap();
+            assert_eq!(waiting.len(), 1);
+            d.deliver(&mut g, "reason:r1", waiting, true).0
+        };
+        assert_eq!(state, "pushed");
+        let commands = reason_sent(&d, &log).await;
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands.iter().any(|c| c.contains("left behind")), "{commands:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
     /// A fake `codex` for `d` to run: it records each command, as `CODEX_HOME|arguments`, in a file of its own in the
     /// folder returned, and fails if `fails`, as `codex queue` does when it can't reach an app-server.
     #[cfg(unix)]
@@ -2127,19 +2378,33 @@ mod tests {
         let unloaded = send(names[0].clone()).await;
         assert_eq!(unloaded.state, "pushed");
         assert!(
-            unloaded.note.contains("Codex is asked to load that same thread again, which starts a turn with it"),
+            unloaded.note.contains("Codex is asked to load that same thread again, which starts a turn with it;"),
             "{}",
             unloaded.note
         );
         let archived = send(names[1].clone()).await;
         assert_eq!(archived.state, "pushed");
-        assert!(archived.note.contains("unless the person archived it"), "{}", archived.note);
+        assert!(archived.note.contains("If the person archived it, it waits here"), "{}", archived.note);
         assert_eq!(codex_queued(&d, &log, "t1").await.len(), 1);
         let commands = codex_commands(&log);
         let ran = |args: &str| commands.iter().filter(|c| c.contains(&format!("|queue {args} --message "))).count();
         // The same thread, by its id: loaded again by Codex, never a new chat.
         assert_eq!((ran("--thread t1 --resume"), ran("--thread t1")), (1, 0), "{commands:?}");
-        assert_eq!((ran("--thread t2 --resume"), ran("--thread t2")), (0, 1), "{commands:?}");
+        // Archived: Codex refuses to queue into it, so nothing is run; the mail waits here, unread, for its hooks.
+        for _ in 0..400 {
+            if d.inner.lock().unwrap().codex_handing.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let commands = codex_commands(&log);
+        assert_eq!((ran("--thread t2 --resume"), ran("--thread t2")), (0, 0), "{commands:?}");
+        assert!(commands.iter().all(|c| !c.contains("--thread t2 ")), "{commands:?}");
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread(&d.addr(&names[1])).unwrap().len(), 1);
+            assert!(!g.codex_retry.contains_key("codex:t2") && !g.codex_failed.contains("codex:t2"));
+        }
         assert!(commands.iter().all(|c| c.starts_with(&format!("{home_s}|"))), "{commands:?}");
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
@@ -2354,12 +2619,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
-    /// Review of #218 (P1): with no Codex app-server to load the thread, `codex queue --resume` would queue the mail
-    /// into Codex with no turn to start, and nothing could ask Codex to load it later without queueing it again. The
-    /// mail is kept here, unread, and offered to Codex again once an app-server answers: queued once, into that thread.
+    /// Review of #218 (no-socket handoff): with no Codex app-server on the home's control socket (Codex Desktop runs
+    /// its own over stdio, so there this is the usual case), wake mail goes to `codex queue` without `--resume`, as
+    /// before #218: Codex holds it and starts a turn when the person opens the thread. Read once handed over, never
+    /// queued twice, never kept here, and nothing asks Codex to load the thread later.
     #[cfg(unix)]
     #[tokio::test]
-    async fn wake_mail_waits_here_until_a_codex_app_server_can_load_the_thread_then_goes_once() {
+    async fn with_no_codex_app_server_wake_mail_is_queued_into_the_thread_once_without_resume() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         let log = fake_codex(&d, false);
         *d.fake_codex_app_server.lock().unwrap() = Some(false);
@@ -2374,52 +2640,63 @@ mod tests {
                 res.await.unwrap().recipients.remove(0)
             }
         };
-        assert_eq!(send("first").await.state, "pushed");
-        for _ in 0..200 {
-            if d.inner.lock().unwrap().codex_retry.contains_key("codex:t1") {
-                break;
+        let unread = || d.inner.lock().unwrap().store.unread(&to).unwrap().len();
+        let settled = || async {
+            for _ in 0..400 {
+                if unread() == 0 && d.inner.lock().unwrap().codex_handing.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let first = send("first").await;
+        assert_eq!(first.state, "pushed");
+        assert!(first.note.contains("it starts when they open it"), "{}", first.note);
+        settled().await;
+        assert_eq!(unread(), 0);
+        let commands = codex_commands(&log);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].contains("|queue --thread t1 --message "), "{commands:?}");
+        {
+            let g = d.inner.lock().unwrap();
+            assert!(g.codex_retry.is_empty() && g.codex_unresumed.is_empty());
         }
-        // Not handed to Codex: unread here, not in flight, and tried again.
-        assert!(codex_commands(&log).is_empty());
-        assert!(d.inner.lock().unwrap().codex_retry.contains_key("codex:t1"));
-        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
-        // The next sender hears the truth.
-        let second = send("second").await;
-        assert!(second.note.contains("kept here and tried again"), "{}", second.note);
-        // Retries keep it here while no app-server answers; once one does, both go to Codex, once, by the thread's id.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(codex_commands(&log).is_empty());
-        *d.fake_codex_app_server.lock().unwrap() = Some(true);
-        // Mail sent now goes straight through, and takes what was kept with it.
-        send("third").await;
+        // Later mail goes the same way, alone: what Codex took is not queued again.
+        send("second").await;
+        settled().await;
+        let queued = codex_queued(&d, &log, "t1").await;
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued.iter().filter(|q| q.contains("first")).count(), 1, "{queued:?}");
+        assert!(codex_commands(&log).iter().all(|c| !c.contains(RESUME)));
+        // A thread left still to be loaded (by an earlier `codex queue --resume`) is let go once no app-server can
+        // load it: it waits in the thread, and Codex is not asked again and again.
+        {
+            let mut g = d.inner.lock().unwrap();
+            g.unresumed("codex:t1");
+            d.schedule_resume(&mut g, "codex:t1");
+        }
         for _ in 0..400 {
-            if d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty() {
+            if !d.inner.lock().unwrap().codex_unresumed.contains_key("codex:t1") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let queued = codex_queued(&d, &log, "t1").await;
-        assert_eq!(queued.len(), 1, "{queued:?}");
-        assert!(["first", "second", "third"].iter().all(|m| queued[0].contains(m)), "{queued:?}");
-        assert!(codex_commands(&log)[0].contains("|queue --thread t1 --resume --message "));
-        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
-        assert!(!d.inner.lock().unwrap().codex_retry.contains_key("codex:t1"));
+        assert!(!d.inner.lock().unwrap().codex_unresumed.contains_key("codex:t1"));
+        assert_eq!(d.fake_codex_resume.lock().unwrap().0, 0);
         // Nothing left to try: no more `codex queue`.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(codex_commands(&log).len(), 1);
+        assert_eq!(codex_commands(&log).len(), 2);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
     /// Review of #218 (P2): which mail is kept is in the store, the retry schedule only in memory. After a daemon
-    /// restart, mail kept before it goes with the next wake mail, oldest first, and is offered to Codex again by itself.
+    /// restart, wake mail still unread here (kept by an earlier build of this change, say) goes with the next wake mail,
+    /// oldest first, and is offered to Codex again by itself, with an app-server or without one.
     #[cfg(unix)]
     #[tokio::test]
     async fn wake_mail_kept_before_a_daemon_restart_still_reaches_the_codex_thread() {
         let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
         let log = fake_codex(&d, false);
-        *d.fake_codex_app_server.lock().unwrap() = Some(false);
         d.register(Some(1), gemini("gemini:1"), crate::git::GitInfo::default()).unwrap();
         d.hook(codex_hook("t1", "start", None)).await.unwrap();
         let name = gone(&d, "codex:t1", HOUR);
@@ -2432,22 +2709,14 @@ mod tests {
             }
         };
         let kept = || d.inner.lock().unwrap().codex_retry.contains_key("codex:t1");
-        let restart = || {
-            let mut g = d.inner.lock().unwrap();
-            g.codex_retry.clear();
-            g.in_flight.clear();
+        let keep = |text: &str| {
+            let mut m = from_bob(&to, text.to_string(), Vec::new());
+            m.wake = true;
+            d.inner.lock().unwrap().store.insert(&mut m, false).unwrap();
         };
         let unread = || d.inner.lock().unwrap().store.unread(&to).unwrap().len();
-        send("before the restart").await;
-        for _ in 0..200 {
-            if kept() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(kept() && unread() == 1 && codex_commands(&log).is_empty());
-        // Restarted, with an app-server now: the next wake mail takes the kept one along, first.
-        restart();
+        keep("before the restart");
+        // With an app-server: the next wake mail takes the kept one along, first.
         *d.fake_codex_app_server.lock().unwrap() = Some(true);
         send("after it").await;
         let queued = codex_queued(&d, &log, "t1").await;
@@ -2455,17 +2724,10 @@ mod tests {
         let (a, b) = (queued[0].find("before the restart").unwrap(), queued[0].find("after it").unwrap());
         assert!(a < b, "{queued:?}");
         assert_eq!(unread(), 0);
-        // Kept again, restarted, and nothing new is sent: the restarted daemon offers it to Codex by itself.
+        // Kept again, and nothing new is sent, with no app-server: the restarted daemon offers it to Codex by itself,
+        // without `--resume`.
+        keep("kept again");
         *d.fake_codex_app_server.lock().unwrap() = Some(false);
-        send("kept again").await;
-        for _ in 0..200 {
-            if kept() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        restart();
-        *d.fake_codex_app_server.lock().unwrap() = Some(true);
         d.retry_kept_codex_mail();
         for _ in 0..400 {
             if unread() == 0 {
@@ -2478,6 +2740,8 @@ mod tests {
         // The fake logs one file per call, named by its pid: read_dir order says nothing about which came first.
         let again: Vec<&String> = queued.iter().filter(|q| q.contains("kept again")).collect();
         assert!(again.len() == 1 && !again[0].contains("after it"), "{queued:?}");
+        let commands = codex_commands(&log);
+        assert_eq!(commands.iter().filter(|c| c.contains("|queue --thread t1 --message ")).count(), 1, "{commands:?}");
         assert!(!kept());
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
@@ -2569,7 +2833,7 @@ mod tests {
         let received = d.receive(bob.public(), msg).unwrap();
         for (state, note) in [(sent.state, sent.note), received] {
             assert_eq!(state, "pushed");
-            assert!(note.starts_with("queued into the Codex thread, which is offline (last seen 1h ago)"), "{note}");
+            assert!(note.starts_with("for the Codex thread, which is offline (last seen 1h ago)"), "{note}");
         }
         let queued = codex_queued(&d, &log, "t1").await;
         assert_eq!(queued.len(), 2, "{queued:?}");
@@ -2580,6 +2844,52 @@ mod tests {
         // Taken: read, and the turn it starts doesn't show it again.
         assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
         assert_eq!(d.hook(codex_hook("t1", "start", Some("/work/.codex-b"))).await.unwrap().text, None);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mail_too_long_for_one_codex_queue_command_goes_in_several_or_waits_for_the_hooks() {
+        let (d, _, _) = with_teammate();
+        let log = fake_codex(&d, false);
+        *d.fake_codex_app_server.lock().unwrap() = Some(true);
+        d.hook(codex_hook("t1", "start", None)).await.unwrap();
+        let name = gone(&d, "codex:t1", HOUR);
+        let to = d.addr(&name);
+        let wake = |body: String| {
+            let mut m = from_bob(&to, body, Vec::new());
+            m.wake = true;
+            m
+        };
+        let hand = |msgs: Vec<Message>| {
+            let mut g = d.inner.lock().unwrap();
+            let r = g.store.session_by_name(&name).unwrap().unwrap();
+            for m in &msgs {
+                g.store.insert(&mut m.clone(), false).unwrap();
+            }
+            d.deliver_offline(&mut g, Some(&r), msgs, true)
+        };
+        // Four messages that fit a command each, not two together, and that no command line takes all at once: four
+        // commands, a message in each, and all taken.
+        let each = HANDOFF_MAX * 6 / 10;
+        let digits = ["1", "2", "3", "4"];
+        let (state, _) = hand(digits.iter().map(|digit| wake(digit.repeat(each))).collect());
+        assert_eq!(state, "pushed");
+        let queued = codex_queued(&d, &log, "t1").await;
+        assert_eq!(queued.len(), 4, "{:?}", queued.iter().map(String::len).collect::<Vec<_>>());
+        assert!(queued.iter().all(|q| q.len() <= "default|".len() + HANDOFF_MAX));
+        for digit in digits {
+            assert_eq!(queued.iter().filter(|q| q.contains(&digit.repeat(each))).count(), 1);
+        }
+        // Decided once for the thread: only one of them asks Codex to load it (the last, once all are queued).
+        let commands = codex_commands(&log);
+        assert_eq!(commands.iter().filter(|c| c.contains(" --resume ")).count(), 1, "{commands:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // One too long for any command: nothing runs for it, and it waits, unread, for the hooks of the turn.
+        let (state, note) = hand(vec![wake("5".repeat(HANDOFF_MAX + 1))]);
+        assert!(state == "queued" && note.starts_with("queued: last seen 1h ago"), "{state}: {note}");
+        assert_eq!(codex_queued(&d, &log, "t1").await.len(), 4);
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
@@ -2647,7 +2957,7 @@ mod tests {
         // Offline again: its next wake mail goes through `codex queue` again, which takes it once.
         gone(&d, "codex:t1", HOUR);
         let later = send("once it is gone again").await;
-        assert!(later.state == "pushed" && later.note.starts_with("queued into the Codex thread"), "{}", later.note);
+        assert!(later.state == "pushed" && later.note.starts_with("for the Codex thread"), "{}", later.note);
         let queued = codex_queued(&d, &working, "t1").await;
         assert_eq!(queued.len(), 2, "{queued:?}");
         assert_eq!(queued.iter().filter(|q| q.contains("once it is gone again")).count(), 1, "{queued:?}");
@@ -3224,5 +3534,39 @@ mod tests {
         assert_eq!(state, "queued");
         let got = d.inner.lock().unwrap().store.unread(&to).unwrap();
         assert_eq!((got.len(), got[0].body.len(), got[0].files.len()), (1, MAX_BODY, MAX_FILES));
+    }
+
+    #[test]
+    fn a_message_this_machine_cant_store_is_asked_again_not_refused() {
+        let (d, db, home) = disk_daemon();
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        let unread = || d.inner.lock().unwrap().store.unread(&to).unwrap().len();
+
+        // A file where the inbox folder should be, as a full or a locked disk would leave it: the files can't be saved.
+        std::fs::write(home.join("inbox"), "").unwrap();
+        let file = Attachment { name: "a.md".into(), content: "x".into(), path: None };
+        let msg = from_bob(&to, "the logs".into(), vec![file]);
+        let (state, note) = d.receive(bob.public(), msg.clone()).unwrap();
+        assert_eq!(state, "retry", "{note}");
+        assert!(note.contains("retrying later"), "{note}");
+        assert_eq!(unread(), 0);
+        // The sender's machine keeps it and sends it again, as it does at its next flush: taken once the disk works.
+        std::fs::remove_file(home.join("inbox")).unwrap();
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "queued");
+        assert_eq!(unread(), 1);
+
+        // The same when the database fails, whatever the message carries.
+        db.execute_batch("ALTER TABLE messages RENAME TO messages_away").unwrap();
+        let text = from_bob(&to, "the logs, again".into(), Vec::new());
+        assert_eq!(d.receive(bob.public(), text.clone()).unwrap().0, "retry");
+        db.execute_batch("ALTER TABLE messages_away RENAME TO messages").unwrap();
+        assert_eq!(d.receive(bob.public(), text).unwrap().0, "queued");
+        assert_eq!(unread(), 2);
+        drop(db);
+        let _ = std::fs::remove_dir_all(home);
     }
 }

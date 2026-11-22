@@ -4,9 +4,11 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Short machine name: `Sams-MacBook-Pro.local` -> `sams-macbook-pro`. `REASON_NETWORK_MACHINE` overrides it.
-pub fn hostname() -> String {
-    if let Some(name) = crate::paths::env_var("MACHINE").ok().map(|n| slug(&n)).filter(|n| !n.is_empty()) {
+/// Short machine name: `Sams-MacBook-Pro.local` -> `sams-macbook-pro`. `REASON_NETWORK_MACHINE` overrides it, then
+/// `configured` (the config file's `machine`).
+pub fn hostname(configured: Option<&str>) -> String {
+    let given = crate::paths::env_var("MACHINE").ok().map(|n| slug(&n)).filter(|n| !n.is_empty());
+    if let Some(name) = given.or_else(|| configured.map(slug).filter(|n| !n.is_empty())) {
         return name;
     }
     let raw = system_hostname();
@@ -334,6 +336,53 @@ mod tests {
         let end = setup[start..].find("\n#[cfg(windows)]\nasync fn service(").unwrap() + start;
         out.push((root.join("setup.rs"), setup[start..end].to_string()));
         out
+    }
+
+    /// The machine's name comes from the environment, so each case runs this test again in a process of its own with
+    /// the environment it needs (`RN_TEST_MACHINE_NAME_CASE` says which): setting a variable here would race the other
+    /// tests.
+    #[test]
+    fn the_machine_name_is_the_env_variable_then_the_config_key_then_the_host_name() {
+        const CASE: &str = "RN_TEST_MACHINE_NAME_CASE";
+        let host = || {
+            let s = slug(system_hostname().split('.').next().unwrap_or_default());
+            if s.is_empty() { "machine".to_string() } else { s }
+        };
+        match std::env::var(CASE).ok().as_deref() {
+            Some("env") => {
+                assert_eq!(hostname(Some("From Config")), "from-env");
+                assert_eq!(hostname(None), "from-env");
+            }
+            // A name that slugs to nothing is no name: the next one in the order is taken.
+            Some("empty-env") => assert_eq!(hostname(Some("From Config")), "from-config"),
+            Some("none") => {
+                assert_eq!(hostname(Some("From Config")), "from-config");
+                assert_ne!(host(), "from-config");
+                assert_eq!(hostname(None), host());
+                assert_eq!(hostname(Some("!!!")), host());
+            }
+            Some(other) => panic!("unknown case {other}"),
+            None => {
+                for (case, env) in [("env", Some("From Env")), ("empty-env", Some("!!!")), ("none", None)] {
+                    let mut again = std::process::Command::new(std::env::current_exe().unwrap());
+                    again.args([
+                        "--exact",
+                        "util::tests::the_machine_name_is_the_env_variable_then_the_config_key_then_the_host_name",
+                        "--nocapture",
+                    ]);
+                    again.env(CASE, case).env_remove(format!("{}_MACHINE", crate::LEGACY_NAME.to_uppercase()));
+                    match env {
+                        Some(name) => again.env("REASON_NETWORK_MACHINE", name),
+                        None => again.env_remove("REASON_NETWORK_MACHINE"),
+                    };
+                    let out = again.output().unwrap();
+                    let said =
+                        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                    assert!(out.status.success(), "case {case}: {said}");
+                    assert!(said.contains("1 passed"), "case {case} ran no test: {said}");
+                }
+            }
+        }
     }
 
     #[test]
