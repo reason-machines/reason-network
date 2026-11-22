@@ -487,6 +487,10 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 Ok(())
             };
             let explicit = from.is_some();
+            // `--from <you>/terminal`, as the group-send hint above says: the terminal is a session once registered.
+            if from.as_deref().is_some_and(|f| f == "terminal" || f == "cli:terminal" || f.ends_with("/terminal")) {
+                cli_session(&link, "terminal", "stop").await?;
+            }
             let r: SendResult = match from.or_else(current_session) {
                 Some(f) => match link.call(send(f)).await {
                     Err(e) if !explicit && e.to_string().contains("isn't registered") => {
