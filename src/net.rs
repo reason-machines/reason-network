@@ -140,6 +140,9 @@ struct Link {
     since: Instant,
 }
 
+/// Who waits for the verdict on a message sent: by the machine it went to and its id.
+type AckWaiters = HashMap<(EndpointId, String), oneshot::Sender<(String, String)>>;
+
 pub struct Net {
     endpoint: Endpoint,
     /// Where teammates are dialed: the team's own relay (nothing looks them up on n0's DNS then), or the default ones.
@@ -156,7 +159,7 @@ pub struct Net {
     daemon: Weak<Daemon>,
     links: Mutex<HashMap<EndpointId, Link>>,
     remote: Mutex<HashMap<EndpointId, Remote>>,
-    acks: Mutex<HashMap<String, oneshot::Sender<(String, String)>>>,
+    acks: Mutex<AckWaiters>,
     dialing: Mutex<HashSet<EndpointId>>,
     wake: Notify,
     /// A local session came or went: announce it now, not at the next tick.
@@ -933,15 +936,17 @@ impl Net {
     pub async fn send_msg(&self, target: &EndpointId, msg: &Message) -> Option<(String, String)> {
         let tx = self.links.lock().unwrap().get(target).map(|l| l.tx.clone())?;
         let (otx, orx) = oneshot::channel();
-        self.acks.lock().unwrap().insert(msg.id.clone(), otx);
+        // By machine as well as id: the same message can go to several machines at once (a notify to your own user).
+        let key = (*target, msg.id.clone());
+        self.acks.lock().unwrap().insert(key.clone(), otx);
         if tx.send(Wire::Msg { msg: msg.clone() }).is_err() {
-            self.acks.lock().unwrap().remove(&msg.id);
+            self.acks.lock().unwrap().remove(&key);
             return None;
         }
         match tokio::time::timeout(ACK_TIMEOUT, orx).await {
             Ok(Ok(verdict)) => Some(verdict),
             _ => {
-                self.acks.lock().unwrap().remove(&msg.id);
+                self.acks.lock().unwrap().remove(&key);
                 None
             }
         }
@@ -1152,7 +1157,7 @@ impl Net {
             }
             Wire::Ack { id, state, note, to } => {
                 daemon.acked(&peer, &id, &state, to);
-                if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
+                if let Some(waiter) = self.acks.lock().unwrap().remove(&(peer, id)) {
                     let _ = waiter.send((state, note));
                 }
             }
@@ -1575,5 +1580,100 @@ mod tests {
         // Kept names are names like any other a teammate's machine sends.
         let p = tidy_presence(Presence { kept: vec!["<API Claude>".into(), "!!".into()], ..Default::default() });
         assert_eq!(p.kept, ["api-claude"]);
+    }
+
+    fn notify_message() -> Message {
+        Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "alex/api-codex".into(),
+            from_agent: None,
+            from_repo: None,
+            to: "alex".into(),
+            via: None,
+            reply_to: None,
+            body: "need you".into(),
+            wake: false,
+            notify: true,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        }
+    }
+
+    /// `send` with notify to your own user hands one Message (one id) to each of your other online machines at once
+    /// (mail.rs, the `own` branch). Each machine answers; each send should get its answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_message_id_sent_to_two_machines_at_once_gets_both_answers() {
+        let relay = Some("https://relay.example.com");
+        let bound = bind(SecretKey::generate(), relay, false, None).await.unwrap();
+        let a = bound.endpoint.clone();
+        let net = Arc::new(Net {
+            endpoint: a.clone(),
+            relays: Vec::new(),
+            proxy: None,
+            at: None,
+            udp: bound.udp,
+            router: Mutex::new(None),
+            invites: Default::default(),
+            me: a.id(),
+            daemon: std::sync::Weak::new(),
+            links: Default::default(),
+            remote: Default::default(),
+            acks: Default::default(),
+            dialing: Default::default(),
+            wake: Notify::new(),
+            changed: Notify::new(),
+            next_link: AtomicU64::new(1),
+        });
+        let mut peers = Vec::new();
+        let mut keep = Vec::new();
+        for _ in 0..2 {
+            let e = bind(SecretKey::generate(), relay, false, None).await.unwrap().endpoint;
+            e.set_alpns(vec![ALPN.to_vec()]);
+            let port = e.bound_sockets().iter().find(|s| s.is_ipv4()).unwrap().port();
+            let addr = EndpointAddr::new(e.id()).with_ip_addr((Ipv4Addr::LOCALHOST, port).into());
+            let accept = {
+                let e = e.clone();
+                tokio::spawn(async move { e.accept().await.unwrap().await.unwrap() })
+            };
+            let conn = a.connect(addr, ALPN).await.unwrap();
+            keep.push((e.clone(), accept.await.unwrap()));
+            let (tx, rx) = mpsc::unbounded_channel::<Wire>();
+            net.links.lock().unwrap().insert(
+                e.id(),
+                Link {
+                    id: net.next_link.fetch_add(1, Ordering::Relaxed),
+                    tx,
+                    conn,
+                    dialer: a.id(),
+                    since: Instant::now(),
+                },
+            );
+            peers.push((e.id(), rx));
+        }
+        let msg = notify_message();
+        let sends: Vec<_> = peers
+            .iter()
+            .map(|(id, _)| {
+                let (net, id, msg) = (net.clone(), *id, msg.clone());
+                tokio::spawn(async move { net.send_msg(&id, &msg).await })
+            })
+            .collect();
+        // Both machines get the message, and each answers as `on_wire` passes an Ack to its waiter.
+        for (_, rx) in &mut peers {
+            assert!(matches!(rx.recv().await, Some(Wire::Msg { .. })));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for (peer, _) in &peers {
+            // As `on_wire` does with each machine's Ack.
+            if let Some(waiter) = net.acks.lock().unwrap().remove(&(*peer, msg.id.clone())) {
+                let _ = waiter.send(("notified".into(), "popped up".into()));
+            }
+        }
+        let mut got = Vec::new();
+        for s in sends {
+            got.push(s.await.unwrap());
+        }
+        assert!(got.iter().all(|v| v.is_some()), "answers seen: {got:?}");
     }
 }
