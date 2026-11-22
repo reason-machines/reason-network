@@ -85,8 +85,17 @@ pub async fn run(service: bool) -> Result<()> {
         tokio::spawn(daemon.clone().update_loop());
     }
     loop {
-        let stream = listener.accept().await?;
-        tokio::spawn(daemon.clone().serve(stream));
+        match listener.accept().await {
+            Ok(stream) => {
+                tokio::spawn(daemon.clone().serve(stream));
+            }
+            // Out of file handles, say: that client is turned away, but the daemon (and every live session, wait and
+            // handoff it holds) carries on.
+            Err(e) => {
+                log(&format!("a local connection couldn't be accepted: {e}"));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
     }
 }
 
