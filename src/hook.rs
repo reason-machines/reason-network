@@ -140,8 +140,9 @@ async fn handle(
     Some((format_for(agent, event, ev, &text), key, ids))
 }
 
-/// What Antigravity injects: a step its model would otherwise take as its user's, so mail says whose it is.
-fn antigravity_text(key: &str, mail: bool, text: &str) -> String {
+/// What Antigravity injects: a step its model would otherwise take as typed in the conversation, so mail says where it
+/// came from.
+pub fn antigravity_text(key: &str, mail: bool, text: &str) -> String {
     let note = if mail { format!("{}\n", crate::antigravity::TEAMMATE_NOTE) } else { String::new() };
     format!(
         "{note}{text}\nFor Reason Network tools, pass session_id: {}. This identifies this conversation even when other chats use the same project.",
@@ -275,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_mail_says_it_is_not_from_the_user_and_its_own_notice_does_not() {
+    fn antigravity_mail_says_where_it_came_from_and_its_own_notice_does_not() {
         let mail = antigravity_text("antigravity:c1", true, "hello");
         assert!(mail.starts_with(crate::antigravity::TEAMMATE_NOTE), "{mail}");
         assert!(mail.contains("hello") && mail.contains("session_id: c1"), "{mail}");

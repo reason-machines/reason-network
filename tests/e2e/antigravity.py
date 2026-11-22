@@ -6,7 +6,7 @@ import json, os, pathlib, select, socket, subprocess, tempfile, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / 'target/debug/reason-network'
-NOTE = 'Reason Network: the message below came over the team network'
+NOTE = "Reason Network: the messages below came over the team network, not typed in this conversation. Each one's From line says who sent it.\n"
 
 def main():
     with tempfile.TemporaryDirectory(prefix='rn-antigravity-', dir='/tmp') as directory:
@@ -75,6 +75,12 @@ def main():
             assert continued['reason'].startswith(NOTE),continued
             assert receipt(ids)[0]['stage']=='handed_to_agent'
             print('PASS Stop continues with mail on a normal finish and holds it on any other')
+            # The person's own word is mail too (a late ask_user answer comes the same way): the note mustn't deny it.
+            cli('send',recipient,'Go ahead, drop it')
+            own=json.loads(hooks(first,'user-prompt-submit'))['injectSteps'][0]['userMessage']
+            assert own.startswith(NOTE+'<reason-message from="alice/terminal"') and 'From alice, typed in a terminal.' in own,own
+            assert not any(ruling in NOTE.lower() for ruling in ['your user','instruction','approval']),NOTE
+            print("PASS the person's own terminal message keeps its From line under a note that doesn't rule on it")
             hooks(second,'user-prompt-submit')
             mcp=subprocess.Popen([str(BIN),'mcp'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(env,REASON_NETWORK_AGENT='antigravity'),cwd=project)
             def rpc(i,method,params):
