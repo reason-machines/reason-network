@@ -335,7 +335,7 @@ impl Daemon {
             .chain(
                 known
                     .iter()
-                    .filter(|r| r.agent != "cli" && self.holds(r, now))
+                    .filter(|r| r.agent != "cli" && self.holds(&g, r, now))
                     .flat_map(|r| std::iter::once(r.name.clone()).chain(offline_formers.get(&r.name).cloned())),
             )
             .collect();
