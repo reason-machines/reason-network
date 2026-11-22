@@ -253,6 +253,34 @@ pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// Writes `content` to `path` whole or not at all: to a file beside it, which is then renamed over it, so a crash or a
+/// full disk can't leave a half-written file where the real one was (`std::fs::write` empties the file first). The
+/// file keeps its permissions, and a symlink is written through, so it stays one. A write that fails leaves `path` as
+/// it was and no temporary file behind.
+pub fn write_atomic(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let linked = path.symlink_metadata().is_ok_and(|m| m.is_symlink());
+    let target =
+        if linked { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
+    let mut name = target.clone().into_os_string();
+    name.push(".tmp-reason");
+    let tmp = std::path::PathBuf::from(name);
+    let written = (|| {
+        let mut file = File::create(&tmp)?;
+        file.write_all(content.as_ref())?;
+        file.sync_all()?;
+        drop(file);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    written
+}
+
 /// Text from a teammate as one printable line: no control characters (escape sequences, newlines), at most `max`
 /// characters.
 pub fn one_line(s: &str, max: usize) -> String {
@@ -310,6 +338,85 @@ impl NoWindow for tokio::process::Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty folder of its own, and the names in it, for the tests of `write_atomic`.
+    fn folder() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("reason-network-write-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_file_is_written_whole_over_the_old_one_with_nothing_left_beside_it() {
+        let dir = folder();
+        let path = dir.join("config.toml");
+        write_atomic(&path, "one\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+        write_atomic(&path, "two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        assert_eq!(names(&dir), ["config.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_what_was_there_and_no_temporary_file() {
+        let dir = folder();
+        let path = dir.join("config.toml");
+        // A folder where the file goes: the new text is written beside it, and can't be renamed over a folder.
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_atomic(&path, "text").is_err());
+        assert!(path.is_dir());
+        assert_eq!(names(&dir), ["config.toml"]);
+        // A file in the way of the temporary one: nothing is written, and the old file is as it was.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::create_dir(dir.join("config.toml.tmp-reason")).unwrap();
+        assert!(write_atomic(&path, "new\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_written_over_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old\n").unwrap();
+        chmod(&path, 0o600).unwrap();
+        write_atomic(&path, "new\n").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_symlink_is_written_through_and_stays_one() {
+        let dir = folder();
+        let (kept, home) = (dir.join("dotfiles"), dir.join("home"));
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let (real, link) = (kept.join("config.toml"), home.join("config.toml"));
+        std::fs::write(&real, "old\n").unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&real, &link);
+        // Where this account may not make a symlink (Windows without developer mode) there is nothing to try.
+        if made.is_ok() {
+            write_atomic(&link, "new\n").unwrap();
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "the link is still a link");
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+            assert_eq!(names(&kept), ["config.toml"]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The files with code the daemon runs, and the setup functions it calls. Tests (a trailing `mod tests`) aside.
     fn daemon_sources() -> Vec<(std::path::PathBuf, String)> {
