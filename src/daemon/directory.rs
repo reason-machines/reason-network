@@ -75,10 +75,24 @@ impl Daemon {
         let claude = self.shared(tokio::task::spawn_blocking(move || claude::scan_in(&dirs)).await?);
         let mut cwds: Vec<String> = self.inner.lock().unwrap().live.values().map(|l| l.reg.cwd.clone()).collect();
         cwds.extend(claude.iter().filter_map(|c| c.cwd.clone()));
+        cwds.sort();
+        cwds.dedup();
+        // All at once: each lookup has a deadline, and one slow folder mustn't add up with the others.
+        let lookups: Vec<_> = cwds
+            .into_iter()
+            .map(|cwd| {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let info = this.git(&cwd).await;
+                    (cwd, info)
+                })
+            })
+            .collect();
         let mut gits: HashMap<String, GitInfo> = HashMap::new();
-        for cwd in cwds {
-            let info = self.git(&cwd).await;
-            gits.insert(cwd, info);
+        for lookup in lookups {
+            if let Ok((cwd, info)) = lookup.await {
+                gits.insert(cwd, info);
+            }
         }
 
         // With Claude Code on Reason Network, every open Claude session is on it: sessions started before Reason Network was set

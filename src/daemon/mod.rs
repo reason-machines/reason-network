@@ -128,7 +128,7 @@ pub struct Daemon {
     inner: Mutex<Inner>,
     /// Woken on every new message, for `Inbox` long-polls.
     arrived: Notify,
-    git_cache: Mutex<HashMap<String, (Instant, GitInfo)>>,
+    git_cache: Mutex<HashMap<String, GitSeen>>,
     net: RwLock<Option<Arc<Net>>>,
     /// Held while the network starts, stops or is swapped, and while an invite is made: one at a time, so two networks
     /// never run on this machine's key, and an invite isn't made on one that is going away.
@@ -526,15 +526,68 @@ impl Daemon {
     }
 
     async fn git(&self, cwd: &str) -> GitInfo {
-        if let Some((at, info)) = self.git_cache.lock().unwrap().get(cwd)
-            && at.elapsed() < GIT_TTL
-        {
-            return info.clone();
+        self.git_from(cwd, git::lookup).await
+    }
+
+    /// The checkout `cwd` is in, by `lookup` (`git::lookup`, or a test's stand-in), asked once per `GIT_TTL` and by
+    /// one caller at a time: the others wait for that answer. When git doesn't answer, the folder keeps what it last did.
+    async fn git_from(&self, cwd: &str, lookup: impl FnOnce(&str) -> Option<GitInfo> + Send + 'static) -> GitInfo {
+        let turn = {
+            let mut cache = self.git_cache.lock().unwrap();
+            let seen = cache.entry(cwd.to_string()).or_default();
+            if let Some(info) = seen.fresh() {
+                return info;
+            }
+            seen.turn.clone()
+        };
+        let turn = turn.lock_owned().await;
+        // Whoever had the turn before this may have just asked.
+        if let Some(info) = self.git_cache.lock().unwrap().get(cwd).and_then(GitSeen::fresh) {
+            return info;
         }
         let dir = cwd.to_string();
-        let info = tokio::task::spawn_blocking(move || git::lookup(&dir)).await.unwrap_or_default();
-        self.git_cache.lock().unwrap().insert(cwd.to_string(), (Instant::now(), info.clone()));
-        info
+        // The turn goes with the lookup and comes back with its answer: it lasts until git is done and what it said is
+        // kept, and not a moment less if this caller is gone by then.
+        let (answer, _turn) = tokio::task::spawn_blocking(move || (lookup(&dir), turn)).await.ok().unzip();
+        let mut cache = self.git_cache.lock().unwrap();
+        let seen = cache.entry(cwd.to_string()).or_default();
+        if seen.took(answer.flatten()) {
+            log(&format!(
+                "git didn't answer in {cwd} within {:?}: it keeps the repo and branch last seen there, if any",
+                git::BUDGET
+            ));
+        }
+        seen.info.clone()
+    }
+}
+
+/// What the daemon knows of one folder's checkout.
+#[derive(Default)]
+struct GitSeen {
+    /// Git's last answer here. A lookup git doesn't answer leaves it, so a session keeps its repo and branch while its
+    /// folder is slow, and a folder that is slow only sometimes doesn't come and go in presence.
+    info: GitInfo,
+    /// When git was last asked here, answered or not: not again within `GIT_TTL`.
+    asked: Option<Instant>,
+    /// Git didn't answer the last time. The log says so once, not at every lookup, until git answers again.
+    silent: bool,
+    /// Held for the length of a lookup: whoever else wants this folder waits for that answer rather than start git too.
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl GitSeen {
+    fn fresh(&self) -> Option<GitInfo> {
+        self.asked.is_some_and(|at| at.elapsed() < GIT_TTL).then(|| self.info.clone())
+    }
+
+    /// Takes what a lookup came back with. True when git has just stopped answering here, which the log should say.
+    fn took(&mut self, answer: Option<GitInfo>) -> bool {
+        self.asked = Some(Instant::now());
+        let was_silent = std::mem::replace(&mut self.silent, answer.is_none());
+        if let Some(info) = answer {
+            self.info = info;
+        }
+        self.silent && !was_silent
     }
 }
 
@@ -557,5 +610,100 @@ mod tests {
         assert!(r.error.unwrap().starts_with("bad request:"));
         let e = serde_json::from_str::<super::Frame<super::Request>>("not json").unwrap_err();
         assert_eq!(super::bad_request("not json", e).id, 0);
+    }
+
+    fn checkout(branch: &str) -> super::GitInfo {
+        super::GitInfo { root: Some("/work/api".into()), repo: Some("acme/api".into()), branch: Some(branch.into()) }
+    }
+
+    #[tokio::test]
+    async fn a_folder_git_stops_answering_in_keeps_its_last_repo_and_branch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        let d = super::test_daemon(crate::config::Config::default());
+        // What git says in `/work/api`, where it is asked again only once `GIT_TTL` has passed.
+        let git = async |answer: Option<super::GitInfo>, ttl_passed: bool| {
+            if ttl_passed {
+                d.git_cache.lock().unwrap().get_mut("/work/api").unwrap().asked = None;
+            }
+            let lookup = move |_: &str| {
+                ASKED.fetch_add(1, Ordering::SeqCst);
+                answer
+            };
+            let info = d.git_from("/work/api", lookup).await;
+            (info.repo, info.branch, ASKED.load(Ordering::SeqCst))
+        };
+        let (acme, main, fix) = (Some("acme/api".to_string()), Some("main".to_string()), Some("fix".to_string()));
+        assert_eq!(git(Some(checkout("main")), false).await, (acme.clone(), main.clone(), 1));
+        assert_eq!(git(Some(checkout("fix")), false).await, (acme.clone(), main.clone(), 1));
+        // Git doesn't answer: the folder keeps what it had, and git isn't asked again within the TTL either.
+        assert_eq!(git(None, true).await, (acme.clone(), main.clone(), 2));
+        assert_eq!(git(Some(checkout("fix")), false).await, (acme.clone(), main.clone(), 2));
+        assert_eq!(git(None, true).await, (acme.clone(), main, 3));
+        // It answers again.
+        assert_eq!(git(Some(checkout("fix")), true).await, (acme, fix, 4));
+        // A folder git never answered in has neither.
+        assert!(d.git_from("/work/web", |_| None).await.repo.is_none());
+    }
+
+    #[test]
+    fn a_folder_git_doesnt_answer_in_is_logged_once_until_it_answers_again() {
+        let mut seen = super::GitSeen::default();
+        assert!(!seen.took(Some(checkout("main"))));
+        assert!(seen.took(None));
+        assert!(!seen.took(None));
+        assert!(!seen.took(None));
+        assert_eq!(seen.info.repo.as_deref(), Some("acme/api"));
+        assert!(!seen.took(Some(checkout("main"))));
+        assert!(seen.took(None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn git_is_asked_once_in_a_folder_however_many_ask_at_once() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let d = Arc::new(super::test_daemon(crate::config::Config::default()));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let asking: Vec<_> = (0..20)
+            .map(|_| {
+                let (d, asked) = (d.clone(), asked.clone());
+                tokio::spawn(async move {
+                    let lookup = move |_: &str| {
+                        asked.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        Some(checkout("main"))
+                    };
+                    d.git_from("/work/api", lookup).await
+                })
+            })
+            .collect();
+        for one in asking {
+            // Each has the answer the one lookup gave.
+            assert_eq!(one.await.unwrap().repo.as_deref(), Some("acme/api"));
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lookup_waits_for_its_own_folders_only() {
+        use std::{sync::mpsc::channel, time::Duration};
+        let d = std::sync::Arc::new(super::test_daemon(crate::config::Config::default()));
+        let ((started, begun), (release, held)) = (channel::<()>(), channel::<()>());
+        let slow = tokio::spawn({
+            let d = d.clone();
+            let lookup = move |_: &str| {
+                let _ = started.send(());
+                let _ = held.recv();
+                None
+            };
+            async move { d.git_from("/work/slow", lookup).await }
+        });
+        tokio::task::spawn_blocking(move || begun.recv()).await.unwrap().unwrap();
+        let other = tokio::time::timeout(Duration::from_secs(30), d.git_from("/work/api", |_| Some(checkout("main"))));
+        assert_eq!(other.await.expect("answered while git hangs elsewhere").repo.as_deref(), Some("acme/api"));
+        release.send(()).unwrap();
+        assert!(slow.await.unwrap().repo.is_none());
     }
 }

@@ -518,7 +518,7 @@ pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachme
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let root = crate::git::lookup(cwd).root.unwrap_or_else(|| cwd.to_string());
+    let root = crate::git::lookup(cwd).and_then(|g| g.root).unwrap_or_else(|| cwd.to_string());
     let confine =
         crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
             .with_folders(crate::config::Config::load());
