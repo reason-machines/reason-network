@@ -259,11 +259,13 @@ pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
 /// it was and no temporary file behind.
 pub fn write_atomic(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let linked = path.symlink_metadata().is_ok_and(|m| m.is_symlink());
-    let target =
-        if linked { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
+    let target = if linked { link_target(path) } else { path.to_path_buf() };
+    // A name of its own, so that two writers at once don't take over or delete each other's file.
     let mut name = target.clone().into_os_string();
-    name.push(".tmp-reason");
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    name.push(format!(".tmp-reason-{}-{n}", std::process::id()));
     let tmp = std::path::PathBuf::from(name);
     let written = (|| {
         let mut file = File::create(&tmp)?;
@@ -279,6 +281,23 @@ pub fn write_atomic(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<(
         std::fs::remove_file(&tmp).ok();
     }
     written
+}
+
+/// The file a symlink points to, also when that file doesn't exist yet (`canonicalize` fails then).
+fn link_target(link: &Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(link) {
+        return real;
+    }
+    let mut target = link.to_path_buf();
+    // A link to a link: follow them all, but not round a loop.
+    for _ in 0..40 {
+        let Ok(to) = std::fs::read_link(&target) else { break };
+        target = match target.parent() {
+            Some(dir) => dir.join(to),
+            None => to,
+        };
+    }
+    target
 }
 
 /// Text from a teammate as one printable line: no control characters (escape sequences, newlines), at most `max`
@@ -374,12 +393,17 @@ mod tests {
         assert!(write_atomic(&path, "text").is_err());
         assert!(path.is_dir());
         assert_eq!(names(&dir), ["config.toml"]);
-        // A file in the way of the temporary one: nothing is written, and the old file is as it was.
         std::fs::remove_dir(&path).unwrap();
-        std::fs::write(&path, "old\n").unwrap();
-        std::fs::create_dir(dir.join("config.toml.tmp-reason")).unwrap();
-        assert!(write_atomic(&path, "new\n").is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+        // A temporary file that can't be made (its name, longer than the file's, is more than a file system takes):
+        // nothing is written, and the old file is as it was. (Windows also limits the whole path, so not there.)
+        #[cfg(unix)]
+        {
+            let long = dir.join(format!("{}.toml", "c".repeat(240)));
+            std::fs::write(&long, "old\n").unwrap();
+            assert!(write_atomic(&long, "new\n").is_err());
+            assert_eq!(std::fs::read_to_string(&long).unwrap(), "old\n");
+            assert_eq!(names(&dir).len(), 1);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -416,6 +440,43 @@ mod tests {
             assert_eq!(names(&kept), ["config.toml"]);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_file_not_made_yet_is_written_through_and_stays_one() {
+        let dir = folder();
+        let (kept, home) = (dir.join("dotfiles"), dir.join("home"));
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join("config.toml");
+        // A relative link, as `ln -s ../dotfiles/config.toml` makes, to a file that isn't there yet.
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+        write_atomic(&link, "new\n").unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "the link was replaced by a file");
+        assert_eq!(std::fs::read_to_string(kept.join("config.toml")).unwrap(), "new\n");
+        assert_eq!(names(&kept), ["config.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_writers_at_once_both_succeed() {
+        let dir = folder();
+        let path = dir.join("config.toml");
+        let writers: Vec<_> = ["a", "b", "a", "b"]
+            .into_iter()
+            .map(|c| {
+                let (path, text) = (path.clone(), c.repeat(1 << 18));
+                std::thread::spawn(move || (0..100).filter(|_| write_atomic(&path, &text).is_err()).count())
+            })
+            .collect();
+        let failed: usize = writers.into_iter().map(|w| w.join().unwrap()).sum();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let left = names(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(failed, 0, "writes failed");
+        assert!(text.len() == 1 << 18 && (text.bytes().all(|c| c == b'a') || text.bytes().all(|c| c == b'b')));
+        assert_eq!(left, ["config.toml"], "a temporary file was left behind");
     }
 
     /// The files with code the daemon runs, and the setup functions it calls. Tests (a trailing `mod tests`) aside.
