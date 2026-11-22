@@ -589,16 +589,15 @@ impl Daemon {
         let (state, removed) = {
             let mut g = self.inner.lock().unwrap();
             let team = g.team.as_mut().ok_or_else(|| anyhow!("not in a team"))?;
-            // `person`, `person/machine`, a machine name, or the start of a machine's key.
+            // `person`, `person/machine`, a machine name, or the start of a machine's key. A
+            // person's name means that person's machines, even if someone else's machine has it.
+            let is_person = team.people().iter().any(|p| p == who);
             let hits: Vec<(EndpointId, String, String)> = team
                 .active()
                 .filter(|m| match who.split_once('/') {
                     Some((p, mach)) => m.person == p && m.machine == mach,
-                    None => {
-                        m.person == who
-                            || m.machine == who
-                            || (who.len() >= 6 && m.endpoint.to_string().starts_with(who))
-                    }
+                    None if is_person => m.person == who,
+                    None => m.machine == who || (who.len() >= 6 && m.endpoint.to_string().starts_with(who)),
                 })
                 .map(|m| (m.endpoint, m.person.clone(), m.machine.clone()))
                 .collect();
@@ -606,7 +605,7 @@ impl Daemon {
                 bail!("no person or machine called '{who}' in the team");
             }
             let people: HashSet<&String> = hits.iter().map(|h| &h.1).collect();
-            if people.len() > 1 && !team.people().iter().any(|p| p == who) {
+            if people.len() > 1 {
                 let opts: Vec<String> = hits.iter().map(|h| format!("{}/{}", h.1, h.2)).collect();
                 bail!("'{who}' matches machines of several people; say which: {}", opts.join(", "));
             }
@@ -721,6 +720,28 @@ fn sign_in_needs_a_link(invite_text: &str, proof: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_a_person_keeps_another_persons_machine_of_that_name() {
+        let cfg = Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let (bob, carol) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let mut team = TeamState::found("acme", "alex", &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        // carol's machine is called "bob" (it was bob's old laptop).
+        team.put_member(&d.key, carol.public(), "carol", "bob", true);
+        d.inner.lock().unwrap().team = Some(team);
+
+        let out = d.remove("bob").unwrap();
+        assert!(out.starts_with("Removed bob on xps."), "{out}");
+        let t = d.team_state().unwrap();
+        assert!(!t.is_active(&bob.public()));
+        assert!(t.is_active(&carol.public()));
+
+        // carol's machine can still be removed by its full name.
+        d.remove("carol/bob").unwrap();
+        assert!(!d.team_state().unwrap().is_active(&carol.public()));
+    }
 
     #[test]
     fn a_sign_in_never_joins_with_a_code() {
