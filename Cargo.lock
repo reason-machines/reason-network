@@ -1691,6 +1691,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "serde",
  "serde_bytes",
  "strum",
