@@ -221,15 +221,25 @@ struct Live {
 }
 
 pub fn load_key() -> Result<SecretKey> {
-    let path = paths::home().join("machine.key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is corrupt", path.display()))?;
-        return Ok(SecretKey::from_bytes(&arr));
+    load_key_at(&paths::home().join("machine.key"))
+}
+
+/// The key in `path`; a new one, kept there, only when there is no such file yet. A file that is there but can't be
+/// read (held by a scanner for a moment, a permission) is an error and is left as it is: a new key in its place would
+/// make this a different machine, one that no team knows.
+fn load_key_at(path: &std::path::Path) -> Result<SecretKey> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is corrupt", path.display()))?;
+            return Ok(SecretKey::from_bytes(&arr));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("can't read {}: {e}", path.display())),
     }
     let key = SecretKey::generate();
-    std::fs::write(&path, key.to_bytes())?;
+    std::fs::write(path, key.to_bytes())?;
     #[cfg(unix)]
-    util::chmod(&path, 0o600)?;
+    util::chmod(path, 0o600)?;
     Ok(key)
 }
 
@@ -609,6 +619,73 @@ mod tests {
         assert_eq!(in_team_as("mbp", named("!!!")).unused_machine_name(), None);
         assert_eq!(in_team_as("mbp", Config::default()).unused_machine_name(), None);
         assert_eq!(test_daemon(named("studio")).unused_machine_name(), None);
+    }
+
+    /// An empty folder of its own, for a test that writes files.
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("reason-network-key-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_machine_key_is_made_once_and_read_after() {
+        let dir = scratch_dir();
+        let path = dir.join("machine.key");
+        let first = load_key_at(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first.to_bytes());
+        assert_eq!(load_key_at(&path).unwrap().to_bytes(), first.to_bytes());
+        // A file of the wrong size is not a key, and not something to write over.
+        std::fs::write(&path, b"short").unwrap();
+        assert!(load_key_at(&path).unwrap_err().to_string().contains("is corrupt"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Makes `path` unreadable to this process, but still writable, until the returned value is dropped. None where
+    /// that can't be done. (A file that can't be read but can be written over is what the old code took for "no key".)
+    #[cfg(windows)]
+    fn block_reading(path: &std::path::Path) -> Option<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Another handle that lets others write but not read, as a virus scanner's is for a moment.
+        const FILE_SHARE_WRITE: u32 = 2;
+        std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_WRITE).open(path).ok()
+    }
+
+    #[cfg(unix)]
+    struct Unreadable(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600)).ok();
+        }
+    }
+
+    /// A file its owner may write but not read.
+    #[cfg(unix)]
+    fn block_reading(path: &std::path::Path) -> Option<Unreadable> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o200)).ok()?;
+        let blocked = Unreadable(path.to_path_buf());
+        // Root reads anything: then there is no unreadable file to try.
+        std::fs::read(path).is_err().then_some(blocked)
+    }
+
+    /// The key file is there, and for the moment this process can't read it. It isn't gone, so it isn't made anew.
+    #[test]
+    fn a_machine_key_that_cant_be_read_is_not_replaced() {
+        let dir = scratch_dir();
+        let path = dir.join("machine.key");
+        let key = load_key_at(&path).unwrap();
+        if let Some(blocked) = block_reading(&path) {
+            let err = load_key_at(&path).expect_err("a key that can't be read is an error, not a new key");
+            assert!(err.to_string().contains("can't read"), "{err}");
+            drop(blocked);
+            assert_eq!(std::fs::read(&path).unwrap(), key.to_bytes(), "the key stays what it was");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
