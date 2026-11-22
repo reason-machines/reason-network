@@ -207,7 +207,8 @@ machine can no longer connect, but it is not made cryptographically powerless: t
 that was removed while away is first sent the state that says so; strangers learn nothing.
 
 **Invites.** The main way in is the **team link**: `https://<site>/join/#<ticket>`, where the ticket packs the
-team id, the team link's secret, the inviting machine's relay and LAN address hints, and up to six members' keys.
+team id, the team link's secret, the inviting machine's relay and LAN address hints, and the keys of the inviting
+machine and up to two other members (online ones first).
 The link secret is a reusable invite in the team state (any member can show the link and any online member can
 redeem it), replaced with `reason-network link --new` and whenever someone is removed; removed machines are never sent it.
 It travels as the invite line, `Join the Reason Network: <team link>`, which the joiner pastes to their agent: they
