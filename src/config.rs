@@ -176,6 +176,7 @@ impl Config {
             };
         }
         key!(person, None);
+        key!(machine, None);
         key!(share_paths, false);
         key!(share_unmanaged, false);
         key!(lan, false);
@@ -505,6 +506,16 @@ mod tests {
         assert_eq!(policy("accept"), Policy::Hold);
         assert_eq!(policy("hold"), Policy::Hold);
         assert_eq!(policy("refuse"), Policy::Refuse);
+    }
+
+    #[test]
+    fn the_machine_name_is_read_when_another_setting_is_not() {
+        // `port` can't be read, so the file is read key by key, and `machine` has to come through too.
+        let cfg = Config::read_private("machine = \"studio\"\nport = \"41641\"\n");
+        assert_eq!(cfg.machine.as_deref(), Some("studio"));
+        assert!(cfg.warning().is_some_and(|w| w.contains("port")));
+        // And a machine name that can't be read is reported like any other setting.
+        assert!(Config::read_private("machine = 5\n").warning().is_some_and(|w| w.contains("machine")));
     }
 
     #[test]
