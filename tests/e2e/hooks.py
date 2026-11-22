@@ -538,6 +538,57 @@ starts = open(os.path.join(env["REASON_NETWORK_HOME"], "daemon.log")).read().cou
 check("…and doesn't race to start daemons", starts <= 3, f"{starts} duplicate starts")
 mcp.kill()
 
+# The Codex app runs short ephemeral threads of its own (naming a chat, for one) beside the chats people have: they keep no
+# rollout, so their hooks name no transcript. Never a session anyone can reach, nor a name taken from the chats that are.
+titles = os.path.join(D, "titles")
+os.makedirs(titles)
+eph = lambda event: hook("codex", event, {"session_id": "ephemeral-1", "cwd": titles, "transcript_path": None, "hook_event_name": event})
+eph_out = "".join(eph(event) for event in ("session-start", "user-prompt-submit", "post-tool-use", "stop"))
+out = run("who", "titles")
+check("a Codex ephemeral thread's hooks put no session on the network", "titles-codex" not in out and eph_out == "", out + eph_out)
+# …nor do its MCP server's calls, which name the thread too.
+ex = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=titles, text=True)
+rpc(ex, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
+reply(ex, 1)
+rpc(ex, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+rpc(ex, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": {"sessionId": "ephemeral-1", "threadId": "ephemeral-1"}}})
+eph_listing = json.dumps(reply(ex, 2))
+ex.kill()
+ex.wait(timeout=5)
+out = run("who", "titles")
+check("…nor its MCP server's list_team", "titles-codex" not in out and "keeps no transcript" in eph_listing, out + eph_listing)
+rollout = os.path.join(titles, "rollout-durable-1.jsonl")
+open(rollout, "w").close()
+intro = hook("codex", "session-start", {"session_id": "durable-1", "cwd": titles, "transcript_path": rollout, "hook_event_name": "SessionStart"})
+eph("post-tool-use")
+out = run("who", "titles")
+check("…while a chat with a rollout there is on it, by the folder's own name",
+      "alex/titles-codex." in intro and out.count("titles-codex") == 1 and "titles-codex-2" not in out, out + intro)
+eph("session-end")
+# One MCP server serves the Codex app's chats and its ephemeral threads. One that got on through it first is off at its
+# hooks' word, and stays off when the daemon restarts and the server re-registers what it serves; the chat stays on.
+eph2 = lambda event: hook("codex", event, {"session_id": "ephemeral-2", "cwd": titles, "transcript_path": None, "hook_event_name": event})
+app = subprocess.Popen([BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=titles, text=True)
+rpc(app, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client", "version": "1"}}})
+reply(app, 1)
+rpc(app, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+for i, thread in ((2, "durable-1"), (3, "ephemeral-2")):
+    rpc(app, {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": {"sessionId": thread, "threadId": thread}}})
+    reply(app, i)
+before = run("who", "titles")
+eph2("session-start")
+gone = run("who", "titles")
+run("stop")
+time.sleep(4)
+rpc(app, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_team", "arguments": {}, "_meta": {"sessionId": "durable-1", "threadId": "durable-1"}}})
+chat_listing = json.dumps(reply(app, 4))
+after = run("who", "titles")
+app.kill()
+app.wait(timeout=5)
+check("an ephemeral thread its MCP server put on first is off at its hooks' word, and stays off across a daemon restart",
+      "titles-codex-2" in before and "titles-codex-2" not in gone and "titles-codex-2" not in after
+      and re.search(r"^  titles-codex ", after, re.M) and '"isError": true' not in chat_listing, before + gone + after + chat_listing)
+
 # The daemon being down never breaks the agent.
 run("stop")
 bad = dict(env, REASON_NETWORK_HOME="/nonexistent/dir/that/cannot/exist")
