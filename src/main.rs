@@ -197,9 +197,9 @@ enum Cmd {
         /// A one-time four-word code instead of the link
         #[arg(long)]
         code: bool,
-        /// Hours until it expires
-        #[arg(long, default_value_t = 24)]
-        hours: u64,
+        /// Hours until the one-time code expires (24 if not given; the team link doesn't expire)
+        #[arg(long)]
+        hours: Option<u64>,
     },
     /// Show the team link (anyone with it can join)
     Link {
@@ -519,6 +519,9 @@ async fn cli(cmd: Cmd) -> Result<()> {
         Cmd::Join { invite, person, no_setup: false, proof: None, json: false } if wizard::interactive() => {
             wizard::guided(wizard::onboard(Some(false), None, invite, person)).await?
         }
+        Cmd::Invite { me: false, code: false, hours: Some(_) } => {
+            bail!("--hours is for a one-time code (--me or --code); the team link doesn't expire")
+        }
         Cmd::Invite { me: false, code: false, .. } if wizard::interactive() => wizard::guided(wizard::invite()).await?,
         Cmd::Link { new, json } => {
             let l: LinkInfo = link.call(Request::Link { new }).await?;
@@ -592,7 +595,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Invite { me, hours, .. } => {
-            let i: InviteInfo = link.call(Request::Invite { me, hours: hours.clamp(1, 24 * 30) }).await?;
+            let i: InviteInfo = link.call(Request::Invite { me, hours: hours.unwrap_or(24).clamp(1, 24 * 30) }).await?;
             let who = if me { "another machine of yours" } else { "a teammate" };
             println!("One-time code for {who}: {}\n", i.code);
             let [unix, windows] = install_lines(&i.code);
