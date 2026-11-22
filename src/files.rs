@@ -273,16 +273,19 @@ fn invisible(c: char) -> bool {
 /// bytes, keeping the extension.
 fn shorten(name: &str, suffix: &str) -> String {
     let (stem, ext) = split_ext(name);
-    let fits = |s: &str| {
-        let all = format!("{s}{suffix}{ext}");
-        all.chars().count() <= MAX_NAME && all.len() <= MAX_NAME_BYTES
-    };
-    let mut stem = stem.to_string();
-    let cut = !fits(&stem);
-    while !fits(&stem) && stem.pop().is_some() {}
-    if cut {
-        stem.truncate(stem.trim_end_matches(['.', ' ']).len());
+    // What the stem may take of each limit once the suffix and extension are in, counted from its front: a peer's name
+    // can be as long as a frame, and cutting it back from the end a character at a time is quadratic.
+    let chars = MAX_NAME.saturating_sub(suffix.chars().count() + ext.chars().count());
+    let bytes = MAX_NAME_BYTES.saturating_sub(suffix.len() + ext.len());
+    let mut end = 0;
+    for (n, (at, c)) in stem.char_indices().enumerate() {
+        if n == chars || at + c.len_utf8() > bytes {
+            break;
+        }
+        end = at + c.len_utf8();
     }
+    let cut = end < stem.len();
+    let stem = if cut { stem[..end].trim_end_matches(['.', ' ']) } else { stem };
     format!("{stem}{suffix}{ext}")
 }
 
@@ -517,6 +520,65 @@ mod tests {
         let wide = format!("{}.md", "代".repeat(300));
         let files = check(vec![file(&wide, ""), file(&wide, "")]).unwrap();
         assert!(files[1].name.ends_with("-2.md") && files[1].name.len() <= MAX_NAME_BYTES, "{}", files[1].name);
+    }
+
+    /// A peer's file name can be as long as a frame: cutting it takes one pass, not minutes.
+    #[test]
+    fn a_name_as_long_as_a_frame_is_cut_at_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (plain, wide) = ("x".repeat(2 << 20), "代".repeat(1 << 20));
+            let _ = tx.send((safe_name(&format!("{plain}.md")), safe_name(&wide)));
+        });
+        let (plain, wide) = rx.recv_timeout(Duration::from_secs(10)).expect("a long name is cut in a moment");
+        assert_eq!(plain.chars().count(), MAX_NAME);
+        assert!(plain.ends_with(".md"));
+        assert_eq!(wide.chars().count(), MAX_NAME_BYTES / 3);
+    }
+
+    /// The cut keeps the longest front of the stem that fits both limits, as cutting it back a character at a time does.
+    #[test]
+    fn the_cut_keeps_what_fits_from_the_front() {
+        let by_pop = |name: &str, suffix: &str| {
+            let (stem, ext) = split_ext(name);
+            let fits = |s: &str| {
+                let all = format!("{s}{suffix}{ext}");
+                all.chars().count() <= MAX_NAME && all.len() <= MAX_NAME_BYTES
+            };
+            let mut stem = stem.to_string();
+            let cut = !fits(&stem);
+            while !fits(&stem) && stem.pop().is_some() {}
+            if cut {
+                stem.truncate(stem.trim_end_matches(['.', ' ']).len());
+            }
+            format!("{stem}{suffix}{ext}")
+        };
+        let mut names = Vec::new();
+        // Names right at each limit, in one-, two-, three- and four-byte characters, with a dot or a space where the cut
+        // falls and an extension that is too long to be one.
+        for len in 90..=110 {
+            for c in ["x", "é", "代", "😀"] {
+                for tail in ["", ".", " ", ".md", ".an-extension-too-long"] {
+                    let front = c.repeat(len);
+                    names.extend([format!("{front}{tail}"), format!("{front}.{tail}"), format!("{front} {tail}")]);
+                }
+            }
+        }
+        // And a spread of others.
+        let pieces = ["x", "é", "代", "😀", ".", " ", ".md", "a.b"];
+        let mut seed = 7u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for _ in 0..2000 {
+            names.push((0..1 + next(12)).map(|_| pieces[next(pieces.len())].repeat(1 + next(40))).collect::<String>());
+        }
+        for name in &names {
+            for suffix in ["", "-2", "-10", "-12345"] {
+                assert_eq!(shorten(name, suffix), by_pop(name, suffix), "{name:?} + {suffix:?}");
+            }
+        }
     }
 
     #[test]
