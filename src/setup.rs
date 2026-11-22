@@ -1502,6 +1502,12 @@ pub fn detect(exe: &Path) -> Vec<Found> {
         .collect()
 }
 
+/// Agents already on Reason Network for this binary. An update re-applies only these, so it never
+/// wires up an agent the person never chose.
+pub fn wired_agents(exe: &Path) -> Vec<&'static str> {
+    detect(exe).into_iter().filter(|f| f.wired).map(|f| f.id).collect()
+}
+
 /// What `apply` did: a line per agent (and the service), and things the user should know.
 #[derive(Default)]
 pub struct Applied {

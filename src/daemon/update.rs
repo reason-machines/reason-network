@@ -1,11 +1,16 @@
 //! Keeps a standalone install up to date: every few hours the daemon looks for a newer release and, if there is one,
-//! installs it over its own binary (with install.sh, or install.ps1 on Windows, checksum verified) and restarts on it.
+//! installs it over its own binary (with install.sh, or install.ps1 on Windows, checksum verified), refreshes what
+//! `setup` wrote into agents that are already wired, and restarts on it.
 //! Off with `auto_update = false`; never for builds run from a source tree, nor for the build the Reason CLI pins
 //! (in `~/.reason/bin`), which updates with the CLI.
 
 use super::{Daemon, log};
 use anyhow::{Result, bail};
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 const EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -15,6 +20,11 @@ impl Daemon {
         loop {
             match update().await {
                 Ok(Some(v)) => {
+                    if let Ok(exe) = installed_exe() {
+                        for line in refresh_wiring(&exe).await {
+                            log(&line);
+                        }
+                    }
                     log(&format!("updated to {v}; restarting on it"));
                     self.restart_soon();
                     return;
@@ -32,15 +42,38 @@ pub(super) fn allowed(enabled: bool) -> bool {
     enabled && !crate::util::from_source() && !crate::managed() && crate::paths::env_var_os("NO_UPDATE").is_none()
 }
 
+fn installed_exe() -> Result<PathBuf> {
+    let dir = crate::util::current_exe()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    Ok(dir.join(format!("{}{}", crate::AGENT_NAME, std::env::consts::EXE_SUFFIX)))
+}
+
+/// Re-apply `setup` for agents already wired to `exe`. Does not touch agents the person never chose, and does not
+/// change the login service.
+pub(super) async fn refresh_wiring(exe: &Path) -> Vec<String> {
+    let ids = crate::setup::wired_agents(exe);
+    if ids.is_empty() {
+        return vec!["agent wiring: nothing already wired".into()];
+    }
+    let out = crate::setup::apply(exe, &ids, &[], None, false).await;
+    let mut lines: Vec<String> = out.lines.into_iter().map(|l| format!("agent wiring: {l}")).collect();
+    for note in out.notes {
+        lines.push(format!("agent wiring: {note}"));
+    }
+    if lines.is_empty() {
+        lines.push(format!("agent wiring: refreshed {}", ids.join(", ")));
+    }
+    lines
+}
+
 /// Installs the latest release if it is newer than this one; returns its version.
 async fn update() -> Result<Option<String>> {
     let latest = latest_version().await?;
     if !newer(&latest, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
-    let dir = crate::util::current_exe()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-    let exe = dir.join(format!("{}{}", crate::AGENT_NAME, std::env::consts::EXE_SUFFIX));
+    let exe = installed_exe()?;
     let waiting = crate::migrate::waiting(&exe);
+    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
     let mut cmd = crate::util::no_window(tokio::process::Command::from(crate::installer(&dir)));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -116,11 +149,31 @@ fn newer(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     #[test]
     fn versions_compare_by_number() {
         assert!(super::newer("0.10.0", "0.9.3"));
         assert!(super::newer("1.0.0", "0.99.99"));
         assert!(!super::newer("0.6.3", "0.6.3"));
         assert!(!super::newer("0.6.2", "0.6.10"));
+    }
+
+    #[tokio::test]
+    async fn refresh_wiring_skips_when_no_agent_points_at_this_binary() {
+        let dir = std::env::temp_dir().join(format!("reason-network-update-{}", ulid::Ulid::generate()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("reason-network");
+        std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+        let lines = super::refresh_wiring(&exe).await;
+        assert!(lines.iter().any(|line| line.contains("nothing already wired")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wired_agents_ignore_an_unrelated_binary_path() {
+        let exe = PathBuf::from("/tmp/reason-network-not-wired-anywhere-for-tests");
+        assert!(crate::setup::wired_agents(&exe).is_empty(), "a path no agent names must not be refreshed");
     }
 }
