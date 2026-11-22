@@ -1,6 +1,7 @@
 //! A `git` that hangs in one folder never holds up `who`: the daemon looks up each session folder's checkout with a
-//! deadline, and the folders that miss it show without their repo and branch. Runs the real daemon with a stand-in
-//! `git` that hangs in one folder (as git can on a stuck network mount or a lock) and passes everything else through.
+//! deadline, and the folders that miss it show without their repo and branch, or with the ones last seen there. However
+//! many ask at once, one git is started in a folder. Runs the real daemon with a stand-in `git` that hangs in one
+//! folder (as git can on a stuck network mount or a lock) and passes everything else through.
 #![cfg(unix)]
 
 use std::{
@@ -36,9 +37,12 @@ fn a_hanging_git_in_one_folder_does_not_hold_up_who() {
         fs::create_dir_all(d).unwrap();
     }
     let real = String::from_utf8(Command::new("sh").args(["-c", "command -v git"]).output().unwrap().stdout).unwrap();
-    assert!(Command::new(real.trim()).args(["init", "-q"]).current_dir(&fast).status().unwrap().success());
-    let git = bin.join("git");
-    let case = format!("case \"$*\" in *{}*) exec sleep 600 ;; esac", slow.display());
+    for args in [&["init", "-q"][..], &["remote", "add", "origin", "git@github.com:acme/fastrepo.git"]] {
+        assert!(Command::new(real.trim()).args(args).current_dir(&fast).status().unwrap().success());
+    }
+    // The stand-in leaves a line in `hung` for every git it starts in the slow folder.
+    let (git, hung) = (bin.join("git"), root.join("hung"));
+    let case = format!("case \"$*\" in *{}*) echo >> {}; exec sleep 600 ;; esac", slow.display(), hung.display());
     let hang = format!("#!/bin/sh\n{case}\nexec {} \"$@\"\n", real.trim());
     fs::write(&git, hang).unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
@@ -61,24 +65,39 @@ fn a_hanging_git_in_one_folder_does_not_hold_up_who() {
         c
     };
     let _daemon = Kill(cmd(&["daemon"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-
-    let started = Instant::now();
-    let mut who = cmd(&["who"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let out = loop {
-        if who.try_wait().unwrap().is_some() {
-            break who.wait_with_output().unwrap();
-        }
-        if started.elapsed() > Duration::from_secs(20) {
-            let _ = who.kill();
-            let _ = who.wait();
-            let _ = fs::remove_dir_all(&root);
-            panic!("`who` still hadn't answered after 20s with git hanging in one folder");
-        }
+    // Until the daemon listens, a `who` would start a detached daemon of its own.
+    let socket = root.join("state/network.sock");
+    let up = Instant::now();
+    while !socket.exists() && up.elapsed() < Duration::from_secs(20) {
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+
+    // Several at once, as agents ask: each is answered, and they share the one lookup of the slow folder.
+    let started = Instant::now();
+    let asking: Vec<Child> =
+        (0..6).map(|_| cmd(&["who"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()).collect();
+    let mut answers = Vec::new();
+    for mut who in asking {
+        answers.push(loop {
+            if who.try_wait().unwrap().is_some() {
+                break who.wait_with_output().unwrap();
+            }
+            if started.elapsed() > Duration::from_secs(20) {
+                let _ = who.kill();
+                let _ = who.wait();
+                let _ = fs::remove_dir_all(&root);
+                panic!("`who` still hadn't answered after 20s with git hanging in one folder");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    }
+    let gits = fs::read_to_string(&hung).unwrap_or_default().lines().count();
     let _ = fs::remove_dir_all(&root);
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "who failed: {}{text}", String::from_utf8_lossy(&out.stderr));
-    assert!(text.contains("fastone") && text.contains("slowone"), "both sessions listed:\n{text}");
-    assert!(text.contains("fast"), "the folder git answered for keeps its repo:\n{text}");
+    for out in answers {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "who failed: {}{text}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("fastone") && text.contains("slowone"), "both sessions listed:\n{text}");
+        assert!(text.contains("acme/fastrepo"), "the folder git answered for keeps its repo:\n{text}");
+    }
+    assert_eq!(gits, 1, "one git started in the slow folder, however many asked at once");
 }

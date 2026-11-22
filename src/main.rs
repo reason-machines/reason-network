@@ -166,6 +166,7 @@ enum Cmd {
     /// Set what the current agent session is doing (run from inside the agent's shell)
     Status {
         doing: Vec<String>,
+        /// Rename this session. Taking an offline conversation's name on this computer brings its waiting mail.
         #[arg(long)]
         name: Option<String>,
     },
@@ -395,25 +396,26 @@ async fn cli_session(link: &std::sync::Arc<Link>, id: &str, event: &str) -> Resu
         name: Some(id.into()),
         dirs: Vec::new(),
         keep: true,
+        codex_home: None,
     });
     link.call(req).await
 }
 
 /// The folder `<you>/terminal` goes by. Folders that are off are about agent sessions, not the person at the terminal:
 /// in one, theirs goes by no folder. An agent's shell there is an agent's session, and gets nothing.
-fn terminal_cwd(cwd: String, off: bool, agent: bool) -> Result<String> {
+fn terminal_cwd(cwd: String, off: Option<String>, agent: bool) -> Result<String> {
     match (off, agent) {
-        (false, _) => Ok(cwd),
-        (true, false) => Ok("/".into()),
-        (true, true) => bail!(config::OFF_HERE),
+        (None, _) => Ok(cwd),
+        (Some(_), false) => Ok("/".into()),
+        (Some(why), true) => bail!(why),
     }
 }
 
-/// Whether this command runs in a folder that is off: by the agent's project folder, or the shell's own.
-fn here_off() -> bool {
-    let cfg = config::Config::load_strict().unwrap_or_default();
+/// What to say if this command runs in a folder that is off: by the agent's project folder, or the shell's own.
+fn here_off() -> Option<String> {
+    let cfg = config::Config::load();
     let shell = std::env::current_dir().ok().map(|p| p.display().to_string());
-    [Some(agent::cwd()), shell].into_iter().flatten().any(|d| cfg.off_in(&d))
+    [Some(agent::cwd()), shell].into_iter().flatten().find(|d| cfg.off_in(d)).map(|d| cfg.off_message(&d))
 }
 
 fn current_session() -> Option<String> {
@@ -444,8 +446,10 @@ async fn cli(cmd: Cmd) -> Result<()> {
         }
         Cmd::Send { to, message, reply_to, fyi, notify, from, files, purpose } => {
             // An agent in a folder that is off sends nothing, as no session (nor its files).
-            if agent_shell() && here_off() {
-                bail!(config::OFF_HERE);
+            if agent_shell()
+                && let Some(why) = here_off()
+            {
+                bail!(why);
             }
             let mut body = message.join(" ");
             if message.is_empty() || body == "-" {
@@ -458,7 +462,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let cwd = std::env::current_dir()?;
             // An agent's shell sends no file from a folder that is off, wherever it runs.
             let files = if agent_shell() {
-                files::read_outside(&files, &cwd, &config::Config::load_strict().unwrap_or_default())?
+                files::read_outside(&files, &cwd, &config::Config::load())?
             } else {
                 files::read(&files, &cwd)?
             };
@@ -505,7 +509,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 bail!("run this from inside an agent session's shell");
             };
             let doing = (!doing.is_empty()).then(|| doing.join(" "));
-            let r: Registered = link.call(Request::SetStatus { key, doing, name }).await?;
+            let reclaim = name.is_some();
+            let r: Registered = link.call(Request::SetStatus { key, doing, name, reclaim }).await?;
             println!("You are {}.", r.address);
         }
         Cmd::Init { team, person, no_setup: false, relay: None, proof: None, json: false } if wizard::interactive() => {
@@ -862,9 +867,10 @@ mod tests {
 
     #[test]
     fn in_a_folder_that_is_off_the_terminal_goes_by_no_folder_and_an_agents_shell_gets_nothing() {
-        assert_eq!(terminal_cwd("/work/api".into(), false, true).unwrap(), "/work/api");
-        assert_eq!(terminal_cwd("/work/private".into(), true, false).unwrap(), "/");
-        assert_eq!(terminal_cwd("/work/private".into(), true, true).unwrap_err().to_string(), config::OFF_HERE);
+        let off = Some("why it is off".to_string());
+        assert_eq!(terminal_cwd("/work/api".into(), None, true).unwrap(), "/work/api");
+        assert_eq!(terminal_cwd("/work/private".into(), off.clone(), false).unwrap(), "/");
+        assert_eq!(terminal_cwd("/work/private".into(), off, true).unwrap_err().to_string(), "why it is off");
     }
 
     #[test]

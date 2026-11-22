@@ -133,26 +133,42 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let home = paths::user_home();
-    #[cfg(unix)]
-    let extra = [
-        home.join(".local/bin"),
-        home.join(".bun/bin"),
-        home.join(".npm-global/bin"),
-        home.join(".cargo/bin"),
-        home.join(".opencode/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-    ];
-    #[cfg(windows)]
-    let extra = [home.join(r".local\bin"), home.join(r"AppData\Roaming\npm"), home.join(r".bun\bin")];
-    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
     let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(extra)
+    find_in(name, &path, &paths::user_home())
+}
+
+/// [`find_bin`] with `PATH` and the home folder given: the folders on `path`, then [`install_dirs`] under `home`.
+fn find_in(name: &str, path: &std::ffi::OsStr, home: &Path) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
+    std::env::split_paths(path)
+        .chain(install_dirs(home, cfg!(windows)))
         .flat_map(|d| exts.iter().map(move |ext| d.join(format!("{name}{ext}"))))
         .find(|p| executable(p))
+}
+
+/// Where programs usually are when a daemon's `PATH` doesn't say (launchd, systemd, or a Windows daemon started by a
+/// program with a bare `PATH`, such as the Reason app's CLI). On Windows that includes `%LOCALAPPDATA%\Reason\bin`,
+/// where the Reason CLI's installer puts `reason.exe`: without it the daemon can't start `reason network __relay`,
+/// and Reason's hosted tools see none of this computer's agents (`agent_network_offline`).
+fn install_dirs(home: &Path, windows: bool) -> Vec<PathBuf> {
+    let under = |parts: &[&str]| parts.iter().fold(home.to_path_buf(), |d, p| d.join(p));
+    if windows {
+        return [
+            &[".local", "bin"][..],
+            &["AppData", "Roaming", "npm"],
+            &[".bun", "bin"],
+            &["AppData", "Local", "Reason", "bin"],
+        ]
+        .into_iter()
+        .map(under)
+        .collect();
+    }
+    let mut dirs: Vec<PathBuf> = [".local/bin", ".bun/bin", ".npm-global/bin", ".cargo/bin", ".opencode/bin"]
+        .iter()
+        .map(|d| home.join(d))
+        .collect();
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    dirs
 }
 
 /// How to run `name`, for the caller to add its arguments to. On Windows the `<name>.cmd` npm (or pnpm) installs runs
@@ -163,7 +179,7 @@ pub fn command_for(name: &str) -> Option<std::process::Command> {
 }
 
 /// [`command_for`] for the program at `bin`.
-fn command_at(bin: &Path) -> std::process::Command {
+pub fn command_at(bin: &Path) -> std::process::Command {
     #[cfg(windows)]
     if bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"))
         && let Some(dir) = bin.parent()
@@ -268,12 +284,34 @@ pub fn label(agent: &str) -> &str {
     }
 }
 
-/// `<repo-or-dir>-<agent>`, e.g. `api-claude`.
-pub fn default_name(agent: &str, cwd: &str, git: &GitInfo) -> String {
+/// The repo's or directory's name, e.g. `api`, which a session's name starts with.
+fn folder(cwd: &str, git: &GitInfo) -> String {
     let dir = git.root.as_deref().unwrap_or(cwd);
     let base = util::slug(Path::new(dir).file_name().and_then(|n| n.to_str()).unwrap_or("home"));
-    let base = if base.is_empty() { "home".into() } else { base };
-    util::joined(&base, short(agent))
+    if base.is_empty() { "home".into() } else { base }
+}
+
+/// `<repo-or-dir>-<agent>`, e.g. `api-claude`.
+pub fn default_name(agent: &str, cwd: &str, git: &GitInfo) -> String {
+    util::joined(&folder(cwd, git), short(agent))
+}
+
+/// Whether `name` is the one a session gets when it asks for none: `default_name`, or it with `-2`, `-3`, ….
+pub fn is_default_name(name: &str, agent: &str, cwd: &str, git: &GitInfo) -> bool {
+    let base = default_name(agent, cwd, git);
+    // `-2`, `-3`, … as `pick_name` adds them, which cuts a long base short to fit.
+    name == base
+        || name.rsplit_once('-').is_some_and(|(_, n)| {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && name == util::joined(&base, n)
+        })
+}
+
+/// `<repo-or-dir>-<the first words of its title>`, e.g. `api-fix-the-login-bug`: the folder and what the conversation
+/// is about, so the person (and their other agents) can tell the chats in one folder apart. None for a title with no
+/// letters or digits.
+pub fn titled_name(cwd: &str, git: &GitInfo, title: &str) -> Option<String> {
+    let words = util::slug(&title.split_whitespace().take(4).collect::<Vec<_>>().join(" "));
+    (!words.is_empty()).then(|| util::joined(&folder(cwd, git), &words))
 }
 
 pub fn cwd() -> String {
@@ -576,6 +614,29 @@ mod tests {
     }
 
     #[test]
+    fn default_names_and_titled_ones() {
+        let git = GitInfo { root: Some("/Users/alex/src/API".into()), ..Default::default() };
+        let cwd = "/Users/alex/src/API/web";
+        for name in ["api-claude", "api-claude-2", "api-claude-17"] {
+            assert!(is_default_name(name, CLAUDE_CODE, cwd, &git), "{name}");
+        }
+        for name in ["api-claude-", "api-claude-x", "api-claude2", "review", "api-fix-the-login-bug"] {
+            assert!(!is_default_name(name, CLAUDE_CODE, cwd, &git), "{name}");
+        }
+        assert_eq!(titled_name(cwd, &git, "Fix the login bug on Safari").as_deref(), Some("api-fix-the-login-bug"));
+        assert_eq!(
+            titled_name("/tmp/My Thing", &GitInfo::default(), "Résumé: export PDFs!").as_deref(),
+            Some("my-thing-resume-export-pdfs")
+        );
+        assert_eq!(titled_name(cwd, &git, " … "), None);
+        // In a folder with a long name, `-2` cuts the default short, as `pick_name` does.
+        let long = format!("/tmp/{}", "a".repeat(33));
+        let second = util::joined(&default_name(CLAUDE_CODE, &long, &GitInfo::default()), "2");
+        assert!(second.ends_with("-clau-2"), "{second}");
+        assert!(is_default_name(&second, CLAUDE_CODE, &long, &GitInfo::default()));
+    }
+
+    #[test]
     fn an_npm_shim_is_run_as_node_and_its_script() {
         let d = std::env::temp_dir().join(format!("reason-network-shim-{}", ulid::Ulid::generate()));
         let script = d.join("node_modules").join("@openai").join("codex").join("bin").join("codex.js");
@@ -617,6 +678,29 @@ mod tests {
         }
         assert_eq!(node_shim(&format!("@SETLOCAL\r\nIF 1==1 (SET X=1)\r\n{plain}"), &sub), None);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A Windows daemon the Reason app's CLI started has only System32 on its `PATH`; it still finds the Reason CLI
+    /// where the CLI's installer puts it, so it can keep `reason network __relay` (Reason's hosted tools) running.
+    #[test]
+    fn a_windows_daemon_looks_where_the_reason_cli_is_installed() {
+        let home = PathBuf::from("home");
+        let reason = ["AppData", "Local", "Reason", "bin"].iter().fold(home.clone(), |d, p| d.join(p));
+        assert!(install_dirs(&home, true).contains(&reason));
+        assert!(!install_dirs(&home, false).contains(&reason));
+    }
+
+    /// The same on Windows itself: `reason.exe` in `%LOCALAPPDATA%\Reason\bin` is found with a bare `PATH`.
+    #[cfg(windows)]
+    #[test]
+    fn the_reason_cli_is_found_with_a_bare_path_on_windows() {
+        let home = std::env::temp_dir().join(format!("reason-network-find-{}", ulid::Ulid::generate()));
+        let bin = home.join("AppData").join("Local").join("Reason").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("reason.exe"), b"").unwrap();
+        let system32 = std::ffi::OsString::from(r"C:\Windows\System32");
+        assert_eq!(find_in("reason", &system32, &home), Some(bin.join("reason.exe")));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

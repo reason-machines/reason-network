@@ -10,11 +10,14 @@ use std::{
 };
 
 pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: Option<String>, doing: Option<String>) {
+    let cfg = crate::config::Config::load();
     let input = if session.is_none() { read_stdin(Duration::from_secs(3)) } else { String::new() };
     let link = Link::new(None);
-    let Ok(Some((out, key, ids))) =
-        tokio::time::timeout(Duration::from_secs(8), handle(&link, agent_name, event, &input, session, state, doing))
-            .await
+    let Ok(Some((out, key, ids))) = tokio::time::timeout(
+        Duration::from_secs(8),
+        handle((&link, &cfg), agent_name, event, &input, session, state, doing),
+    )
+    .await
     else {
         return;
     };
@@ -23,6 +26,19 @@ pub async fn run(agent_name: &str, event: &str, session: Option<String>, state: 
         // Printed, so the agent has it: now it counts as read.
         let _ = tokio::time::timeout(Duration::from_secs(3), link.call::<Value>(Request::Delivered { key, ids })).await;
     }
+}
+
+/// The `CODEX_HOME` a Codex hook runs with, for the daemon to run `codex queue` against: only a full path to a folder
+/// that is there, as its real path. Anything else is left out, and the daemon uses the default home.
+fn codex_home(value: Option<std::ffi::OsString>) -> Option<String> {
+    let path = std::path::PathBuf::from(value?);
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    let real = std::fs::canonicalize(path).ok()?;
+    let real = real.to_str()?;
+    // Windows gives it as `\\?\C:\…`; kept as `C:\…`, as Codex would be given it (a share's path as it comes).
+    Some(real.strip_prefix(r"\\?\").filter(|p| !p.starts_with("UNC")).unwrap_or(real).to_string())
 }
 
 /// The hook payload, without hanging if the agent never closes our stdin.
@@ -38,7 +54,7 @@ fn read_stdin(limit: Duration) -> String {
 
 /// Returns what to print, the session key, and the ids of the messages in it.
 async fn handle(
-    link: &std::sync::Arc<Link>,
+    (link, cfg): (&std::sync::Arc<Link>, &crate::config::Config),
     agent_name: &str,
     event: &str,
     input: &str,
@@ -71,7 +87,6 @@ async fn handle(
     );
     let cwd = dirs.first().cloned().or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()));
     // In a folder that is off, the agent hears nothing; the daemon only that this session is off.
-    let cfg = crate::config::Config::load_strict().unwrap_or_default();
     let off = cwd.iter().chain(&dirs).any(|d| cfg.off_in(d));
     let ev = match (event, state.as_deref()) {
         ("session-start", _) => "start",
@@ -104,16 +119,19 @@ async fn handle(
         name: None,
         dirs: dirs.into_iter().skip(1).collect(),
         keep: false,
+        codex_home: (agent == "codex").then(|| codex_home(std::env::var_os("CODEX_HOME"))).flatten(),
     });
     let reply: HookReply = link.call(req).await.ok()?;
     if off {
         return None;
     }
     let ids = reply.ids;
-    let text = match (reply.text, ev, reply.address) {
-        (Some(t), ..) => t,
-        // Say who it is on Reason Network once, at session start.
-        (None, "start" | "prompt", Some(addr)) if ev == "start" || agent == "antigravity" => {
+    // An older daemon doesn't say: then at session start, as before.
+    let intro = reply.intro.unwrap_or(ev == "start");
+    let text = match (reply.text, reply.address) {
+        (Some(t), _) => t,
+        // Say who it is on Reason Network once per session.
+        (None, Some(addr)) if intro => {
             format!(
                 "Reason Network: you are {addr}. Teammates' agents can message you; list_team and send_message reach them."
             )
@@ -193,7 +211,7 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_for, grok_ignores, takes_mail};
+    use super::{codex_home, format_for, grok_ignores, takes_mail};
     use serde_json::json;
 
     #[test]
@@ -210,6 +228,29 @@ mod tests {
         assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
         assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
+    }
+
+    #[test]
+    fn a_codex_home_is_named_only_as_the_real_path_of_a_folder_that_is_there() {
+        let dir = std::env::temp_dir().join(format!("reason-network-codex-home-{}", std::process::id()));
+        let home = dir.join("codex-b");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        let real = std::fs::canonicalize(&home).unwrap();
+        let real = real.to_str().unwrap();
+        let real = real.strip_prefix(r"\\?\").unwrap_or(real);
+        let named = |p: &std::path::Path| codex_home(Some(p.as_os_str().to_owned()));
+        assert_eq!(named(&home).as_deref(), Some(real));
+        // By another path to it: its real one (macOS's temp folder is under a link, `/var` to `/private/var`).
+        assert_eq!(named(&dir.join("x").join("..").join("codex-b")).as_deref(), Some(real));
+        // Not a folder, not there, not a full path, or empty: none, so the daemon's own home.
+        assert_eq!(named(&dir.join("file")), None);
+        assert_eq!(named(&dir.join("missing")), None);
+        assert_eq!(named(std::path::Path::new("codex-b")), None);
+        assert_eq!(codex_home(Some("".into())), None);
+        assert_eq!(codex_home(None), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

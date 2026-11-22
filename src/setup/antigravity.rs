@@ -16,7 +16,7 @@ pub(super) fn apply(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report
         return Ok(None);
     }
     let dir = config_dir();
-    let mut report = Report { agent: "Antigravity", lines: Vec::new(), notes: Vec::new() };
+    let mut report = Report { agent: "Antigravity", ..Default::default() };
     let mcp = dir.join("mcp_config.json");
     let mut value = read_json(&mcp)?;
     let servers = obj(obj(&mut value)?.entry("mcpServers").or_insert_with(|| json!({})))?;
@@ -25,7 +25,7 @@ pub(super) fn apply(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report
     } else {
         servers.insert(AGENT_NAME.into(), json!({"command": exe.display().to_string(), "args": ["mcp"], "env": {"REASON_NETWORK_AGENT": "antigravity"}}));
     }
-    report.lines.push(changed(&mcp, write_json(&mcp, &value, dry)?));
+    report.write_json(&mcp, &value, dry)?;
     let hooks = dir.join("hooks.json");
     let mut value = read_json(&hooks)?;
     let definitions = obj(&mut value)?;
@@ -45,7 +45,7 @@ pub(super) fn apply(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report
             }),
         );
     }
-    report.lines.push(changed(&hooks, write_json(&hooks, &value, dry)?));
+    report.write_json(&hooks, &value, dry)?;
     let sidecar = dir.join("sidecars/reason-network/sidecar.json");
     let config = dir.join("config.json");
     let mut value = read_json(&config)?;
@@ -57,11 +57,11 @@ pub(super) fn apply(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report
         }
     } else {
         let data = json!({"command": exe.display().to_string(), "args": ["antigravity-sidecar"], "restart_policy": "on-failure", "display_name": "Reason Network", "description": "Deliver messages to your existing agent conversations"});
-        report.lines.push(changed(&sidecar, write_json(&sidecar, &data, dry)?));
+        report.write_json(&sidecar, &data, dry)?;
         // Preserve an explicit decision to disable this sidecar.
         sidecars.entry(AGENT_NAME).or_insert_with(|| json!({"enabled": true}));
         report.notes.push("Reload Antigravity's MCP configuration and start a new conversation. App idle delivery needs the Reason Network sidecar enabled; CLI conversations receive mail at their next invocation.".into());
     }
-    report.lines.push(changed(&config, write_json(&config, &value, dry)?));
+    report.write_json(&config, &value, dry)?;
     Ok(Some(report))
 }
