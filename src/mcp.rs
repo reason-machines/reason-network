@@ -120,6 +120,8 @@ pub struct ReasonNetworkMcp {
     client_agent: Arc<Mutex<Option<&'static str>>>,
     /// Gemini: it has gone by its hooks' session (so between two conversations, the next is waited for).
     hooks_linked: Arc<AtomicBool>,
+    /// Whether the last tool list included check_inbox.
+    inbox_listed: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -131,6 +133,7 @@ pub async fn run() -> Result<()> {
         claude: Default::default(),
         client_agent: Default::default(),
         hooks_linked: Default::default(),
+        inbox_listed: Default::default(),
         tool_router: ReasonNetworkMcp::tool_router(),
     };
     let service = server.clone().serve(stdio()).await?;
@@ -331,6 +334,7 @@ impl ServerHandler for ReasonNetworkMcp {
         if self.pushed(self.agent(&ctx.peer, None)) {
             tools.retain(|t| t.name != "check_inbox");
         }
+        self.inbox_listed.store(tools.iter().any(|t| t.name == "check_inbox"), Ordering::Relaxed);
         Ok(ListToolsResult::with_all_items(tools))
     }
 }
@@ -463,7 +467,7 @@ impl ReasonNetworkMcp {
             Ok(mut text) => {
                 if notice
                     && let Ok(u) = self.link.call::<Unread>(Request::Unread { key: key.to_string() }).await
-                    && let Some(n) = render::unread_notice(&u)
+                    && let Some(n) = render::unread_notice(&u, self.inbox_listed.load(Ordering::Relaxed))
                 {
                     text.push_str("\n\n");
                     text.push_str(&n);

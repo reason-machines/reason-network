@@ -559,7 +559,7 @@ impl Daemon {
         self: &Arc<Self>,
         g: &mut Inner,
         key: &str,
-        msgs: Vec<Message>,
+        mut msgs: Vec<Message>,
         wake: bool,
     ) -> (String, String) {
         if !g.live.contains_key(key) {
@@ -614,6 +614,16 @@ impl Daemon {
             _ if l.last_hook.is_some() => Channel::Hook,
             _ => Channel::Pull,
         };
+        // FYI never starts a push, but goes along when wake mail gives the session a pause.
+        if matches!(channel, Channel::ClaudeSocket(_) | Channel::Command(..) | Channel::ClaudeDirect(_)) {
+            let address = self.addr(&l.name);
+            for m in g.pending(&address).unwrap_or_default() {
+                if !m.wake && !msgs.iter().any(|sent| sent.id == m.id) {
+                    msgs.push(m);
+                }
+            }
+        }
+        let l = &g.live[key];
         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
         let cli = matches!(channel, Channel::ClaudeDirect(_));
         let text = render::for_agent(&msgs, Some(&l.reg.agent), cli);
@@ -2319,13 +2329,69 @@ mod tests {
         assert_eq!(reply["unread"], 2);
         let Event::Deliver { key: recipient, ids, text } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(recipient, key);
-        assert_eq!(ids, sent.ids);
-        assert!(text.contains("waiting message") && !text.contains("for a natural pause"));
+        assert_eq!(ids, [sent.ids, fyi.ids].concat());
+        assert!(text.contains("waiting message") && text.contains("for a natural pause"));
         d.handle(9, rename()).await.unwrap();
         assert!(rx.try_recv().is_err());
         d.handle(7, Request::Delivered { key: key.into(), ids }).await.unwrap();
         let inbox = d.inbox(key.into(), 0, false).await.unwrap();
-        assert_eq!(inbox.messages.into_iter().map(|m| m.id).collect::<Vec<_>>(), fyi.ids);
+        assert!(inbox.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pushed_wake_mail_carries_fyi_once_and_only_counts_it_read_after_handoff() {
+        for path in ["send", "register", "stop_waiting"] {
+            let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+            d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            d.inner.lock().unwrap().conns.insert(7, tx);
+            let key = "claude-code:a";
+            let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex(key) };
+            let to = d.register(Some(7), reg.clone(), crate::git::GitInfo::default()).unwrap().address;
+            let send = |body: &'static str, wake| {
+                d.send("codex:sender".into(), &to, body, None, wake, false, None, Vec::new())
+            };
+            let fyi = send("for the next pause", false).await.unwrap();
+            assert_eq!(fyi.recipients[0].state, "queued");
+            d.register(Some(7), reg.clone(), crate::git::GitInfo::default()).unwrap();
+            d.stop_waiting(key).await;
+            assert!(rx.try_recv().is_err(), "FYI alone never pushes");
+            // Hold the wake mail for the handover under test.
+            if path != "send" {
+                d.inner.lock().unwrap().live.get_mut(key).unwrap().mcp_push = false;
+            }
+            let wake = send("please reply", true).await.unwrap();
+            match path {
+                "register" => {
+                    d.register(Some(7), reg, crate::git::GitInfo::default()).unwrap();
+                }
+                "stop_waiting" => {
+                    d.inner.lock().unwrap().live.get_mut(key).unwrap().mcp_push = true;
+                    d.stop_waiting(key).await;
+                }
+                _ => {}
+            }
+            let Event::Deliver { key: recipient, ids, text } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(recipient, key);
+            assert_eq!(ids, [wake.ids, fyi.ids].concat(), "{path}");
+            assert!(text.contains("please reply") && text.contains("for the next pause"));
+            assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 2);
+            let next = send("another wake", true).await.unwrap();
+            let Event::Deliver { ids: next_ids, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(next_ids, next.ids, "FYI already in flight is not repeated");
+            d.push_failed(key, &ids);
+            d.register(
+                Some(7),
+                SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex(key) },
+                crate::git::GitInfo::default(),
+            )
+            .unwrap();
+            let Event::Deliver { ids: retry, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(retry, ids, "failed FYI handoff is retried with its wake mail");
+            d.handle(7, Request::Delivered { key: key.into(), ids: [retry, next_ids].concat() }).await.unwrap();
+            assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

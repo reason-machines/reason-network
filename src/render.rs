@@ -431,20 +431,36 @@ pub fn for_human(msgs: &[Message]) -> String {
     out
 }
 
-pub fn unread_notice(u: &Unread) -> Option<String> {
+pub fn unread_notice(u: &Unread, check_inbox: bool) -> Option<String> {
     (u.count > 0).then(|| {
         let plural = if u.count == 1 { "" } else { "s" };
-        format!(
-            "[Reason Network] {} unread message{plural} from {}. Call check_inbox to read.",
-            u.count,
-            u.from.join(", ")
-        )
+        let next = if check_inbox {
+            "Call check_inbox to read."
+        } else {
+            "FYI mail accompanies the next pushed wake message."
+        };
+        format!("[Reason Network] {} unread message{plural} from {}. {next}", u.count, u.from.join(", "))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_notices_name_check_inbox_only_when_listed() {
+        for listed in [false, true] {
+            assert_eq!(unread_notice(&Unread { count: 0, from: vec![] }, listed), None);
+            for count in [1, 2] {
+                let u = Unread { count, from: vec!["alice/api".into(), "bob/web".into()] };
+                let text = unread_notice(&u, listed).unwrap();
+                let plural = if count == 1 { "" } else { "s" };
+                assert!(text.contains(&format!("{count} unread message{plural} from alice/api, bob/web.")));
+                assert_eq!(text.contains("Call check_inbox to read."), listed);
+                assert_eq!(text.contains("FYI mail accompanies the next pushed wake message."), !listed);
+            }
+        }
+    }
 
     #[test]
     fn a_team_shows_its_relay_or_the_default() {

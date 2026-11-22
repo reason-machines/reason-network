@@ -86,7 +86,7 @@ isn't kept, and it doesn't push later sessions to `-2`, `-3`.
   this computer. The CLI sets `reclaim` on its local `SetStatus` request. A relay retrying a hosted assistant's name
   leaves that flag unset, so the offline owner keeps its name and mail.
   After a reclaim, both conversations' unread mail goes to the new owner. Mail held for approval still needs approval.
-  Wake mail is delivered as on registration. FYI mail waits for its next natural pause.
+  Wake mail is delivered as on registration. FYI mail waits for its next natural pause, or accompanies a pushed wake message.
   The former owner gets a free name if it resumes. Live names, names kept on other machines, and permanent mailboxes
   cannot be reclaimed. During the first six hours after daemon startup, the old owner must have been seen live by
   this daemon and gone offline again. Startup grace uses the daemon's monotonic clock so changing the system time
@@ -405,7 +405,9 @@ Four tools, none of which an agent has to call unless it wants to message someon
   a PowerShell toast on Windows, at most one per person sending a minute, none for messages over 15 minutes old;
   a machine without a desktop says so. With `notify`, `to` may be your own user: then only the pop-up, on each of
   your machines that is on (an agent that needs its user).
-- `check_inbox(wait_secs?)`: unread messages; can block waiting for a reply.
+- `check_inbox(wait_secs?)`: unread messages; can block waiting for a reply. Hidden when Claude Code's MCP server
+  knows its push inbox; pending FYI mail accompanies the next pushed wake message, without waking the session on its
+  own. The unread notice names `check_inbox` only when it was listed.
 - `ask_user(question, about?)`: asks the session's own person with a pop-up on its machine and waits (up to 10
   minutes) for Approve or Deny, with a note: on macOS and Windows a floating panel that doesn't take the keyboard
   (Return approves once it is clicked into, Escape denies), on Linux a notification with buttons (no note; libnotify
