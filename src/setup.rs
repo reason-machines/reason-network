@@ -743,10 +743,16 @@ fn opencode(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let mut r = Report { agent: "opencode", ..Default::default() };
     let path = dir.join("opencode.json");
     if dir.join("opencode.jsonc").exists() && !path.exists() {
-        r.notes.push(format!(
-            "opencode: you use opencode.jsonc, which Reason Network doesn't edit. Add under \"mcp\": \"{AGENT_NAME}\": {{\"type\": \"local\", \"command\": [\"{}\", \"mcp\"], \"environment\": {{\"REASON_NETWORK_AGENT\": \"opencode\"}}}}",
-            exe.display()
-        ));
+        r.notes.push(if remove {
+            format!(
+                "opencode: you use opencode.jsonc, which Reason Network doesn't edit. Remove \"{AGENT_NAME}\" from under \"mcp\" there if you added it"
+            )
+        } else {
+            format!(
+                "opencode: you use opencode.jsonc, which Reason Network doesn't edit. Add under \"mcp\": \"{AGENT_NAME}\": {{\"type\": \"local\", \"command\": [\"{}\", \"mcp\"], \"environment\": {{\"REASON_NETWORK_AGENT\": \"opencode\"}}}}",
+                exe.display()
+            )
+        });
     } else {
         let mut v = read_json(&path)?;
         let mcp = obj(obj(&mut v)?.entry("mcp").or_insert_with(|| json!({})))?;
