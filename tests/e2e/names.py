@@ -6,7 +6,7 @@
 Needs internet for the other machines (iroh relays/discovery). With an older build, it also checks terminals with an
 older engine in the team.
 """
-import json, os, re, subprocess, sys, tempfile, time
+import json, os, re, socket, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofs import TRUST, proof, serve_relay_lists
 
@@ -136,6 +136,12 @@ try:
     c = claude("one", "session-start", "conv-c")
     check("…a new conversation after the restart gets the next free name", you_are(c) == "lars/proj-claude-3", c)
     check("…and none of the other's mail", "bug report" not in c, c)
+    out = cli("one", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    wait = re.search(r"try again in about (\d+) minutes?\.", out)
+    check("an explicit rename explains how soon to retry or recover the unseen name",
+          "'proj-claude' has not reconnected since the daemon restart" in out
+          and "Resume the original conversation" in out and "end it and retry" in out
+          and wait is not None and 1 <= int(wait[1]) <= 360, out)
     back = claude("one", "session-start", "conv-a")
     check("the first conversation comes back as itself", name_of("one", "conv-a") == "lars/proj-claude", name_of("one", "conv-a"))
     check("…and its mail reaches it", "bug report for conversation A" in back, back)
@@ -144,11 +150,24 @@ try:
     out = cli("one", "who")
     check("who lists each under its own name", all(n in out for n in ("proj-claude ", "proj-claude-2", "proj-claude-3")), out)
 
-    # Renames: never into a name kept for a conversation that is offline.
+    # Only an explicit rename may take a conversation's name and mail.
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-a")
+    check("the original conversation names itself handoff", "You are lars/handoff." in out, out)
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    check("a live owner keeps its name", "taken by a live session" in out, out)
     claude("one", "session-end", "conv-a")
-    out = cli("one", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
-    check("a rename into the offline conversation's name is refused",
-          "'proj-claude' belongs to a session that is offline" in out and "pick another name" in out, out)
+    cli("one", "send", "handoff", "--fyi", "mail for the handoff")
+    out = cli("one", "status", "--name", "handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
+    check("an explicit rename takes the offline name", "You are lars/handoff." in out, out)
+    got = claude("one", "stop", "conv-c")
+    check("the new owner receives the queued mail", "mail for the handoff" in got, got)
+    back = claude("one", "session-start", "conv-a")
+    check("the former owner resumes under a free name without that mail",
+          name_of("one", "conv-a") == "lars/proj-claude" and "mail for the handoff" not in back, back)
+    cli("one", "send", "proj-claude", "--fyi", "for the resumed conversation")
+    got = claude("one", "stop", "conv-a")
+    check("the resumed conversation receives new mail at its own address", "for the resumed conversation" in got, got)
+    claude("one", "session-end", "conv-a")
     out = cli("one", "status", "--name", "auth", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-c")
     check("…another name is fine", "You are lars/auth." in out, out)
     out = cli("one", "listen", "--as", "proj-claude", "--wait", "0")
@@ -179,6 +198,17 @@ try:
     check("…and once it's gone, a new Gemini session there gets the next name", "proj-gemini-2" in out, out)
     got = gemini("stop", "g1")
     check("…while g1, back, is proj-gemini with what came meanwhile", "more for g1" in got, got)
+    gemini("session-end", "g1")
+    cli("one", "send", "proj-gemini", "--fyi", "handoff from hook-only g1")
+    gemini("session-start", "g2")
+    out = cli("one", "status", "--name", "proj-gemini", REASON_NETWORK_AGENT="gemini", GEMINI_SESSION_ID="g2")
+    check("a replacement takes the offline hook-only session's name", "You are lars/proj-gemini." in out, out)
+    back = gemini("session-start", "g1")
+    out = cli("one", "status", REASON_NETWORK_AGENT="gemini", GEMINI_SESSION_ID="g1")
+    check("the old owner resumes under a free name without seeing the waiting mail",
+          "You are lars/proj-gemini-2." in out and "handoff from hook-only g1" not in back, (out, back))
+    got = gemini("stop", "g2")
+    check("its hook receives the mail queued for the old owner", "handoff from hook-only g1" in got, got)
 
     # An agent that gives no session id: as before, the next session in its place takes the name and its mail.
     zed = Mcp("one", "zed")
@@ -193,6 +223,45 @@ try:
     check("…and one does", "for whoever runs zed here" in out, out)
     zed.close()
 
+    # A push session gets reclaimed mail through its MCP server without calling an inbox or running a hook.
+    old = Mcp("one", "claude-code", CLAUDE_CODE_SESSION_ID="push-old")
+    try:
+        old.tool("list_team", {})
+        out = cli("one", "status", "--name", "push-handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="push-old")
+        check("the former push owner names itself", "You are lars/push-handoff." in out, out)
+    finally:
+        old.close()
+    until(lambda: cli("one", "who"), lambda o: "push-handoff" not in o)
+    out = cli("one", "send", "push-handoff", "waiting for the push replacement")
+    check("the message waits for the offline push owner", "it reaches that session when it's back" in out, out)
+    with socket.socket(socket.AF_UNIX) as inbox:
+        path = os.path.join(D, "push.sock")
+        inbox.bind(path)
+        inbox.listen(1)
+        inbox.settimeout(5)
+        replacement = Mcp("one", "claude-code", CLAUDE_CODE_SESSION_ID="push-new",
+                          CLAUDE_CODE_MESSAGING_SOCKET=path)
+        try:
+            replacement.tool("list_team", {})
+            out = cli("one", "status", "--name", "push-handoff", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="push-new")
+            check("the push session reclaims the name", "You are lars/push-handoff." in out, out)
+            try:
+                connection, _ = inbox.accept()
+                with connection:
+                    connection.settimeout(5)
+                    with connection.makefile() as frames:
+                        pushed = frames.read()
+            except socket.timeout:
+                pushed = ""
+            check("the MCP server pushes reclaimed mail into the session without an inbox check",
+                  "waiting for the push replacement" in pushed, pushed)
+            replacement.tool("send_message", {"to": "lars/terminal", "message": "answer from the push replacement"})
+            out = cli("one", "listen", "--as", "terminal", "--wait", "5")
+            check("the sender receives the replacement's reply from its reclaimed address",
+                  "answer from the push replacement" in out and "lars/push-handoff" in out, out)
+        finally:
+            replacement.close()
+
     # --- two machines of the same person ---
     link = re.search(r"https://\S+/join/#\S+", cli("one", "link")).group(0)
     out = cli("two", "join", link, "--proof", proof("u_lars", "lars", ep["two"]), "--no-setup")
@@ -205,6 +274,8 @@ try:
     check("…and when one goes offline", "auth" in out and "proj-claude-2" not in out, out)
     d = claude("two", "session-start", "conv-d")
     check("a new conversation there gets none of the names kept on the first", you_are(d) not in ("lars/proj-claude", "lars/proj-claude-2"), d)
+    out = cli("two", "status", "--name", "proj-claude", CLAUDECODE="1", CLAUDE_CODE_SESSION_ID="conv-d")
+    check("an explicit rename cannot take a name kept on another machine", "another of your machines" in out, out)
     # Each computer has its own terminal, whatever the other's is doing.
     out = cli("one", "listen", "--as", "terminal", "--wait", "0")
     check("the first computer's terminal", "You are lars/terminal." in out, out)

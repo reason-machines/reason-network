@@ -13,7 +13,7 @@ pub use mac::run;
 mod mac {
     use crate::{CLI, client::Link, config::Config, proto::*, util, wizard};
     use anyhow::{Result, anyhow};
-    use objc2::MainThreadMarker;
+    use objc2::{MainThreadMarker, rc::autoreleasepool};
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSEventMask, NSImage};
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSString};
     use std::{
@@ -49,81 +49,88 @@ mod mac {
 
     pub fn run() -> Result<()> {
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow!("the menu bar icon needs the main thread"))?;
-        let app = NSApplication::sharedApplication(mtm);
-        // A menu bar item only: no Dock icon, no app menu.
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-        app.finishLaunching();
+        let (app, tray) = autoreleasepool(|_| -> Result<_> {
+            let app = NSApplication::sharedApplication(mtm);
+            // A menu bar item only: no Dock icon, no app menu.
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            app.finishLaunching();
+
+            let tray = TrayIconBuilder::new()
+                .with_tooltip("Reason")
+                .with_autosave_name("com.reasonmachines.network.tray")
+                .with_menu(Box::new(Menu::new()))
+                .build()?;
+            set_icon(&tray, false, None, mtm);
+            Ok((app, tray))
+        })?;
 
         let (tx, updates) = mpsc::channel();
         let (act, actions) = amsc::unbounded_channel();
         tokio::spawn(poll(tx, actions));
 
-        let tray = TrayIconBuilder::new()
-            .with_tooltip("Reason")
-            .with_autosave_name("com.reasonmachines.network.tray")
-            .with_menu(Box::new(Menu::new()))
-            .build()?;
-        set_icon(&tray, false, None, mtm);
         let parent = util::parent_pid();
         let mut shown: Option<Box<View>> = None;
         let mut flash: Option<(&str, Instant)> = None;
         loop {
-            let until = NSDate::dateWithTimeIntervalSinceNow(0.5);
-            // SAFETY: the main thread's event loop, with AppKit's own run loop mode.
-            let ev = unsafe {
-                app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&until),
-                    NSDefaultRunLoopMode,
-                    true,
-                )
-            };
-            if let Some(ev) = ev {
-                app.sendEvent(&ev);
-            }
-            while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                match ev.id.as_ref() {
-                    "link" => {
-                        let _ = act.send(Action::CopyLink);
-                    }
-                    "hide" => hide(),
-                    id => {
-                        if let Some(addr) = id.strip_prefix("copy:") {
-                            let _ = act.send(Action::Copy(addr.to_string()));
+            // Our manual event loop must drain AppKit's temporary images and menus each time around.
+            autoreleasepool(|_| {
+                let until = NSDate::dateWithTimeIntervalSinceNow(0.5);
+                // SAFETY: the main thread's event loop, with AppKit's own run loop mode.
+                let ev = unsafe {
+                    app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                        NSEventMask::Any,
+                        Some(&until),
+                        NSDefaultRunLoopMode,
+                        true,
+                    )
+                };
+                if let Some(ev) = ev {
+                    app.sendEvent(&ev);
+                }
+                while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                    match ev.id.as_ref() {
+                        "link" => {
+                            let _ = act.send(Action::CopyLink);
+                        }
+                        "hide" => hide(),
+                        id => {
+                            if let Some(addr) = id.strip_prefix("copy:") {
+                                let _ = act.send(Action::Copy(addr.to_string()));
+                            }
                         }
                     }
                 }
-            }
-            let mut changed = false;
-            while let Ok(u) = updates.try_recv() {
-                match u {
-                    Update::View(v) if shown.as_ref().is_none_or(|s| s.key != v.key) => {
-                        tray.set_menu(Some(Box::new(menu(&v))));
-                        shown = Some(v);
-                        changed = true;
+                let mut changed = false;
+                while let Ok(u) = updates.try_recv() {
+                    match u {
+                        Update::View(v) if shown.as_ref().is_none_or(|s| s.key != v.key) => {
+                            tray.set_menu(Some(Box::new(menu(&v))));
+                            shown = Some(v);
+                            changed = true;
+                        }
+                        Update::View(_) => {}
+                        Update::Flash(text) => {
+                            flash = Some((text, Instant::now()));
+                            changed = true;
+                        }
+                        Update::Gone => std::process::exit(0),
                     }
-                    Update::View(_) => {}
-                    Update::Flash(text) => {
-                        flash = Some((text, Instant::now()));
-                        changed = true;
-                    }
-                    Update::Gone => std::process::exit(0),
                 }
-            }
-            if flash.is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(2)) {
-                flash = None;
-                changed = true;
-            }
-            if changed {
-                let v = shown.as_deref();
-                let online = v.is_some_and(|v| v.machines.iter().any(|(m, ..)| m.online && !m.is_me));
-                let title = flash.map(|(t, _)| t.to_string());
-                set_icon(&tray, online, title.as_deref(), mtm);
-            }
-            // Our daemon exited (we were handed to launchd): go with it.
-            if util::parent_pid() != parent {
-                std::process::exit(0);
-            }
+                if flash.is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(2)) {
+                    flash = None;
+                    changed = true;
+                }
+                if changed {
+                    let v = shown.as_deref();
+                    let online = v.is_some_and(|v| v.machines.iter().any(|(m, ..)| m.online && !m.is_me));
+                    let title = flash.map(|(t, _)| t.to_string());
+                    set_icon(&tray, online, title.as_deref(), mtm);
+                }
+                // Our daemon exited (we were handed to launchd): go with it.
+                if util::parent_pid() != parent {
+                    std::process::exit(0);
+                }
+            });
         }
     }
 

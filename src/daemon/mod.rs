@@ -2,7 +2,9 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod antigravity;
 mod ask;
+mod diagnostics;
 mod directory;
 mod mail;
 mod notify;
@@ -92,7 +94,12 @@ pub async fn run(service: bool) -> Result<()> {
 async fn tray() {
     let Ok(exe) = util::current_exe() else { return };
     for _ in 0..5 {
-        match tokio::process::Command::new(&exe).arg("tray").stdin(std::process::Stdio::null()).status().await {
+        match util::no_window(tokio::process::Command::new(&exe))
+            .arg("tray")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .await
+        {
             Ok(st) if st.success() => return,
             Ok(st) => log(&format!("menu bar icon exited ({st}); restarting it")),
             Err(e) => return log(&format!("menu bar icon not started: {e}")),
@@ -113,6 +120,7 @@ fn log(msg: &str) {
 }
 
 pub struct Daemon {
+    usage: crate::usage::Usage,
     person: String,
     machine: String,
     cfg: Config,
@@ -131,18 +139,24 @@ pub struct Daemon {
     shown: Mutex<HashMap<String, Instant>>,
     /// Each session's `ask_user` question that is up, with its answer once there is one.
     asks: Mutex<HashMap<String, ask::Asking>>,
-    /// When this daemon started (ms): sessions live before it register again in the while after.
-    started: i64,
+    /// Until this deadline, sessions that were live before startup get time to register again.
+    startup_grace_ends: Instant,
     /// Whether the log says presence names only some of the names kept here.
     capped: std::sync::atomic::AtomicBool,
     /// Until when Reason sessions are listed without `--fields`, which the installed `reason` refused.
     plain_until: Mutex<Option<Instant>>,
+    /// Agent CLIs a test runs in place of the ones on this machine.
+    #[cfg(test)]
+    fake_bins: Mutex<HashMap<&'static str, std::path::PathBuf>>,
 }
 
 struct Inner {
     store: Store,
     live: HashMap<String, Live>,
+    /// During startup, only a conversation seen live by this daemon can be known to have left.
+    seen_since_start: HashSet<String>,
     conns: HashMap<u64, mpsc::UnboundedSender<String>>,
+    antigravity_conn: Option<u64>,
     next_conn: u64,
     team: Option<TeamState>,
     /// Messages handed to a push channel or a hook and not yet confirmed; hidden from inbox and hooks meanwhile.
@@ -159,10 +173,14 @@ struct Inner {
     off: HashMap<String, (bool, i64)>,
     /// Codex sessions whose wake mail waits for a hook of the turn they are in, watched for that turn ending first.
     codex_watch: HashSet<String>,
+    /// Codex sessions whose last `codex queue` failed: while they are offline, their mail waits for their hooks, until
+    /// their next SessionStart or a `codex queue` that works.
+    codex_failed: HashSet<String>,
 }
 
 /// A session running on this machine.
 struct Live {
+    through_reason: Option<bool>,
     reg: SessionReg,
     name: String,
     /// The client connection (`reason network mcp`) that owns it; `None` for sessions known only through hooks.
@@ -190,6 +208,16 @@ struct Live {
     /// person's own mailboxes. Only such a session keeps its name while offline: a run only its hooks ever saw (a
     /// one-shot or headless run without Reason Network's tools) was never reachable, and won't be.
     attached: bool,
+    /// The `CODEX_HOME` a Codex session's hooks run with; `None` for the default home (and other agents).
+    codex_home: Option<String>,
+    /// Its hooks have already said who it is on Reason Network (Antigravity hooks run before every invocation).
+    introduced: bool,
+    /// The default name it went by before its conversation's title named it, which it was told at its start: that
+    /// name is still its own (no other session takes it) and mail to it comes here. Remembered with the session
+    /// (`Store::set_former`), so it stays so after a restart and while the session is offline, until it is forgotten.
+    former: Option<String>,
+    /// Its hooks have told it the name it goes by now, in place of `former`.
+    told_renamed: bool,
 }
 
 pub fn load_key() -> Result<SecretKey> {
@@ -206,8 +234,25 @@ pub fn load_key() -> Result<SecretKey> {
 }
 
 impl Daemon {
+    pub(crate) fn usage_transport(&self, metric: &'static str, relay: bool, rtt: u64) {
+        let mut dims = crate::usage::Dimensions { locality: "remote".into(), ..Default::default() };
+        if metric == "path_changed" {
+            dims.transport = if relay { "relay" } else { "direct" }.into();
+        }
+        self.usage.count(metric, dims.clone(), 1);
+        if rtt > 0 {
+            dims.bucket = crate::usage::duration(rtt).into();
+            self.usage.count("rtt_ms", dims, 1);
+        }
+    }
     fn open() -> Result<Self> {
-        Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)
+        let cfg = Config::load();
+        if let Some(warning) = cfg.warning() {
+            log(&warning);
+        }
+        let mut daemon = Self::with(cfg, Store::open(&paths::db(), paths::inbox())?, load_key()?)?;
+        daemon.usage = crate::usage::Usage::open(paths::home().join("usage.sqlite"));
+        Ok(daemon)
     }
 
     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {
@@ -216,6 +261,7 @@ impl Daemon {
         // In a team, who we are is what the signed roster says, whatever the config file says.
         let member = team.as_ref().and_then(|t| t.member(&key.public()).cloned());
         Ok(Daemon {
+            usage: Default::default(),
             person: member.as_ref().map_or_else(|| cfg.person(), |m| m.person.clone()),
             machine: member.map_or_else(|| util::hostname(cfg.machine.as_deref()), |m| m.machine),
             key,
@@ -223,7 +269,9 @@ impl Daemon {
             inner: Mutex::new(Inner {
                 store,
                 live: HashMap::new(),
+                seen_since_start: HashSet::new(),
                 conns: HashMap::new(),
+                antigravity_conn: None,
                 next_conn: 0,
                 team,
                 in_flight: HashMap::new(),
@@ -233,6 +281,7 @@ impl Daemon {
                 quota: Default::default(),
                 off: HashMap::new(),
                 codex_watch: HashSet::new(),
+                codex_failed: HashSet::new(),
             }),
             arrived: Notify::new(),
             git_cache: Mutex::new(HashMap::new()),
@@ -241,10 +290,21 @@ impl Daemon {
             rate: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
-            started: util::now_ms(),
+            startup_grace_ends: Instant::now() + sessions::HOOK_TTL,
             plain_until: Mutex::new(None),
             capped: Default::default(),
+            #[cfg(test)]
+            fake_bins: Default::default(),
         })
+    }
+
+    /// The agent's own CLI `bin` on this machine (in a test, its fake).
+    fn agent_bin(&self, bin: &str) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_bins.lock().unwrap().get(bin) {
+            return Some(fake.clone());
+        }
+        crate::agent::find_bin(bin)
     }
 
     fn addr(&self, name: &str) -> String {
@@ -319,15 +379,47 @@ impl Daemon {
     }
 
     async fn handle(self: &Arc<Self>, conn: u64, req: Request) -> Result<Value> {
+        let operation = match &req {
+            Request::Who { .. } => Some("who"),
+            Request::Send { .. } => Some("send"),
+            Request::Inbox { .. } => Some("inbox"),
+            Request::Ask { .. } => Some("ask"),
+            _ => None,
+        };
+        if let Some(operation) = operation {
+            self.usage.count("tool", crate::usage::Dimensions { bucket: operation.into(), ..Default::default() }, 1);
+        }
         Ok(match req {
             Request::Register { session } => {
                 let git = self.git(&session.cwd).await;
                 json!(self.register(Some(conn), session, git)?)
             }
-            Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
+            Request::SetStatus { key, doing, name, reclaim } => {
+                let rename = if reclaim { sessions::Rename::Explicit } else { sessions::Rename::Automatic };
+                let (r, reclaimed) = self.set_status_quiet(&key, doing, name, rename)?;
+                if reclaimed {
+                    let mut g = self.inner.lock().unwrap();
+                    // A hook may have read the mail, or the owner changed, since the rename released the lock.
+                    if g.live.get(&key).is_some_and(|l| l.name == r.name) {
+                        let wake: Vec<_> = g.pending(&r.address)?.into_iter().filter(|m| m.wake).collect();
+                        if !wake.is_empty() {
+                            self.deliver(&mut g, &key, wake, true);
+                        }
+                    }
+                }
+                json!(r)
+            }
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
-            Request::Send { from, to, body, reply_to, wake, notify, files } => {
-                json!(self.send(from, &to, &body, reply_to, wake, notify, None, files).await?)
+            Request::Send { from, to, body, reply_to, wake, notify, files, purpose, idempotency_key } => {
+                let dims = crate::usage::Dimensions {
+                    bucket: purpose.unwrap_or_else(|| "unknown".into()),
+                    ..Default::default()
+                };
+                self.usage.count("purpose", dims, 1);
+                json!(
+                    self.send_idempotent(from, &to, &body, reply_to, wake, notify, None, files, idempotency_key)
+                        .await?
+                )
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
@@ -336,11 +428,24 @@ impl Daemon {
                 self.stop_waiting(&key).await;
                 Value::Null
             }
-            Request::Delivered { ids, .. } => {
+            Request::Delivered { key, ids } => {
                 let mut g = self.inner.lock().unwrap();
-                g.store.mark_read(&ids, util::now_ms())?;
+                let changed = g.store.mark_read(&ids, util::now_ms())?;
+                // Hosted relays acknowledge a handover to a server inbox, not agent consumption.
+                let handed_to_agent = g.live.get(&key).is_some_and(|l| l.through_reason == Some(false));
+                for id in &changed {
+                    if handed_to_agent {
+                        self.usage.stage(id, "delivered");
+                    }
+                }
                 for id in &ids {
                     g.in_flight.remove(id);
+                }
+                if handed_to_agent {
+                    g.store.handoff(&changed, util::now_ms())?;
+                }
+                if let Some(l) = g.live.get_mut(&key) {
+                    l.retry = None;
                 }
                 Value::Null
             }
@@ -358,6 +463,24 @@ impl Daemon {
             Request::Proof { jws } => json!(self.attach_proof(&jws)?),
             Request::Invite { me, hours } => json!(self.invite(me, hours).await?),
             Request::Team => json!(self.team_info()?),
+            Request::Usage => {
+                let mut report = json!(self.usage.snapshot());
+                if report.is_object() {
+                    report["health"] = self.diagnostics()?;
+                }
+                report
+            }
+            Request::Diagnostics => self.diagnostics()?,
+            Request::DeliveryStatus { from, ids } => {
+                json!(self.inner.lock().unwrap().store.delivery_status(&from, &ids)?)
+            }
+            Request::AntigravityAttach => json!(self.attach_antigravity(conn)?),
+            Request::AntigravitySession { conversation_id } => {
+                let mut g = self.inner.lock().unwrap();
+                self.prune(&mut g);
+                let key = format!("antigravity:{conversation_id}");
+                json!(g.live.get(&key).filter(|l| l.last_hook.is_some()).map(|_| key))
+            }
             Request::Link { new } => json!(self.link(new).await?),
             Request::Remove { who } => json!(self.remove(&who)?),
             Request::Leave { force } => json!(self.leave(force).await?),

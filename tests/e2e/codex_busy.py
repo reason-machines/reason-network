@@ -2,8 +2,11 @@
 
 Mail to a Codex turn that is still running waits for its next PostToolUse (or Stop), however long the turn runs.
 Mail to a thread whose last turn ended (completed, interrupted or failed: the last two run no Stop hook) wakes it
-through `codex queue`. Each fake rollout records turns the way Codex does (`task_started`, then `task_complete` or
-`turn_aborted`); the fake CLI records queue commands. Neither proves what real Codex shows.
+through `codex queue`, as does mail to a thread that went offline within the last day; `codex queue` runs against the
+`CODEX_HOME` the thread's hooks ran with. Once `codex queue` fails for an offline thread, its mail waits for its hooks,
+and so does mail for one whose hooks last said it is in a folder that is off. Each fake rollout records turns the way
+Codex does (`task_started`, then `task_complete` or `turn_aborted`); the fake CLI records queue commands and their
+`CODEX_HOME`. Neither proves what real Codex shows.
 
     cargo build && python3 tests/e2e/codex_busy.py     # about 2.5 minutes: it waits out real two-minute gaps
 """
@@ -33,18 +36,25 @@ def check(name, ok, detail=""):
 
 
 with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
-    queue_log = os.path.join(d, "queue.log")
+    queue_log, home_log = os.path.join(d, "queue.log"), os.path.join(d, "home.log")
+    attempt_log = os.path.join(d, "attempts.log")
+    off_dir = os.path.join(d, "personal")
     fake = os.path.join(d, "codex")
     with open(fake, "w") as f:
-        f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_QUEUE_LOG"\n')
+        f.write('#!/bin/sh\nprintf "%s\\n" "$3" >> "$CODEX_ATTEMPT_LOG"\n'
+                'case "$*" in *"refuse this"*) echo "no app-server" >&2; exit 1;; esac\n'
+                'printf "%s\\n" "$*" >> "$CODEX_QUEUE_LOG"\n'
+                'printf "%s %s\\n" "${CODEX_HOME:-default}" "$3" >> "$CODEX_HOME_LOG"\n')
     os.chmod(fake, 0o755)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "CODEX", "REASON_NETWORK", "TINCAN"))}
     env.update(REASON_NETWORK_HOME=os.path.join(d, "home"), REASON_NETWORK_NO_MDNS="1",
                REASON_NETWORK_NO_SERVICE="1", REASON_NETWORK_MACHINE="box",
-               REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue_log)
+               REASON_NETWORK_CODEX_BIN=fake, CODEX_QUEUE_LOG=queue_log, CODEX_HOME_LOG=home_log,
+               CODEX_ATTEMPT_LOG=attempt_log)
 
-    def run(*args, payload=None, cwd=d):
-        r = subprocess.run([BIN, *args], env=env, cwd=cwd, input=json.dumps(payload) if payload else None,
+    def run(*args, payload=None, cwd=d, home=None):
+        e = dict(env, CODEX_HOME=home) if home else env
+        r = subprocess.run([BIN, *args], env=e, cwd=cwd, input=json.dumps(payload) if payload else None,
                            capture_output=True, text=True, timeout=30)
         assert r.returncode == 0, r.stdout + r.stderr
         return (r.stdout + r.stderr).strip()
@@ -52,9 +62,11 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
     class Thread:
         """One Codex thread: its folder (so its name, `<folder>-codex`), its hooks and its rollout."""
 
-        def __init__(self, name, transcript=True):
-            self.name, self.cwd = f"{name}-codex", os.path.join(d, name)
+        def __init__(self, name, transcript=True, home=None):
+            self.name, self.cwd, self.home = f"{name}-codex", os.path.join(d, name), home
             os.makedirs(self.cwd)
+            if home:
+                os.makedirs(home, exist_ok=True)
             self.rollout = os.path.join(d, f"rollout-{name}.jsonl") if transcript else None
             if self.rollout:
                 self.record("session_meta", top=True)
@@ -68,11 +80,11 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
             with open(self.rollout, "a") as f:
                 f.write(json.dumps(line) + "\n")
 
-        def hook(self, event):
-            payload = {"session_id": f"thread-{self.name}", "cwd": self.cwd}
+        def hook(self, event, cwd=None):
+            payload = {"session_id": f"thread-{self.name}", "cwd": cwd or self.cwd}
             if self.rollout:
                 payload["transcript_path"] = self.rollout
-            return run("hook", "codex", event, payload=payload, cwd=self.cwd)
+            return run("hook", "codex", event, payload=payload, cwd=cwd or self.cwd, home=self.home)
 
         def start_turn(self):
             self.record("task_started", turn_id="t")
@@ -93,6 +105,14 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         while not queued(body) and time.monotonic() < deadline:
             time.sleep(0.05)
         return queued(body) > 0
+
+    def homes():
+        return open(home_log).read().splitlines() if os.path.exists(home_log) else []
+
+    def attempts(t):
+        """How many times `codex queue` ran for thread `t`, whether or not it took the mail."""
+        text = open(attempt_log).read() if os.path.exists(attempt_log) else ""
+        return text.splitlines().count(f"thread-{t.name}")
 
     def read(body, secs=5):
         with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
@@ -130,6 +150,7 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         check("idle: woken through codex queue", queued_within("idle message", 5), queued())
         check("idle: the queue's success counts as delivered", read("idle message"))
         check("idle: …and no hook shows it again", t.hook("post-tool-use") == "")
+        check("idle: run against the daemon's own CODEX_HOME", f"default thread-{t.name}" in homes(), homes())
 
     def ending():
         # Mail that lands between Stop and the turn's end in the rollout.
@@ -229,6 +250,90 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
         check("no rollout known: woken through codex queue, as before", queued_within("no rollout message", 5),
               queued())
 
+    def other_home():
+        # #199: a thread from another CODEX_HOME is woken through that home's app-server.
+        home = os.path.join(d, "codex-b")
+        t = Thread("otherhome", home=home)
+        t.start_turn()
+        t.hook("stop")
+        t.record("task_complete", turn_id="t")
+        t.send("other home message")
+        check("other CODEX_HOME: woken through codex queue", queued_within("other home message", 5), queued())
+        check("other CODEX_HOME: …run against that home", f"{os.path.realpath(home)} thread-{t.name}" in homes(),
+              homes())
+
+    def offline(name, home=None):
+        """A thread whose turn ended and whose session then ended (as `codex resume` makes it look): offline."""
+        t = Thread(name, home=home)
+        t.start_turn()
+        t.hook("stop")
+        t.record("task_complete", turn_id="t")
+        t.hook("session-end")
+        return t
+
+    def resumed():
+        # #197: mail for a thread seen within the day starts its turn when it is resumed; its hooks don't show it too.
+        home = os.path.join(d, "codex-c")
+        t = offline("resumed", home=home)
+        out = t.send("while you were away")
+        check("offline, seen recently: the sender hears it starts a turn on resume", "starts a turn when the thread is "
+              "resumed" in out, out)
+        check("offline, seen recently: queued into the thread", queued_within("while you were away", 5), queued())
+        check("offline, seen recently: …against its CODEX_HOME", f"{os.path.realpath(home)} thread-{t.name}" in homes(),
+              homes())
+        check("offline, seen recently: counts as delivered", read("while you were away"))
+        start, prompt = t.hook("session-start"), t.hook("user-prompt-submit")
+        check("offline, seen recently: no hook of the resumed turn shows it again",
+              "while you were away" not in start + prompt + t.hook("post-tool-use") + t.hook("stop"), (start, prompt))
+        check("offline, seen recently: queued once", queued("while you were away") == 1, queued())
+        out = t.send("now that you're back")
+        check("offline, seen recently: back online at its first turn", "queued into the Codex session" in out, out)
+
+    def refused():
+        # `codex queue` fails: the mail stays unread and the first hook of the resumed thread shows it, once.
+        t = offline("refused")
+        t.send("refuse this message")
+        time.sleep(2)
+        check("offline, codex queue fails: the mail stays unread", not read("refuse this message", secs=1))
+        # From then on its mail waits for its hooks: no `codex queue` per message, and the sender hears it waits.
+        out = t.send("after the refusal")
+        time.sleep(2)
+        check("offline, codex queue failed: the next message waits, and the sender hears so",
+              out.count("queued: last seen") == 1 and "starts a turn" not in out, out)
+        check("offline, codex queue failed: …with no codex queue run for it", attempts(t) == 1
+              and queued("after the refusal") == 0, (attempts(t), queued()))
+        start, again = t.hook("session-start"), t.hook("post-tool-use")
+        check("offline, codex queue fails: SessionStart of the resumed thread shows both, once",
+              "refuse this message" in start and "after the refusal" in start and "refuse" not in again, (start, again))
+
+    def stale():
+        # Seen more than a day ago: the mail waits for its next turn, and nothing is queued into Codex.
+        t = offline("stale")
+        with sqlite3.connect(os.path.join(env["REASON_NETWORK_HOME"], "network.db")) as db:
+            db.execute("UPDATE sessions SET last_seen = last_seen - 25 * 3600000 WHERE key = ?",
+                       (f"codex:thread-{t.name}",))
+        out = t.send("stale message")
+        fyi = offline("fyi-offline")
+        fyi_out = fyi.send("offline FYI", "--fyi")
+        time.sleep(2)
+        check("offline over a day: the sender hears it waits", "queued: last seen 1d ago" in out, out)
+        check("offline over a day, or an FYI: not queued into Codex",
+              queued("stale message") == 0 and queued("offline FYI") == 0, (fyi_out, queued()))
+        ok, detail = shown_once(t, "stale message", event="session-start")
+        check("offline over a day: its next SessionStart shows it, once", ok, detail)
+
+    def off_folder():
+        # Its hooks last said the thread is in a folder that is off: its mail waits, nothing goes into Codex.
+        t = offline("offfolder")
+        t.hook("user-prompt-submit", cwd=off_dir)
+        out = t.send("while in the off folder")
+        time.sleep(2)
+        check("offline in a folder that is off: the mail waits", "queued: last seen" in out, out)
+        check("offline in a folder that is off: …with no codex queue run for it",
+              attempts(t) == 0 and queued("while in the off folder") == 0, (attempts(t), queued()))
+        ok, detail = shown_once(t, "while in the off folder", event="session-start")
+        check("offline in a folder that is off: back in one that is on, SessionStart shows it, once", ok, detail)
+
     def failed():
         t = Thread("failed")
         t.start_turn()
@@ -297,6 +402,8 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
 
     try:
         run("init", "codex-test", "--as", "alex", "--no-setup")
+        os.makedirs(off_dir)
+        run("folder", off_dir, "off")
 
         # FYI mail never wakes: it waits for check_inbox (or a pause).
         fyi = Thread("fyi")
@@ -337,7 +444,7 @@ with tempfile.TemporaryDirectory(prefix="rn-codex-") as d:
             cx.wait()
 
         scenarios = [busy, idle, ending, interrupted, interrupted_pending, unconfirmed, failed, continued, no_rollout,
-                     long_call, long_gap, long_turn]
+                     other_home, resumed, refused, off_folder, stale, long_call, long_gap, long_turn]
         print(f"Running {len(scenarios)} scenarios at once; the long ones wait {LONG} seconds", flush=True)
         threads = [threading.Thread(target=s) for s in scenarios]
         for th in threads:
