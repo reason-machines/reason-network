@@ -187,12 +187,15 @@ impl Config {
         if let Some(value) = table.get("folders") {
             if let Some(folders) = value.as_table() {
                 for (folder, value) in folders {
-                    let rule = if value.as_str() == Some("off") {
-                        "off"
-                    } else {
-                        errors.push(format!("folders.{folder}: expected \"off\""));
-                        cfg.unreadable_folders.push(folder.clone());
-                        "off"
+                    // A string loads as written, as it does when the rest of the file parses (a value other than
+                    // `off` is ignored, see `rule_holds`); only a value that isn't one can't be read.
+                    let rule = match value.as_str() {
+                        Some(rule) => rule,
+                        None => {
+                            errors.push(format!("folders.{folder}: expected \"off\""));
+                            cfg.unreadable_folders.push(folder.clone());
+                            "off"
+                        }
                     };
                     cfg.folders.insert(folder.clone(), rule.into());
                 }
@@ -521,6 +524,17 @@ mod tests {
         assert!(cfg.warning().is_none() && cfg.lan);
         assert!(!cfg.off_in("/work/api"));
         assert_eq!(cfg.odd_folders().len(), 1);
+    }
+
+    #[test]
+    fn a_folder_value_that_reads_is_kept_when_another_setting_does_not() {
+        // The same `on`, with a `port` that can't be read: the folder is still ignored, not turned off.
+        let cfg = Config::read_private("port = \"41641\"\n[folders]\n\"/work\" = \"on\"\n");
+        assert!(cfg.warning().is_some_and(|w| w.contains("port") && !w.contains("folders")));
+        assert!(!cfg.off_in("/work/api"));
+        assert_eq!(cfg.odd_folders().len(), 1);
+        // A value that isn't a string still can't be read, and the folder stays off.
+        assert!(Config::read_private("[folders]\n\"/work\" = 1\n").off_in("/work/api"));
     }
 
     #[test]
