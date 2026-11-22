@@ -155,6 +155,13 @@ impl TeamState {
     pub fn link_secret(&self) -> Option<&str> {
         self.link.as_ref().map(|l| l.body.secret.as_str())
     }
+    /// Whether the team link still lets someone in: `redeem` refuses it once it has expired or the machine that
+    /// made it has left the team.
+    pub fn link_usable(&self) -> bool {
+        self.link_secret()
+            .and_then(|s| self.invites.get(&hash(s)))
+            .is_some_and(|i| self.is_active(&i.by) && i.body.expires > util::now_ms())
+    }
 
     /// Replaces the team link: the old one stops working.
     pub fn new_link(&mut self, key: &SecretKey) {
