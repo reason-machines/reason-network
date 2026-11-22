@@ -73,20 +73,31 @@ impl Inner {
 
     /// Records an agent-to-agent message; false if this pair has been talking suspiciously much.
     fn loop_ok(&mut self, from: &str, to: &str) -> bool {
+        if self.loop_full(from, to) {
+            return false;
+        }
+        self.loop_record(from, to);
+        true
+    }
+
+    /// Whether this pair has been talking suspiciously much (without recording anything).
+    fn loop_full(&mut self, from: &str, to: &str) -> bool {
         // A person typing in a terminal (`<person>/terminal`) isn't an agent loop (as before, when such messages came
         // from the person).
         if from.ends_with("/terminal") {
-            return true;
+            return false;
         }
         let q = self.pairs.entry((from.to_string(), to.to_string())).or_default();
         while q.front().is_some_and(|t| t.elapsed() > LOOP_WINDOW) {
             q.pop_front();
         }
-        if q.len() >= LOOP_LIMIT {
-            return false;
+        q.len() >= LOOP_LIMIT
+    }
+
+    fn loop_record(&mut self, from: &str, to: &str) {
+        if !from.ends_with("/terminal") {
+            self.pairs.entry((from.to_string(), to.to_string())).or_default().push_back(Instant::now());
         }
-        q.push_back(Instant::now());
-        true
     }
 }
 
@@ -1027,19 +1038,22 @@ impl Daemon {
             }
             // Files take room here: past the quota, the sender's machine keeps the message and tries again later.
             let bytes = files::size(&msg.files);
+            let arrived = Instant::now();
             if bytes > 0 {
                 let kept = g.store.files_kept().context(Unavailable)?;
                 let from_sender = g.store.files_kept_from(&sender).context(Unavailable)?;
-                if let Err(why) = g.quota.admit(&sender, bytes, kept, from_sender, Instant::now()) {
+                if let Err(why) = g.quota.check(&sender, bytes, kept, from_sender, arrived) {
                     return Ok((
                         "retry".into(),
                         format!("queued: {} can't take these files now ({why}); retrying later", self.machine),
                     ));
                 }
             }
-            if !g.loop_ok(&msg.from, &msg.to) {
+            if g.loop_full(&msg.from, &msg.to) {
                 return Ok(("refused".into(), LOOP_NOTE.into()));
             }
+            // Counted once the message is stored (below, where `msg.from` is rewritten and `sender` shadowed).
+            let counted = (sender.clone(), msg.from.clone(), msg.to.clone());
             // Only an older Reason Network still sends an agent's group message; a teammate's isn't taken.
             let sender = msg.from.split_once('/').map_or(msg.from.as_str(), |(p, _)| p);
             if msg.via.is_some() && !msg.from.ends_with("/terminal") && sender != self.person {
@@ -1053,10 +1067,18 @@ impl Daemon {
             let held = policy == Policy::Hold;
             // Held for a session whose name is kept, it is that session's: it goes when the session does.
             let kept = held && g.store.session_by_name(name).context(Unavailable)?.is_some_and(|r| r.kept());
-            // Counted once, when it is new here; a held one once approved.
-            if g.store.insert(&mut msg, held).context(Unavailable)? && !held {
-                self.record_remote_received(&msg);
-                let _ = g.store.count(util::now_ms(), Counted::Received);
+            if g.store.insert(&mut msg, held).context(Unavailable)? {
+                // Only now, so a resend after a write that failed is neither another message for the loop guard nor
+                // more files for the quota.
+                g.loop_record(&counted.1, &counted.2);
+                if bytes > 0 {
+                    g.quota.record(&counted.0, bytes, arrived);
+                }
+                // Counted once, when it is new here; a held one once approved.
+                if !held {
+                    self.record_remote_received(&msg);
+                    let _ = g.store.count(util::now_ms(), Counted::Received);
+                }
             }
             let (state, note) = match key {
                 _ if kept => (
@@ -2649,5 +2671,103 @@ mod tests {
         assert_eq!(unread(), 2);
         drop(db);
         let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+    use crate::team::TeamState;
+    use iroh::SecretKey;
+
+    fn codex(key: &str) -> SessionReg {
+        SessionReg {
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: Tier::Pull,
+            name: None,
+            claude_dir: None,
+        }
+    }
+
+    fn setup() -> (Arc<Daemon>, rusqlite::Connection, std::path::PathBuf, SecretKey, String) {
+        let home = std::env::temp_dir().join(format!("reason-network-resend-{}", Ulid::generate()));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = crate::store::Store::open(&home.join("network.db"), home.join("inbox")).unwrap();
+        let d = Arc::new(Daemon::with(crate::config::Config::default(), store, SecretKey::generate()).unwrap());
+        let bob = SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        let to = d.register(Some(1), codex("codex:1"), crate::git::GitInfo::default()).unwrap().address;
+        let db = rusqlite::Connection::open(home.join("network.db")).unwrap();
+        (d, db, home, bob, to)
+    }
+
+    fn msg(from: &str, to: &str, files: Vec<Attachment>) -> Message {
+        Message {
+            id: Ulid::generate().to_string(),
+            from: from.into(),
+            from_agent: None,
+            from_repo: None,
+            to: to.into(),
+            via: None,
+            reply_to: None,
+            body: "the logs".into(),
+            wake: false,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files,
+        }
+    }
+
+    /// One message its machine resends while this one's database is failing: each "retry" is the same message, not a
+    /// new agent-to-agent message, so it must never end up refused as a loop.
+    #[test]
+    fn resending_one_message_while_the_store_fails_is_never_refused_as_a_loop() {
+        let (d, db, home, bob, to) = setup();
+        let m = msg("bob/web", &to, Vec::new());
+        // Writes fail, reads work: a full disk (SQLITE_FULL).
+        db.execute_batch(
+            "CREATE TRIGGER full BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+        )
+        .unwrap();
+        let mut states = Vec::new();
+        for _ in 0..13 {
+            states.push(d.receive(bob.public(), m.clone()).unwrap());
+        }
+        db.execute_batch("DROP TRIGGER full").unwrap();
+        let last = d.receive(bob.public(), m).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        for (i, (state, note)) in states.iter().enumerate() {
+            assert_eq!(state, "retry", "attempt {i}: {note}");
+        }
+        assert_eq!(last.0, "queued", "{}", last.1);
+    }
+
+    /// Files this machine never took (its disk failed, so the sender was told to retry) must not count against the
+    /// sender's hourly files quota. (From bob's terminal, which the loop guard leaves alone.)
+    #[test]
+    fn files_this_machine_could_not_store_do_not_use_up_the_senders_hourly_quota() {
+        let (d, _db, home, bob, to) = setup();
+        let files = vec![
+            Attachment { name: "a.txt".into(), content: "x".repeat(files::MAX_FILE), path: None },
+            Attachment { name: "b.txt".into(), content: "y".repeat(files::MAX_TOTAL - files::MAX_FILE), path: None },
+        ];
+        let m = msg("bob/terminal", &to, files);
+        std::fs::write(home.join("inbox"), "").unwrap();
+        for i in 0..40 {
+            let (state, note) = d.receive(bob.public(), m.clone()).unwrap();
+            assert_eq!(state, "retry", "attempt {i}: {note}");
+        }
+        assert_eq!(d.inner.lock().unwrap().store.files_kept().unwrap(), 0);
+        std::fs::remove_file(home.join("inbox")).unwrap();
+        let (state, note) = d.receive(bob.public(), m).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(state, "queued", "{note}");
     }
 }

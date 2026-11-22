@@ -403,9 +403,10 @@ pub struct Quota {
 }
 
 impl Quota {
-    /// Takes `bytes` of files from `sender`, with `kept` bytes of teammates' files on this machine already (`from_sender`
-    /// of them that person's), or says why not (a teammate's machine retries later).
-    pub fn admit(
+    /// Whether `bytes` of files from `sender` may be taken, with `kept` bytes of teammates' files on this machine
+    /// already (`from_sender` of them that person's), or why not (a teammate's machine retries later). Nothing is
+    /// counted until `record`, once the files are actually kept.
+    pub fn check(
         &mut self,
         sender: &str,
         bytes: usize,
@@ -432,7 +433,26 @@ impl Quota {
         if q.iter().map(|(_, b)| b).sum::<usize>() + bytes > QUOTA_SENDER_HOUR {
             return Err(format!("it takes {} MB of files an hour from {sender} at most", QUOTA_SENDER_HOUR >> 20));
         }
-        q.push_back((now, bytes));
+        Ok(())
+    }
+
+    /// Counts `bytes` of files kept from `sender` towards the hourly quota.
+    pub fn record(&mut self, sender: &str, bytes: usize, now: Instant) {
+        self.recent.entry(sender.to_string()).or_default().push_back((now, bytes));
+    }
+
+    /// `check`, then `record` if they may be taken.
+    #[cfg(test)]
+    pub fn admit(
+        &mut self,
+        sender: &str,
+        bytes: usize,
+        kept: usize,
+        from_sender: usize,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.check(sender, bytes, kept, from_sender, now)?;
+        self.record(sender, bytes, now);
         Ok(())
     }
 }
