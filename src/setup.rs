@@ -140,14 +140,20 @@ fn write_file(path: &Path, content: &str, dry: bool) -> Result<bool> {
     if path.exists() && !backup.exists() && !wired {
         std::fs::copy(path, &backup)?;
     }
+    // A config that is a symlink (kept in a dotfiles repository, say) is written through the link, so it stays one:
+    // the rename below would otherwise put a plain file in its place and cut it off from where the person keeps it.
+    // (Only a link is resolved, so a plain path goes through exactly as before.)
+    let linked = path.symlink_metadata().is_ok_and(|m| m.is_symlink());
+    let target =
+        if linked { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
     // Write then rename, so an agent never reads a half-written file.
-    let tmp = PathBuf::from(format!("{}.tmp-reason", path.display()));
+    let tmp = PathBuf::from(format!("{}.tmp-reason", target.display()));
     std::fs::write(&tmp, content)?;
     // Keep its permissions (a config holding tokens may be 0600).
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(&target) {
         std::fs::set_permissions(&tmp, meta.permissions())?;
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, &target)?;
     Ok(true)
 }
 
@@ -1709,6 +1715,36 @@ mod tests {
         assert!(doc.to_string().contains("MCPTool(reason-network__*)"));
         grok_allow(&mut doc, true);
         assert_eq!(doc.to_string(), "");
+    }
+
+    /// Makes `link` a symlink to `target`; false where this account may not make one (Windows without developer mode).
+    fn symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(target, link);
+        made.is_ok()
+    }
+
+    #[test]
+    fn a_config_that_is_a_symlink_is_written_through_it_and_stays_one() {
+        let dir = std::env::temp_dir().join(format!("reason-setup-{}", ulid::Ulid::generate()));
+        let (kept, home) = (dir.join("dotfiles"), dir.join("home"));
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let (real, link) = (kept.join("settings.json"), home.join("settings.json"));
+        std::fs::write(&real, "{}\n").unwrap();
+        if symlink(&real, &link) {
+            assert!(write_file(&link, "{\"a\": 1}\n", false).unwrap());
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink(), "the link is still a link");
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), "{\"a\": 1}\n", "the file it points to has the change");
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "{\"a\": 1}\n");
+            // Nothing else is left beside the real file but what was there.
+            let mut names: Vec<_> = std::fs::read_dir(&kept).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            assert_eq!(names, ["settings.json"]);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A file in a folder of its own.
