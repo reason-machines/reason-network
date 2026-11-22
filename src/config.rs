@@ -8,6 +8,11 @@ use std::{collections::BTreeMap, path::Path};
 pub struct Config {
     /// Your name in the team, e.g. `alex`. Defaults to `$USER`.
     pub person: Option<String>,
+    /// This machine's name in the team, e.g. `studio`. Defaults to the host name, which some hosts (containers, cloud
+    /// runtimes) set to something generic or change on every start. Taken when this machine creates or joins a team:
+    /// in one, the name the team gave it stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     #[serde(skip)]
     pub unreadable: Option<String>,
     #[serde(skip)]
@@ -72,6 +77,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             person: None,
+            machine: None,
             unreadable: None,
             all_folders_off: false,
             unreadable_folders: Vec::new(),
