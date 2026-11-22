@@ -145,6 +145,10 @@ type RemoteJob = (usize, EndpointId, String, bool, Message);
 const UPGRADE: &str =
     "update Reason Network (with the Reason CLI, `reason update`): messages go between agent sessions now";
 
+/// The note for mail to a hosted assistant reached through Reason, as Reason's own `send_message` words it.
+const THROUGH_REASON: &str = "queued: this agent is connected through Reason and only sees it the next time it calls \
+                              check_inbox (or its wake webhook starts it); it hasn't read it yet";
+
 const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messages in the last few minutes, which \
                          looks like a loop. Check with your user before continuing.";
 
@@ -567,6 +571,11 @@ impl Daemon {
         let l = &g.live[key];
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
+        }
+        // The waits on it are the relay's, which only hand the mail to Reason's inbox for the assistant. Only the
+        // relay's sessions (see `Live::relayed`): a Reason session's mail still goes out below.
+        if l.relayed() {
+            return ("queued".into(), THROUGH_REASON.into());
         }
         if g.polling.get(key).is_some_and(|n| *n > 0) {
             return ("delivered".into(), "delivered: the session was waiting for messages".into());
@@ -1725,6 +1734,139 @@ mod tests {
         // Started again: its offline wake mail gets another try at `codex queue`.
         d.hook(codex_hook("t1", "start", None)).await.unwrap();
         assert!(!failed());
+    }
+
+    /// A hook the Reason CLI's relay sends for a hosted assistant it carries (an app connected through Reason), or,
+    /// with `through_reason` false, one of the same agent running here.
+    fn app_hook(id: &str, event: &str, through_reason: bool) -> HookCall {
+        HookCall { through_reason: Some(through_reason), agent: "grok".into(), ..codex_hook(id, event, None) }
+    }
+
+    #[tokio::test]
+    async fn wake_mail_to_an_app_connected_through_reason_is_queued_while_the_relay_waits_and_reaches_that_wait() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        // The relay's session for the app, and the same agent in a session of its own: each waits in `check_inbox`.
+        for (id, through_reason) in [("app", true), ("own", false)] {
+            let to = d.hook(app_hook(id, "start", through_reason)).await.unwrap().address.unwrap();
+            let key = format!("grok:{id}");
+            let waiting = tokio::spawn({
+                let (d, key) = (d.clone(), key.clone());
+                async move { d.inbox(key, 5, false).await.unwrap() }
+            });
+            for _ in 0..500 {
+                if d.inner.lock().unwrap().polling.get(&key).is_some_and(|n| *n > 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let res = d.send("codex:s".into(), &to, "are you there?", None, true, false, None, Vec::new());
+            let sent = res.await.unwrap().recipients.remove(0);
+            if through_reason {
+                // The wait is the relay's: the app hasn't seen it, and its sender is told so.
+                assert_eq!((sent.state.as_str(), sent.note.as_str()), ("queued", THROUGH_REASON), "{id}");
+            } else {
+                assert_eq!(sent.state, "delivered", "{id}: {}", sent.note);
+            }
+            // Either way the wait gets it, at once: the relay hands it on to Reason's inbox for the app.
+            let t0 = std::time::Instant::now();
+            let got: Vec<String> = waiting.await.unwrap().messages.into_iter().map(|m| m.body).collect();
+            assert_eq!(got, ["are you there?"], "{id}");
+            assert!(t0.elapsed() < Duration::from_secs(2), "{id}");
+            assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty(), "{id}");
+            // Between the relay's waits too, and after its later hooks: queued for its next `check_inbox`.
+            d.hook(app_hook(id, "stop", through_reason)).await.unwrap();
+            let res = d.send("codex:s".into(), &to, "and now?", None, true, false, None, Vec::new());
+            let later = res.await.unwrap().recipients.remove(0);
+            assert_eq!(later.state, "queued", "{id}: {}", later.note);
+            assert_eq!(later.note == THROUGH_REASON, through_reason, "{id}: {}", later.note);
+            assert_eq!(d.inbox(key, 0, false).await.unwrap().messages.len(), 1, "{id}");
+            // FYI mail reads as it does for any session.
+            let res = d.send("codex:s".into(), &to, "fyi", None, false, false, None, Vec::new());
+            let fyi = res.await.unwrap().recipients.remove(0);
+            assert!(fyi.state == "queued" && fyi.note.starts_with("queued as FYI"), "{id}: {}", fyi.note);
+        }
+    }
+
+    /// A fake `reason` for `d` to run: it records each command's arguments in a file of its own in the folder returned.
+    #[cfg(unix)]
+    fn fake_reason(d: &Daemon) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reason-network-fake-reason-{}", Ulid::generate()));
+        let log = dir.join("commands");
+        std::fs::create_dir_all(&log).unwrap();
+        let bin = dir.join("reason");
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}/'$$\n", log.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d.fake_bins.lock().unwrap().insert("reason", bin);
+        log
+    }
+
+    /// The `reason session send` commands the fake recorded in `log`, once every one started has finished.
+    #[cfg(unix)]
+    async fn reason_sent(d: &Daemon, log: &std::path::Path) -> Vec<String> {
+        for _ in 0..1000 {
+            if d.inner.lock().unwrap().in_flight.is_empty() {
+                return std::fs::read_dir(log)
+                    .unwrap()
+                    .map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap())
+                    .collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("reason session send never finished");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wake_mail_to_a_reason_session_is_still_sent_into_it() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        let log = fake_reason(&d);
+        d.register(Some(1), codex("codex:s"), crate::git::GitInfo::default()).unwrap();
+        // As the sync with `reason session list` registers one: without a connection, to push into.
+        let reg = SessionReg {
+            agent: "reason".into(),
+            agent_session_id: Some("r1".into()),
+            tier: Tier::Push,
+            cwd: "~".into(),
+            ..codex("reason:r1")
+        };
+        let to = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
+        // It carries the flag an app connected through Reason has, and is not one.
+        {
+            let mut g = d.inner.lock().unwrap();
+            let l = g.live.get_mut("reason:r1").unwrap();
+            assert_eq!(l.through_reason, Some(true));
+            // Seen in that list just now, which keeps it.
+            l.last_hook = Some(util::now_ms());
+        }
+        let res = d.send("codex:s".into(), &to, "review this", None, true, false, None, Vec::new());
+        let sent = res.await.unwrap().recipients.remove(0);
+        assert!(sent.state == "pushed" && sent.note.starts_with("queued into the Reason session"), "{}", sent.note);
+        let commands = reason_sent(&d, &log).await;
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].starts_with("session send r1 --message "), "{commands:?}");
+        assert!(commands[0].contains("review this"), "{commands:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        // Mail a failed push left behind goes out the same way, when its sync sends it again.
+        let wait = Duration::from_secs(60);
+        d.inner.lock().unwrap().live.get_mut("reason:r1").unwrap().retry = Some((Instant::now() + wait, wait));
+        let res = d.send("codex:s".into(), &to, "left behind", None, true, false, None, Vec::new());
+        let held = res.await.unwrap().recipients.remove(0);
+        assert!(held.state == "queued" && held.note.starts_with("queued: Reason didn't take"), "{}", held.note);
+        let state = {
+            let mut g = d.inner.lock().unwrap();
+            g.live.get_mut("reason:r1").unwrap().retry = None;
+            let waiting = g.pending(&to).unwrap();
+            assert_eq!(waiting.len(), 1);
+            d.deliver(&mut g, "reason:r1", waiting, true).0
+        };
+        assert_eq!(state, "pushed");
+        let commands = reason_sent(&d, &log).await;
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands.iter().any(|c| c.contains("left behind")), "{commands:?}");
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
     /// A fake `codex` for `d` to run: it records each command, as `CODEX_HOME|arguments`, in a file of its own in the
