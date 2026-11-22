@@ -355,6 +355,10 @@ impl Daemon {
         if from_title && !g.live.get(key).is_some_and(|l| title_may_name(g, key, l).unwrap_or(false)) {
             return Ok(None);
         }
+        // Before anything is written: a session that isn't live here changes nothing.
+        if !g.live.contains_key(key) {
+            bail!("this session is not registered");
+        }
         let new_name = name.as_deref().map(util::slug);
         let mut reclaim = false;
         if let Some(n) = new_name.as_deref() {
@@ -2637,5 +2641,23 @@ mod tests {
                 assert_eq!(e.to_string(), OFF_HERE);
             }
         }
+    }
+
+    #[test]
+    fn a_status_from_a_session_that_is_not_registered_changes_nothing() {
+        let d = super::super::test_daemon(Default::default());
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        leave(&d, "claude-code:a", 0);
+        let former = |d: &Daemon| d.inner.lock().unwrap().store.former("claude-code:a").unwrap().map(|f| f.0);
+        assert_eq!(former(&d).as_deref(), Some("api-claude"));
+
+        // `reason-network status --name api-claude` from a shell whose session isn't live here.
+        let e = d.set_status("gemini:g", None, Some("api-claude".into()), Rename::Explicit).unwrap_err();
+        assert_eq!(e.to_string(), "this session is not registered");
+        assert_eq!(former(&d).as_deref(), Some("api-claude"), "the titled chat lost its old name");
+        assert!(!d.inner.lock().unwrap().store.name_settled("gemini:g").unwrap());
+        // So a new chat in the folder doesn't get the titled chat's old name.
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
     }
 }
