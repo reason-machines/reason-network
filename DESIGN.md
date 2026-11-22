@@ -157,7 +157,12 @@ subcommands:
 - `reason-network hook <agent>`: hook handler (status, context injection, stop-continuation, wake).
 - `reason-network who | send | listen | status | init | invite | join | setup | doctor`: the CLI. `send` goes out as
   the agent session whose shell runs it, `--from <session>`, or from a plain terminal as `<you>/terminal`;
-  `listen --as <name>` waits for the next message to `<you>/<name>`.
+  `listen --as <name>` waits for the next message to `<you>/<name>`, prints it, and exits.
+  With `--exec <command>`, it keeps listening and runs a shell command per message, one at a time in inbox order,
+  with the framed message on stdin. Only successful runs mark mail delivered; a failed or timed-out run exits
+  with the message and later mail unread. `--exec-timeout <secs>` defaults to 60 seconds.
+  `--wait` is the per-poll wait (default 600); empty polls keep waiting, or with `--wait 0`, exit after draining
+  waiting mail. Ctrl+C stops listening.
 
 Why Rust: iroh 1.x (QUIC dialed by public key, hole punching, HTTPS relays, mDNS) and rmcp (official MCP
 SDK) both exist and work today. Zig has neither, which is why agent-rpc's MCP shim had to be TypeScript.

@@ -13,6 +13,7 @@ mod git;
 mod hook;
 mod invite;
 mod ipc;
+mod listen;
 mod mcp;
 mod migrate;
 mod net;
@@ -300,14 +301,20 @@ enum Cmd {
     /// Restart the daemon
     Stop,
     /// Wait for the next message to a named session, print it, and exit (for agents without Reason Network's tools, e.g.
-    /// cloud agents: run it again after replying)
+    /// cloud agents: run it again after replying). With --exec, keep listening and run a command per message.
     Listen {
         /// The session's name; reachable as <you>/<name>
         #[arg(long = "as", default_value = "agent")]
         name: String,
-        /// Give up after this many seconds
+        /// Wait per poll in seconds; with --exec, poll again if empty (0 drains waiting mail and exits)
         #[arg(long, default_value_t = 600)]
         wait: u64,
+        /// Keep listening, running a shell command per message with framed text on stdin; failures stay unread
+        #[arg(long)]
+        exec: Option<String>,
+        /// Command timeout in seconds; commands run one at a time, and a timeout leaves mail unread
+        #[arg(long, default_value_t = 60, requires = "exec")]
+        exec_timeout: u64,
     },
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
@@ -619,10 +626,16 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 );
             }
         }
-        Cmd::Listen { name, wait } => {
+        Cmd::Listen { name, wait, exec, exec_timeout } => {
             let id = util::slug(&name);
             if id.is_empty() {
                 bail!("a session name needs letters or digits");
+            }
+            if let Some(command) = exec {
+                return tokio::select! {
+                    result = listen::listen(&link, &id, wait, &command, std::time::Duration::from_secs(exec_timeout)) => result,
+                    result = tokio::signal::ctrl_c() => { result?; Ok(()) }
+                };
             }
             let address = cli_session(&link, &id, "stop").await?.address.unwrap_or_default();
             let key = format!("cli:{id}");
@@ -864,6 +877,14 @@ pub async fn stop_daemon() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_exec_options() {
+        assert!(Cli::try_parse_from(["reason-network", "listen"]).is_ok());
+        assert!(Cli::try_parse_from(["reason-network", "listen", "--exec-timeout", "1"]).is_err());
+        let cli = Cli::try_parse_from(["reason-network", "listen", "--exec", "cat"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Listen { exec: Some(_), exec_timeout: 60, wait: 600, .. })));
+    }
 
     #[test]
     fn in_a_folder_that_is_off_the_terminal_goes_by_no_folder_and_an_agents_shell_gets_nothing() {
