@@ -1634,6 +1634,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_registration_that_lands_after_its_client_hung_up_does_not_stay_live() {
+        use tokio::io::AsyncWriteExt;
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let serving = tokio::spawn(d.clone().serve(server));
+        // An MCP server registers on its agent's first tool call, and the agent exits before the answer comes.
+        let reg = SessionReg { pid: Some(gone_pid()), ..claude("a") };
+        let line = serde_json::to_string(&Frame { id: 1, body: Request::Register { session: reg } }).unwrap();
+        let (rd, mut wr) = client.into_split();
+        wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        drop((rd, wr));
+        serving.await.unwrap();
+        // Give a registration still under way time to land, as it would on its own task.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut g = d.inner.lock().unwrap();
+        d.prune(&mut g);
+        assert!(!g.live.contains_key("claude-code:a"), "its process is gone, but the session stays live");
+    }
+
+    #[tokio::test]
     async fn geminis_mcp_server_goes_by_the_session_its_hooks_registered() {
         // Gemini gives its MCP servers no session id, only its hooks: its MCP server asks for the session the hooks of
         // its own process registered, and registers that, which keeps its hooks' tier.
