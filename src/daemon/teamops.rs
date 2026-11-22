@@ -490,17 +490,19 @@ impl Daemon {
         if let Some(net) = self.net() {
             net.online(Duration::from_secs(5)).await;
         }
-        let state = {
+        let (state, made) = {
             let mut g = self.inner.lock().unwrap();
             let team = g.team.as_mut().ok_or_else(|| anyhow!("not in a team yet: run `{CLI}`"))?;
-            if new || team.link_secret().is_none() {
+            // A link whose maker has left the team no longer lets anyone in, so it's replaced too.
+            let made = new || !team.link_usable();
+            if made {
                 team.new_link(&self.key);
             }
             let state = team.clone();
             self.save_team(&g)?;
-            state
+            (state, made)
         };
-        if new && let Some(net) = self.net() {
+        if made && let Some(net) = self.net() {
             net.broadcast(&Wire::State { state: Box::new(state.clone()) });
         }
         let secret = state.link_secret().expect("just made").to_string();
@@ -729,5 +731,32 @@ mod tests {
         assert!(sign_in_needs_a_link(&code.replace('-', " "), Some("jws")).is_err());
         assert!(sign_in_needs_a_link(&code, None).is_ok(), "codes still work without signing in");
         assert!(sign_in_needs_a_link("https://reasonmachines.com/network/join/#rn1-AAAA", Some("jws")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_team_link_is_replaced_when_its_maker_has_left() {
+        let founder = iroh::SecretKey::generate();
+        let cfg = Config { person: Some("alice".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let mut team = TeamState::found("acme", "alex", "mbp", &founder);
+        team.put_member(&founder, d.key.public(), "alice", &d.machine, true);
+        let first = team.link_secret().unwrap().to_string();
+        // The founder made the team link and then left the team, as `leave` does.
+        team.put_member(&founder, founder.public(), "alex", "mbp", false);
+        d.inner.lock().unwrap().team = Some(team);
+
+        let shown = Ticket::decode(&d.link(false).await.unwrap().ticket).unwrap();
+        assert_ne!(shown.secret, first, "the dead link was shown");
+        let req = JoinRequest {
+            team: shown.team,
+            secret: shown.secret.clone(),
+            person: "sam".into(),
+            machine: "nuc".into(),
+            proof: None,
+            owner_only: false,
+        };
+        d.redeem(iroh::SecretKey::generate().public(), &req).unwrap();
+        // A link that works is kept.
+        assert_eq!(Ticket::decode(&d.link(false).await.unwrap().ticket).unwrap().secret, shown.secret);
     }
 }
