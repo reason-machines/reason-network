@@ -305,7 +305,7 @@ enum Cmd {
         /// The session's name; reachable as <you>/<name>
         #[arg(long = "as", default_value = "agent")]
         name: String,
-        /// Give up after this many seconds
+        /// Give up after this many seconds (at most 600)
         #[arg(long, default_value_t = 600)]
         wait: u64,
     },
@@ -620,6 +620,8 @@ async fn cli(cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Listen { name, wait } => {
+            // The daemon waits no longer than this, so say how long it really was.
+            let wait = wait.min(daemon::MAX_WAIT);
             let id = util::slug(&name);
             if id.is_empty() {
                 bail!("a session name needs letters or digits");

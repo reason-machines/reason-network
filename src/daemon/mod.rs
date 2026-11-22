@@ -38,7 +38,7 @@ use tokio::{
 };
 
 const GIT_TTL: Duration = Duration::from_secs(30);
-const MAX_WAIT: u64 = 600;
+pub(crate) const MAX_WAIT: u64 = 600;
 
 /// Runs the daemon. Only one runs per state folder (`REASON_NETWORK_HOME`): a second one exits, or with `service` waits its turn.
 pub async fn run(service: bool) -> Result<()> {
