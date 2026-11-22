@@ -251,7 +251,7 @@ impl Config {
             anyhow::bail!(warning);
         }
         paths::ensure_home()?;
-        std::fs::write(paths::config(), toml::to_string_pretty(self)?)?;
+        util::write_atomic(&paths::config(), toml::to_string_pretty(self)?)?;
         Ok(())
     }
 
@@ -414,7 +414,7 @@ pub fn set_folder(folder: &str, off: bool) -> Result<(String, bool)> {
     }
     if doc.to_string() != text {
         paths::ensure_home()?;
-        std::fs::write(&file, doc.to_string())?;
+        util::write_atomic(&file, doc.to_string())?;
     }
     Ok((name, was_off != off))
 }
