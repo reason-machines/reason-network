@@ -579,6 +579,43 @@ mod tests {
         assert_eq!(g.store.counts(util::now_ms()).unwrap(), []);
     }
 
+    #[tokio::test]
+    async fn a_late_answer_in_antigravity_keeps_its_from_line_under_the_note() {
+        let cfg = crate::config::Config { person: Some("alex".into()), ..Default::default() };
+        let d = Arc::new(super::super::test_daemon(cfg));
+        let reg = crate::proto::SessionReg {
+            key: "antigravity:c1".into(),
+            agent: "antigravity".into(),
+            cwd: "/work/api".into(),
+            agent_session_id: None,
+            pid: None,
+            tier: crate::proto::Tier::Turn,
+            name: None,
+            claude_dir: None,
+        };
+        let address = d.register(None, reg, crate::git::GitInfo::default()).unwrap().address;
+        // Alex answers the pop-up after the call stopped waiting, then types to the same session from a terminal.
+        d.answer_later("antigravity:c1", "drop the staging table?", &Answer::Approved(String::new()));
+        let mut got = d.inner.lock().unwrap().store.unread(&address).unwrap();
+        assert_eq!(got[0].from, "alex/terminal");
+        got.push(Message { id: Ulid::generate().to_string(), body: "and the old backups".into(), ..got[0].clone() });
+        let note = crate::antigravity::TEAMMATE_NOTE;
+        for msgs in [&got[..1], &got[1..], &got[..]] {
+            let framed = crate::render::for_agent(msgs, Some("antigravity"), false);
+            assert!(framed.contains("From alex, typed in a terminal."), "{framed}");
+            // The note stays outside the frame, which reads as it does for every other agent.
+            let text = crate::hook::antigravity_text("antigravity:c1", true, &framed);
+            assert!(text.strip_prefix(note).is_some_and(|rest| rest[1..].starts_with(&framed)), "{text}");
+        }
+        // The note says where the mail came from, for however many messages. Whose word each is, its From line says:
+        // a note that calls the mail someone else's, or no instruction or approval, contradicts "From alex, typed in a
+        // terminal" on the answer the agent was told to expect this way.
+        for ruling in ["your user", "the user", "the system", "instruction", "approval"] {
+            assert!(!note.to_lowercase().contains(ruling), "the note rules on authority ({ruling}): {note}");
+        }
+        assert!(note.contains("messages below") && note.contains("From line"), "{note}");
+    }
+
     #[test]
     fn what_shows_is_what_is_there() {
         // A direction override can't turn text around, nor a spacer or tag character hide in it; joiners stay.

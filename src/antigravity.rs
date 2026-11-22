@@ -5,6 +5,12 @@ use serde_json::Value;
 use std::{process::Stdio, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
 
+/// Before mail in a conversation: it arrives as a step the model would otherwise take as typed there. It says where the
+/// mail came from and leaves whose it is to each From line: a late `ask_user` answer and the person's own
+/// `reason-network send` arrive this way too, from `<person>/terminal`.
+pub const TEAMMATE_NOTE: &str = "Reason Network: the messages below came over the team network, not typed in this \
+                                 conversation. Each one's From line says who sent it.";
+
 pub fn app_transcript(path: &str) -> bool {
     path.replace('\\', "/").contains("/.gemini/antigravity/brain/")
 }
@@ -31,6 +37,7 @@ pub async fn run() -> Result<()> {
                         let _ = link.call::<Value>(Request::PushFailed {key,ids}).await;
                         return;
                     };
+                    let text = format!("{TEAMMATE_NOTE}\n{text}");
                     let result = tokio::time::timeout(Duration::from_secs(30),
                         util::no_window(tokio::process::Command::from(command))
                             .args(["send-message", id, &text]).stdin(Stdio::null())
