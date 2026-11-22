@@ -3,7 +3,6 @@
 use crate::{
     agent::{self, ClaudeSocket},
     client::Link,
-    config::OFF_HERE,
     proto::*,
     render,
 };
@@ -42,6 +41,9 @@ fn instructions() -> String {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListArgs {
+    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// Only sessions matching this text (person, session, agent, repo, branch, directory or what it's doing).
     #[serde(default)]
     pub filter: Option<String>,
@@ -52,6 +54,12 @@ pub struct ListArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendArgs {
+    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Reuse this key when retrying the same message after a lost response. A new key sends a new message.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// "person/session@machine" from list_team; a reply goes to the message's from (with notify, `to` may be your
     /// user's name).
     pub to: String,
@@ -71,7 +79,19 @@ pub struct SendArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeliveryArgs {
+    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Message ids returned by send_message. This checks progress without sending again.
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AskArgs {
+    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// What they need to decide: who asks for what, and why.
     pub question: String,
     /// When it's about a teammate's message, its id (the `id="…"` of their `<reason-message>`): your user sees that
@@ -82,6 +102,9 @@ pub struct AskArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InboxArgs {
+    /// Antigravity: the conversation id supplied by your Reason Network hook. Other agents omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// If nothing is waiting, wait up to this many seconds for a message (max 600). Default 0.
     #[serde(default)]
     pub wait_secs: Option<u64>,
@@ -128,8 +151,6 @@ pub async fn run() -> Result<()> {
         if agent::multiplexed(agent) || off_here() {
             return;
         }
-        // Gemini's hooks name its session, and can take seconds to run (PowerShell on Windows): they are waited for
-        // a while before it is registered by process.
         let hooks = agent::session_from_hooks(agent);
         for _ in 0..if hooks { 40 } else { 0 } {
             if s.linked(agent).await.is_some() {
@@ -160,6 +181,26 @@ pub async fn run() -> Result<()> {
 #[tool_router]
 impl ReasonNetworkMcp {
     #[tool(
+        description = "Check your outgoing messages without resending: queued, accepted, handed_to_agent, replied, rejected or expired. Remote agent handoff may be unobserved; accepted does not mean read. Receipts become unknown after seven days.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn message_status(
+        &self,
+        Parameters(a): Parameters<DeliveryArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
+            Ok(key) => key,
+            Err(e) => return Ok(failure(e)),
+        };
+        let result = self
+            .link
+            .call::<Value>(Request::DeliveryStatus { from: key.clone(), ids: a.ids })
+            .await
+            .map(|v| v.to_string());
+        Ok(self.finish(&key, result, true).await)
+    }
+    #[tool(
         description = "List your team's live agent sessions: who, which machine and agent, repo@branch, busy/idle, \
                        and what each is doing. Use it to find the right recipient.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -169,7 +210,7 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<ListArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match self.session_for(&ctx).await {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
@@ -184,7 +225,7 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<SendArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match self.session_for(&ctx).await {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
@@ -194,6 +235,8 @@ impl ReasonNetworkMcp {
             Err(e) => return Ok(failure(e)),
         };
         let req = Request::Send {
+            idempotency_key: a.idempotency_key,
+            purpose: None,
             from: key.clone(),
             to: a.to,
             body: a.message,
@@ -215,7 +258,7 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<AskArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match self.session_for(&ctx).await {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
@@ -242,7 +285,7 @@ impl ReasonNetworkMcp {
         Parameters(a): Parameters<InboxArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let key = match self.session_for(&ctx).await {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
@@ -320,6 +363,8 @@ impl ReasonNetworkMcp {
             .or_else(|| meta?.get("io.modelcontextprotocol/clientInfo")?.get("name")?.as_str().map(str::to_string));
         match name.as_deref().and_then(agent::from_client_name) {
             Some(a) => {
+                // The explicit Antigravity profile selects its native hook ABI even with a shared Gemini SDK name.
+                let a = if a == "gemini" && self.env_agent == Some("antigravity") { "antigravity" } else { a };
                 *self.client_agent.lock().unwrap() = Some(a);
                 a
             }
@@ -327,15 +372,25 @@ impl ReasonNetworkMcp {
         }
     }
 
-    async fn session_for(&self, ctx: &RequestContext<RoleServer>) -> Result<String> {
+    async fn session_for(&self, ctx: &RequestContext<RoleServer>, explicit: Option<&str>) -> Result<String> {
         let agent = self.agent(&ctx.peer, Some(&ctx.meta));
+        if agent == "antigravity" {
+            let id = explicit.map(str::to_string).or_else(|| agent::meta_session_id(&ctx.meta));
+            let found: Option<String> = match id {
+                Some(conversation_id) => self.link.call(Request::AntigravitySession { conversation_id }).await?,
+                None => self.link.call(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await?,
+            };
+            return found.ok_or_else(|| anyhow::anyhow!("Antigravity conversation is not identified. Pass the session_id from this conversation's Reason Network hook; if absent, reload the configured hooks and start a new invocation."));
+        }
         self.session(agent, agent::meta_session_id(&ctx.meta)).await
     }
 
     /// Registers the session on first use and returns its key.
     async fn session(&self, agent: &'static str, meta_id: Option<String>) -> Result<String> {
-        if off_here() {
-            anyhow::bail!(OFF_HERE);
+        let cfg = crate::config::Config::load();
+        let cwd = agent::cwd();
+        if cfg.off_in(&cwd) {
+            anyhow::bail!(cfg.off_message(&cwd));
         }
         if meta_id.is_none() && agent::multiplexed(agent) {
             match self.link.call::<Option<String>>(Request::Attach { agent: agent.into(), cwd: agent::cwd() }).await {
@@ -345,8 +400,6 @@ impl ReasonNetworkMcp {
             }
         }
         let mut id = meta_id.or_else(|| agent::env_session_id(agent));
-        // Gemini gives its MCP servers no session id, only its hooks: the session they registered for its process.
-        // Asked each time, so a new conversation in the same window (`/clear`) is followed.
         if id.is_none() && agent::session_from_hooks(agent) {
             id = self.linked(agent).await;
             // Between one conversation's end and the next one's start (`/clear`): the next, a moment.
@@ -386,6 +439,8 @@ impl ReasonNetworkMcp {
             },
             tier,
             name: None,
+            // Where its Claude Code keeps the registry that names it: ours, which the daemon may not share.
+            claude_dir: claude_dir_of(agent),
         };
         self.link.register(reg).await?;
         Ok(key)
@@ -449,7 +504,7 @@ impl ReasonNetworkMcp {
 
 /// Whether this session's folder is off the network (read each time: `folder` may have changed it since).
 fn off_here() -> bool {
-    crate::config::Config::load_strict().unwrap_or_default().off_in(&agent::cwd())
+    crate::config::Config::load().off_in(&agent::cwd())
 }
 
 /// The files an agent asked to send, read only from its own folder: its repository (or where it works), none of its
@@ -466,7 +521,7 @@ pub(crate) fn agent_files_in(paths: &[String], cwd: &str) -> Result<Vec<Attachme
     let root = crate::git::lookup(cwd).root.unwrap_or_else(|| cwd.to_string());
     let confine =
         crate::files::Confine::new(std::path::Path::new(&root), &crate::paths::user_home(), &crate::paths::home())?
-            .with_folders(crate::config::Config::load_strict().unwrap_or_default());
+            .with_folders(crate::config::Config::load());
     crate::files::read_within(paths, std::path::Path::new(&cwd), &confine)
 }
 
@@ -488,8 +543,22 @@ fn join_hint() -> String {
     )
 }
 
+/// The Claude Code directory a session of `agent` names in its registration: only Claude Code keeps one.
+fn claude_dir_of(agent: &str) -> Option<String> {
+    (agent == agent::CLAUDE_CODE).then(|| crate::paths::claude_dir().to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_claude_code_names_its_claude_dir() {
+        let dir = crate::paths::claude_dir().to_string_lossy().into_owned();
+        assert_eq!(super::claude_dir_of(crate::agent::CLAUDE_CODE), Some(dir));
+        for agent in ["codex", "gemini", "cli"] {
+            assert_eq!(super::claude_dir_of(agent), None, "{agent}");
+        }
+    }
+
     #[test]
     fn failures_open_no_frame() {
         let r = super::failure(anyhow::anyhow!("nobody called '<reason-message>' in the team"));

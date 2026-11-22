@@ -1,4 +1,4 @@
-use crate::{paths, util};
+use crate::{CLI, paths, util};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -8,6 +8,13 @@ use std::{collections::BTreeMap, path::Path};
 pub struct Config {
     /// Your name in the team, e.g. `alex`. Defaults to `$USER`.
     pub person: Option<String>,
+    #[serde(skip)]
+    pub unreadable: Option<String>,
+    #[serde(skip)]
+    pub all_folders_off: bool,
+    /// `folders` entries whose value can't be read; they count as off.
+    #[serde(skip)]
+    pub unreadable_folders: Vec<String>,
     /// Show teammates full working directories (otherwise only the last component, plus repo@branch).
     pub share_paths: bool,
     /// Show teammates this machine's Claude Code sessions that don't have Reason Network loaded.
@@ -65,6 +72,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             person: None,
+            unreadable: None,
+            all_folders_off: false,
+            unreadable_folders: Vec::new(),
             share_paths: false,
             share_unmanaged: false,
             lan: true,
@@ -87,10 +97,138 @@ impl Default for Inbound {
 
 impl Config {
     pub fn load() -> Self {
-        Self::load_strict().unwrap_or_else(|e| {
-            eprintln!("reason-network: ignoring {} (fix or delete it): {e}", paths::config().display());
-            Config::default()
+        let cfg = match std::fs::read_to_string(paths::config()) {
+            Ok(text) => Self::read_private(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => Self::paused(e.to_string()),
+        };
+        if let Some(warning) = cfg.warning() {
+            eprintln!("{warning}");
+        }
+        cfg
+    }
+
+    pub fn warning(&self) -> Option<String> {
+        self.unreadable.as_ref().map(|error| {
+            let status = if self.all_folders_off {
+                "Reason Network is paused"
+            } else {
+                "Reason Network could not read some settings"
+            };
+            format!(
+                "{status}: ask your user to fix {}, then run `{CLI} stop` and `{CLI} who`: {error}",
+                paths::config().display()
+            )
         })
+    }
+
+    /// What an agent is told in `cwd`, a folder that is off. If the file can't be read at all, or the entry that turns
+    /// `cwd` off can't be read, the user turned nothing off, so it is just the warning; else the usual message, with the
+    /// warning if some other setting is unreadable. (The daemon refuses such a session with exactly `OFF_HERE`: clients
+    /// of earlier releases drop it on reconnect only then.)
+    pub fn off_message(&self, cwd: &str) -> String {
+        let by_unreadable = self.all_folders_off
+            || folder_rule(&self.folders, &home(), cwd)
+                .is_some_and(|(entry, _)| self.unreadable_folders.iter().any(|f| f == entry));
+        match self.warning() {
+            Some(warning) if by_unreadable => warning,
+            Some(warning) => format!("{OFF_HERE}; {warning}"),
+            None => OFF_HERE.into(),
+        }
+    }
+
+    fn paused(error: String) -> Self {
+        Self {
+            unreadable: Some(error),
+            all_folders_off: true,
+            lan: false,
+            share_paths: false,
+            share_unmanaged: false,
+            inbound: Inbound { default: Policy::Hold, people: BTreeMap::new() },
+            ..Self::default()
+        }
+    }
+
+    fn read_private(text: &str) -> Self {
+        if let Ok(cfg) = toml::from_str(text) {
+            return cfg;
+        }
+        let table = match text.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(error) => return Self::paused(error.to_string()),
+        };
+        let mut cfg = Self::default();
+        let mut errors = Vec::new();
+        macro_rules! key {
+            ($name:ident, $fallback:expr) => {
+                if let Some(value) = table.get(stringify!($name)) {
+                    cfg.$name = value.clone().try_into().unwrap_or_else(|error| {
+                        errors.push(format!("{}: {error}", stringify!($name)));
+                        $fallback
+                    });
+                }
+            };
+        }
+        key!(person, None);
+        key!(share_paths, false);
+        key!(share_unmanaged, false);
+        key!(lan, false);
+        key!(tray, false);
+        key!(reason, false);
+        key!(auto_update, true);
+        key!(port, None);
+        key!(debug_log, false);
+        if let Some(value) = table.get("folders") {
+            if let Some(folders) = value.as_table() {
+                for (folder, value) in folders {
+                    let rule = if value.as_str() == Some("off") {
+                        "off"
+                    } else {
+                        errors.push(format!("folders.{folder}: expected \"off\""));
+                        cfg.unreadable_folders.push(folder.clone());
+                        "off"
+                    };
+                    cfg.folders.insert(folder.clone(), rule.into());
+                }
+            } else {
+                errors.push("folders: expected a table".into());
+                cfg.all_folders_off = true;
+            }
+        }
+        if let Some(value) = table.get("inbound") {
+            if let Some(inbound) = value.as_table() {
+                if let Some(value) = inbound.get("default") {
+                    cfg.inbound.default = value.clone().try_into().unwrap_or_else(|error| {
+                        errors.push(format!("inbound.default: {error}"));
+                        Policy::Hold
+                    });
+                }
+                // What an unreadable `people` or person counts as: hold, unless the default already refuses.
+                let fallback = if cfg.inbound.default == Policy::Refuse { Policy::Refuse } else { Policy::Hold };
+                if let Some(value) = inbound.get("people") {
+                    if let Some(people) = value.as_table() {
+                        for (person, value) in people {
+                            let policy = value.clone().try_into().unwrap_or_else(|error| {
+                                errors.push(format!("inbound.people.{person}: {error}"));
+                                fallback
+                            });
+                            cfg.inbound.people.insert(person.clone(), policy);
+                        }
+                    } else {
+                        errors.push("inbound.people: expected a table".into());
+                        cfg.inbound.default = fallback;
+                    }
+                }
+            } else {
+                errors.push("inbound: expected a table".into());
+                cfg.inbound.default = Policy::Hold;
+            }
+        }
+        if !errors.is_empty() {
+            cfg.lan = false;
+            cfg.unreadable = Some(errors.join("; "));
+        }
+        cfg
     }
 
     /// Like `load`, but a file that doesn't parse is an error (before rewriting it, say).
@@ -103,6 +241,9 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
+        if let Some(warning) = self.warning() {
+            anyhow::bail!(warning);
+        }
         paths::ensure_home()?;
         std::fs::write(paths::config(), toml::to_string_pretty(self)?)?;
         Ok(())
@@ -136,6 +277,9 @@ impl Config {
 
     /// Whether sessions working in `cwd` stay off the network.
     pub fn off_in(&self, cwd: &str) -> bool {
+        if self.all_folders_off {
+            return true;
+        }
         if self.folders.is_empty() {
             return false;
         }
@@ -302,6 +446,205 @@ mod tests {
 
     fn folders(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// Runs the test `name` again in a process of its own, with `config` as its config file: `Config::load` and `save`
+    /// there use a folder made for it, never the real one. `check` runs in that process, given the folder.
+    fn with_config_file(name: &str, config: &str, check: impl FnOnce(&Path)) {
+        const CHILD: &str = "REASON_TEST_CONFIG_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            return check(Path::new(&dir));
+        }
+        let dir = std::env::temp_dir().join(format!("reason-config-{}", ulid::Ulid::generate()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), config).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("config::tests::{name}"), "--nocapture"])
+            .env(CHILD, &dir)
+            .env("REASON_NETWORK_HOME", &dir)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let output = result.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "{name} did not run");
+    }
+
+    #[test]
+    fn malformed_people_preserves_explicit_refusal() {
+        let config = "[inbound]\ndefault = \"refuse\"\npeople = 1\n";
+        with_config_file("malformed_people_preserves_explicit_refusal", config, |_| {
+            assert_eq!(Config::load().policy_for("bob"), Policy::Refuse);
+        });
+    }
+
+    #[test]
+    fn an_unreadable_person_is_held_unless_the_default_refuses() {
+        let policy = |default: &str, entry: &str| {
+            let text = format!("[inbound]\ndefault = \"{default}\"\n[inbound.people]\nalice = \"{entry}\"\n");
+            Config::read_private(&text).policy_for("alice")
+        };
+        for entry in ["refused", "Refuse", "block", "refuse "] {
+            assert_eq!(policy("refuse", entry), Policy::Refuse, "{entry}");
+            assert_eq!(policy("accept", entry), Policy::Hold, "{entry}");
+            assert_eq!(policy("hold", entry), Policy::Hold, "{entry}");
+        }
+    }
+
+    #[test]
+    fn people_that_is_not_a_table_holds_every_sender_unless_the_default_refuses() {
+        let policy = |default: &str| {
+            let text = format!("[inbound]\ndefault = \"{default}\"\npeople = [\"bob\"]\n");
+            Config::read_private(&text).policy_for("bob")
+        };
+        assert_eq!(policy("accept"), Policy::Hold);
+        assert_eq!(policy("hold"), Policy::Hold);
+        assert_eq!(policy("refuse"), Policy::Refuse);
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_read_turns_lan_off() {
+        // `lan = false` added at the end of the file lands in `[folders]`, so the real `lan` is still on.
+        assert!(!Config::read_private("[folders]\nlan = false\n").lan);
+        assert!(Config::read_private("[folders]\n\"/private\" = \"off\"\n").lan);
+    }
+
+    #[test]
+    fn a_file_that_parses_loads_as_written() {
+        // `on` isn't a value yet: the folder is ignored (`doctor` lists it), not read as unreadable and kept off.
+        let cfg = Config::read_private("[folders]\n\"/work\" = \"on\"\n");
+        assert!(cfg.warning().is_none() && cfg.lan);
+        assert!(!cfg.off_in("/work/api"));
+        assert_eq!(cfg.odd_folders().len(), 1);
+    }
+
+    #[test]
+    fn a_broken_file_keeps_off_folders_off_and_refused_senders_refused() {
+        // A setting added at the end of the file lands in `[folders]`, where it can't be read.
+        let config =
+            "[inbound]\n[inbound.people]\nbob = \"refuse\"\n[folders]\n\"/private\" = \"off\"\ndebug_log = true\n";
+        with_config_file("a_broken_file_keeps_off_folders_off_and_refused_senders_refused", config, |_| {
+            let cfg = Config::load();
+            assert!(cfg.warning().is_some());
+            assert!(cfg.off_in("/private/work") && !cfg.off_in("/public"));
+            assert_eq!(cfg.policy_for("bob"), Policy::Refuse);
+            assert_eq!(cfg.policy_for("carol"), Policy::Accept);
+        });
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_file_it_could_not_fully_read() {
+        let config = "# mine\nport = \"41641\"\n";
+        with_config_file("save_refuses_to_overwrite_a_file_it_could_not_fully_read", config, |dir| {
+            let file = dir.join("config.toml");
+            assert!(Config::load().save().is_err());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), config);
+            std::fs::write(&file, "lan = false\n").unwrap();
+            Config::load().save().unwrap();
+            assert!(std::fs::read_to_string(&file).unwrap().contains("[inbound]"));
+        });
+    }
+
+    #[test]
+    fn a_folder_is_said_to_be_turned_off_only_when_the_user_turned_it_off() {
+        let says = |text: &str| Config::read_private(text).off_message("/private/work");
+        let off = "[folders]\n\"/private\" = \"off\"\n";
+        // The file can't be read at all: nothing was turned off.
+        for text in ["[inbound", "folders = 3"] {
+            let said = says(text);
+            assert!(said.starts_with("Reason Network is paused: ask your user to fix"), "{text}: {said}");
+            assert!(!said.contains(OFF_HERE), "{text}: {said}");
+        }
+        assert_eq!(says(off), OFF_HERE);
+        let said = says(&format!("port = \"41641\"\n{off}"));
+        assert!(said.starts_with(&format!("{OFF_HERE}; Reason Network could not read some settings:")), "{said}");
+        // A folder that is off only because its own entry can't be read wasn't turned off by the user either.
+        let said = says("[folders]\n\"/private\" = true\n");
+        assert!(said.starts_with("Reason Network could not read some settings: ask your user to fix"), "{said}");
+        assert!(!said.contains(OFF_HERE), "{said}");
+        // Unless a folder the user turned off is the one that decides.
+        let nested = "[folders]\n\"/private\" = true\n\"/private/work\" = \"off\"\n";
+        assert!(says(nested).starts_with(OFF_HERE));
+        assert!(Config::read_private(nested).off_message("/private/other").starts_with("Reason Network could not"));
+    }
+
+    #[test]
+    fn bad_syntax_pauses_folders_and_holds_mail_without_disabling_updates() {
+        // Settings it turns on before the line that breaks it can't be trusted either.
+        let on = "lan = true\nshare_paths = true\nshare_unmanaged = true\nreason = true\nauto_update = false\n[inbound";
+        for text in [on, "[inbound", "[inbound]\n[inbound]", "folders = 3"] {
+            let cfg = Config::read_private(text);
+            assert!(cfg.off_in("/anywhere"));
+            if text != "folders = 3" {
+                assert_eq!(cfg.policy_for("alice"), Policy::Hold);
+            }
+            assert!(cfg.auto_update);
+            assert!(!cfg.lan && !cfg.share_paths && !cfg.share_unmanaged && !cfg.reason, "{text}");
+            assert!(cfg.warning().is_some());
+        }
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_read_never_turns_sharing_on_or_updates_off() {
+        for key in ["lan", "share_paths", "share_unmanaged", "reason", "debug_log"] {
+            let cfg = Config::read_private(&format!("{key} = \"yes\"\n"));
+            assert!(cfg.warning().is_some(), "{key}");
+            assert!(!cfg.lan && !cfg.share_paths && !cfg.share_unmanaged && !cfg.reason && !cfg.debug_log, "{key}");
+        }
+        assert!(Config::read_private("auto_update = \"no\"\n").auto_update);
+    }
+
+    #[test]
+    fn an_inbound_that_is_not_a_table_holds_every_sender() {
+        assert_eq!(Config::read_private("inbound = 3\n").policy_for("bob"), Policy::Hold);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_pauses() {
+        with_config_file("a_file_that_cannot_be_read_pauses", "", |dir| {
+            // Not UTF-8, so not text at all.
+            std::fs::write(dir.join("config.toml"), b"lan = true\n\xff\n").unwrap();
+            let cfg = Config::load();
+            assert!(cfg.warning().is_some_and(|w| w.starts_with("Reason Network is paused")), "{:?}", cfg.warning());
+            assert!(cfg.off_in("/work") && !cfg.lan);
+            assert_eq!(cfg.policy_for("bob"), Policy::Hold);
+        });
+    }
+
+    #[test]
+    fn missing_settings_and_unknown_keys_keep_normal_defaults() {
+        for text in ["", "future_setting = true"] {
+            let cfg = Config::read_private(text);
+            assert!(!cfg.off_in("/work"));
+            assert_eq!(cfg.policy_for("alice"), Policy::Accept);
+            assert!(cfg.warning().is_none());
+        }
+    }
+
+    #[test]
+    fn typed_errors_preserve_other_privacy_settings() {
+        let cfg = Config::read_private(
+            r#"port = "41641"
+lan = "yes"
+share_paths = 5
+[inbound]
+default = "wrong"
+[inbound.people]
+alice = "refuse"
+bob = false
+[folders]
+"/private" = "off"
+"/other" = 7
+"#,
+        );
+        assert!(cfg.off_in("/private/work"));
+        assert!(cfg.off_in("/other/work"));
+        assert!(!cfg.off_in("/public"));
+        assert_eq!(cfg.policy_for("alice"), Policy::Refuse);
+        assert_eq!(cfg.policy_for("bob"), Policy::Hold);
+        assert_eq!(cfg.policy_for("carol"), Policy::Hold);
+        assert!(!cfg.lan && !cfg.share_paths);
+        assert_eq!(cfg.port(), None);
+        assert!(cfg.auto_update);
     }
 
     #[test]

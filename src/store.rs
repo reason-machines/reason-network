@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -43,6 +43,7 @@ const COUNTS_TO: &str = "+1 day";
 /// Days of counts kept: the last ones started, in the order they started rather than by date, so a clock that jumps
 /// doesn't push out the real ones.
 const COUNTS_KEPT: i64 = 8;
+const RECEIPT_KEEP_MS: i64 = 7 * 86_400_000;
 
 /// A held message that can't be approved now, and why (it stays held).
 pub type Unsaved = (String, String);
@@ -101,6 +102,18 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS send_keys (
+    key TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    receipt TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sent_receipts (
+    id TEXT PRIMARY KEY, sender_key TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+    stage TEXT NOT NULL, sent_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS send_keys_created_at ON send_keys(created_at);
+CREATE INDEX IF NOT EXISTS sent_receipts_sent_at ON sent_receipts(sent_at);
 CREATE TABLE IF NOT EXISTS sessions (
     name TEXT PRIMARY KEY,
     key TEXT NOT NULL,
@@ -127,10 +140,118 @@ const MESSAGE_COLS: &str =
 const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox";
 
 impl Store {
+    pub fn record_sent(&self, key: &str, message: &Message, recipient: &str, state: &str) -> Result<()> {
+        let stage = match state {
+            "refused" => "rejected",
+            "held" => "held",
+            "queued" => "queued",
+            _ => "accepted",
+        };
+        self.prune_receipts(crate::util::now_ms())?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO sent_receipts VALUES (?1,?2,?3,?4,?5,?6,?6)",
+            params![message.id, key, message.from, recipient, stage, message.sent_at],
+        )?;
+        // Mail went from it: a reply goes to the name it sent from (see `settle_name`).
+        self.settle_name(key)
+    }
+    pub fn handoff(&self, ids: &[String], now: i64) -> Result<()> {
+        for id in ids {
+            self.db.execute(
+                "UPDATE sent_receipts SET stage='handed_to_agent',updated_at=?2 WHERE id=?1 AND stage <> 'replied'",
+                params![id, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn send_outcome(&self, id: &str, state: &str) -> Result<()> {
+        let stage = match state {
+            "refused" => "rejected",
+            "held" => "held",
+            "queued" => "queued",
+            _ => "accepted",
+        };
+        self.db.execute("UPDATE sent_receipts SET stage=?2,updated_at=?3 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')", params![id,stage,crate::util::now_ms()])?;
+        Ok(())
+    }
+
+    pub fn queue_again(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.db.execute("UPDATE sent_receipts SET stage='queued',updated_at=?2 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')", params![id,crate::util::now_ms()])?;
+        }
+        Ok(())
+    }
+    pub fn delivery_status(&self, key: &str, ids: &[String]) -> Result<Vec<serde_json::Value>> {
+        anyhow::ensure!(ids.len() <= 100, "request at most 100 delivery receipts");
+        let mut out = Vec::new();
+        for id in ids {
+            let found = self.db.query_row("SELECT recipient,stage,sent_at,updated_at FROM sent_receipts WHERE id=?1 AND sender_key=?2 AND sent_at>=?3", params![id,key,crate::util::now_ms()-RECEIPT_KEEP_MS], |r| Ok(serde_json::json!({"id":id,"recipient":r.get::<_,String>(0)?,"stage":r.get::<_,String>(1)?,"sentAt":r.get::<_,i64>(2)?,"updatedAt":r.get::<_,i64>(3)?}))).optional()?;
+            out.push(found.unwrap_or_else(|| serde_json::json!({"id":id,"stage":"unknown"})));
+        }
+        Ok(out)
+    }
+    /// Returns the nonce, saved receipt, and whether this call inserted the key.
+    /// No freshness claim escapes a failed fingerprint check or receipt lookup.
+    pub fn begin_send(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: i64,
+    ) -> Result<(String, Option<crate::proto::SendResult>, bool)> {
+        self.prune_receipts(now)?;
+        let inserted = self.db.execute(
+            "INSERT OR IGNORE INTO send_keys(key,fingerprint,created_at,nonce) VALUES(?1,?2,?3,?4)",
+            params![key, fingerprint, now, ulid::Ulid::generate().to_string()],
+        )?;
+        let (old, receipt, nonce): (String, Option<String>, String) =
+            self.db.query_row("SELECT fingerprint,receipt,nonce FROM send_keys WHERE key=?1", [key], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        anyhow::ensure!(
+            old == fingerprint,
+            "idempotency key already used for a different message; use a new key for a corrected or different message"
+        );
+        Ok((nonce, receipt.map(|v| serde_json::from_str(&v)).transpose()?, inserted == 1))
+    }
+
+    pub fn finish_send(&self, key: &str, receipt: &crate::proto::SendResult) -> Result<()> {
+        self.db
+            .execute("UPDATE send_keys SET receipt=?2 WHERE key=?1", params![key, serde_json::to_string(receipt)?])?;
+        Ok(())
+    }
+
+    fn prune_receipts(&self, now: i64) -> Result<()> {
+        self.db.execute("DELETE FROM sent_receipts WHERE sent_at < ?1", [now - RECEIPT_KEEP_MS])?;
+        self.db.execute("DELETE FROM send_keys WHERE created_at < ?1", [now - RECEIPT_KEEP_MS])?;
+        Ok(())
+    }
+
+    fn discard_receipt(&self, id: &str, stage: &str, now: i64) -> Result<()> {
+        self.db.execute("UPDATE sent_receipts SET stage=?2,updated_at=?3 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')",params![id,stage,now])?;
+        Ok(())
+    }
+    pub fn queue_health(&self, address: &str) -> Result<(u32, Option<i64>)> {
+        Ok(self.db.query_row(
+            "SELECT count(*), min(sent_at) FROM messages WHERE recipient=?1 AND read_at IS NULL AND held=0",
+            [address],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
     /// The database at `path`, and the folder `inbox` that messages' files are saved in.
     pub fn open(path: &Path, inbox: PathBuf) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        // Added when a title could name a session: a session remembered from before may have had its name chosen, and
+        // nothing says which, so a title names none of them. One transaction, so the table is never there without them.
+        {
+            let tx = db.unchecked_transaction()?;
+            if !tx.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settled_names'")?.exists([])? {
+                tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", [])?;
+                tx.execute("INSERT INTO settled_names (key) SELECT DISTINCT key FROM sessions", [])?;
+            }
+            tx.commit()?;
+        }
         // Deleted rows are overwritten, not just let go (see `scrub`).
         db.execute_batch("PRAGMA secure_delete = ON;")?;
         // Only this user reads it, like machine.key: it holds the team link. (SQLite gives the log files the mode the
@@ -170,6 +291,26 @@ impl Store {
                 [],
             )?;
             tx.commit()?;
+        }
+        for (column, definition) in [
+            ("native_app", "INTEGER NOT NULL DEFAULT 0"),
+            ("native_hook_at", "INTEGER"),
+            ("native_dirs", "TEXT NOT NULL DEFAULT '[]'"),
+            // The `CODEX_HOME` a Codex session's hooks named, for mail to reach it while it is offline.
+            ("codex_home", "TEXT"),
+            // The default name a session went by before its conversation's title named it: still its own, with its
+            // mail, for as long as the session is remembered (see `session_by_name`).
+            ("former", "TEXT"),
+            // Its hooks have told it the name it goes by now, in place of `former`.
+            ("told_renamed", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
+                db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
+            }
+        }
+        if !db.prepare("SELECT 1 FROM pragma_table_info('send_keys') WHERE name='nonce'")?.exists([])? {
+            // Empty preserves the identity derivation of an unfinished send from an earlier engine. New keys get a nonce.
+            db.execute("ALTER TABLE send_keys ADD COLUMN nonce TEXT NOT NULL DEFAULT ''", [])?;
         }
         Ok(Store { db, inbox })
     }
@@ -225,6 +366,18 @@ impl Store {
                 held
             ],
         );
+        if n.as_ref().is_ok_and(|n| *n == 1) && !held {
+            let _ = self.observe_reply(m);
+        }
+        // Mail went to the session with this name: its name is settled (see `settle_name`).
+        if n.as_ref().is_ok_and(|n| *n == 1)
+            && let Some((_, name)) = m.to.split_once('/')
+        {
+            let _ = self.db.execute(
+                "INSERT OR IGNORE INTO settled_names (key) SELECT key FROM sessions WHERE name = ?1",
+                [name.split('@').next().unwrap_or(name)],
+            );
+        }
         match (n, saved, kept) {
             (Ok(n), Some(dir), Some(k)) => {
                 m.files = files::located(&dir, &k.files);
@@ -243,6 +396,40 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let sql = format!("SELECT {MESSAGE_COLS}, held FROM messages WHERE id = ?1");
         Ok(self.db.query_row(&sql, [id], |r| self.row(r)).optional()?)
+    }
+
+    /// The machine that took message `id` delivered it to `to`, the name the session it was sent to (at `from`, the
+    /// default name it went by before its title named it) goes by now: a reply from there is the one it waits for.
+    /// A reply from there that came before this (its machine sent it first, as it flushed its outbox on a reconnect)
+    /// counts now, checked as `observe_reply` checks one.
+    pub fn readdress_receipt(&self, id: &str, from: &str, to: &str) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        let n = transaction.execute(
+            "UPDATE sent_receipts SET recipient = ?3 WHERE id = ?1 AND recipient = ?2",
+            params![id, from, to],
+        )?;
+        if n > 0 {
+            transaction.execute(
+                "UPDATE sent_receipts SET stage = 'replied', updated_at = ?2 WHERE id = ?1 AND stage <> 'replied' \
+                 AND EXISTS (SELECT 1 FROM messages m WHERE m.reply_to = ?1 AND m.held = 0 \
+                 AND m.sender = sent_receipts.recipient AND m.recipient = sent_receipts.sender)",
+                params![id, crate::util::now_ms()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Who message `id` was sent to, as its receipt says.
+    pub fn receipt_recipient(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT recipient FROM sent_receipts WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+    }
+
+    fn observe_reply(&self, message: &Message) -> Result<()> {
+        if let Some(reply) = &message.reply_to {
+            self.db.execute("UPDATE sent_receipts SET stage='replied',updated_at=?4 WHERE id=?1 AND recipient=?2 AND sender=?3 AND stage <> 'replied'", params![reply,message.from,message.to,crate::util::now_ms()])?;
+        }
+        Ok(())
     }
 
     pub fn has(&self, id: &str) -> Result<bool> {
@@ -301,6 +488,7 @@ impl Store {
     /// without them), and a message held a week with files goes altogether. Then deletes every folder in the inbox
     /// folder that no kept message names.
     pub fn sweep_files(&self, now: i64) -> Result<()> {
+        self.prune_receipts(now)?;
         let mut st = self.db.prepare("SELECT id, files, read_at, held FROM messages WHERE files IS NOT NULL")?;
         let rows: Vec<(String, String, Option<i64>, bool)> =
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -312,6 +500,7 @@ impl Store {
             let fresh = came.is_some_and(|t| t > now - files::KEEP_UNREAD_MS);
             if held {
                 if !fresh {
+                    self.discard_receipt(&id, "expired", now)?;
                     self.db.execute("DELETE FROM messages WHERE id = ?1", [&id])?;
                 }
             } else if (read_at.is_none() && fresh) || read_at.is_some_and(|t| t > now - files::KEEP_MS) {
@@ -340,7 +529,10 @@ impl Store {
         let (mut done, mut unsaved) = (Vec::new(), Vec::new());
         for mut m in picked {
             if !release {
+                let transaction = self.db.unchecked_transaction()?;
+                self.discard_receipt(&m.id, "rejected", crate::util::now_ms())?;
                 self.db.execute("DELETE FROM messages WHERE id = ?1", [&m.id])?;
+                transaction.commit()?;
                 done.push(m);
                 continue;
             }
@@ -371,6 +563,7 @@ impl Store {
                 return Err(e.into());
             }
             let _ = self.count(crate::util::now_ms(), Counted::Received);
+            let _ = self.observe_reply(&m);
             done.push(m);
         }
         Ok((done, unsaved))
@@ -385,20 +578,29 @@ impl Store {
     }
 
     /// Undelivered messages for a machine; older than a week are given up on.
-    pub fn outbox_for(&self, target: &str, now: i64) -> Result<Vec<Message>> {
-        self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
+    pub fn outbox_for(&self, target: &str, now: i64) -> Result<(Vec<Message>, usize)> {
+        let expired = self.db.execute("DELETE FROM outbox WHERE created_at < ?1", [now - 7 * 86_400_000])?;
         let mut st = self.db.prepare_cached("SELECT msg FROM outbox WHERE target = ?1 ORDER BY created_at, rowid")?;
         let rows = st.query_map([target], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect())
+        Ok((rows.filter_map(|r| r.ok().and_then(|s| serde_json::from_str(&s).ok())).collect(), expired))
     }
 
     /// The receiving machine answered for a message: it leaves the outbox, and counts as sent if that machine took it
     /// (once, however many answers come).
-    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<()> {
-        if self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1 && taken {
-            let _ = self.count(crate::util::now_ms(), Counted::Sent);
+    pub fn outbox_done(&self, id: &str, taken: bool) -> Result<bool> {
+        let transaction = self.db.unchecked_transaction()?;
+        let removed = self.db.execute("DELETE FROM outbox WHERE id = ?1", [id])? == 1;
+        if removed {
+            self.db.execute(
+                "UPDATE sent_receipts SET stage=?3,updated_at=?2 WHERE id=?1 AND stage NOT IN ('handed_to_agent','replied')",
+                params![id, crate::util::now_ms(), if taken {"accepted"} else {"rejected"}],
+            )?;
+            if taken {
+                let _ = self.count(crate::util::now_ms(), Counted::Sent);
+            }
         }
-        Ok(())
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Adds one to today's count (by UTC day). Only numbers are kept, and only for the last few days.
@@ -462,22 +664,32 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_read(&self, ids: &[String], now: i64) -> Result<()> {
+    pub fn mark_read(&self, ids: &[String], now: i64) -> Result<Vec<String>> {
         let mut st = self.db.prepare_cached("UPDATE messages SET read_at = ?2 WHERE id = ?1 AND read_at IS NULL")?;
+        let mut changed = Vec::new();
         for id in ids {
-            st.execute(params![id, now])?;
+            if st.execute(params![id, now])? > 0 {
+                changed.push(id.clone());
+            }
         }
-        Ok(())
+        Ok(changed)
     }
 
-    /// A renamed session keeps its unread mail.
-    pub fn rename(&self, old_name: &str, new_name: &str, old_addr: &str, new_addr: &str) -> Result<()> {
-        self.db.execute(
+    /// Unread mail follows a rename. On reclaim, keep the claimant attached so a later registration cannot inherit the mail.
+    pub fn rename(&self, person: &str, old_name: &str, new_name: &str, claimant: Option<&str>) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        transaction.execute(
             "UPDATE messages SET recipient = ?2 WHERE recipient = ?1 AND read_at IS NULL",
-            params![old_addr, new_addr],
+            params![format!("{person}/{old_name}"), format!("{person}/{new_name}")],
         )?;
-        self.db.execute("DELETE FROM sessions WHERE name = ?1", [new_name])?;
-        self.db.execute("UPDATE sessions SET name = ?2 WHERE name = ?1", params![old_name, new_name])?;
+        transaction.execute("DELETE FROM sessions WHERE name = ?1", [new_name])?;
+        let moved = transaction.execute(
+            "UPDATE sessions SET name = ?2, attached = max(attached, ?3 IS NOT NULL)
+             WHERE name = ?1 AND (?3 IS NULL OR key = ?3)",
+            params![old_name, new_name, claimant],
+        )?;
+        anyhow::ensure!(claimant.is_none() || moved == 1, "the session being renamed is no longer registered");
+        transaction.commit()?;
         Ok(())
     }
 
@@ -489,7 +701,7 @@ impl Store {
             st.query_map(params![s.key, s.name], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         for old in before {
-            self.rename(&old, &s.name, &format!("{person}/{old}"), &format!("{person}/{}", s.name))?;
+            self.rename(person, &old, &s.name, None)?;
         }
         // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
@@ -498,7 +710,13 @@ impl Store {
                  ON CONFLICT (name) DO UPDATE SET key = ?2, agent = ?3, cwd = ?4, repo = ?5, branch = ?6,
                  doing = ?7, tier = ?8, last_seen = ?9,
                  attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END,
-                 mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END"
+                 mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
+                 native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
+                 native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
+                 native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
+                 codex_home = CASE WHEN key = ?2 THEN codex_home ELSE NULL END,
+                 former = CASE WHEN key = ?2 THEN former ELSE NULL END,
+                 told_renamed = CASE WHEN key = ?2 THEN told_renamed ELSE 0 END"
             ),
             params![
                 s.name,
@@ -539,6 +757,7 @@ impl Store {
     /// the name was kept for the session: it was that conversation's, never the next one's. Otherwise it stays the
     /// person's to settle, for whoever has the name.
     pub fn forget_session(&self, r: &Remembered, person: &str) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
         let unread = if r.kept() {
             "FROM messages WHERE recipient = ?1 AND read_at IS NULL"
         } else {
@@ -548,14 +767,28 @@ impl Store {
         let to = format!("{person}/{name}");
         let mut cols = self.db.prepare_cached(&format!("SELECT files {unread} AND files IS NOT NULL"))?;
         let cols: Vec<String> = cols.query_map([&to], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        self.db.execute(&format!("UPDATE sent_receipts SET stage='expired',updated_at=?2 WHERE id IN (SELECT id {unread}) AND stage NOT IN ('handed_to_agent','replied')"),params![to,crate::util::now_ms()])?;
         self.db.execute(&format!("DELETE {unread}"), [&to])?;
+        self.db.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+        transaction.commit()?;
         for kept in cols.iter().filter_map(|c| serde_json::from_str::<Kept>(c).ok()) {
             if let Some(dir) = self.dir(&kept) {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
-        self.db.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
         Ok(())
+    }
+
+    /// Settles a session's name: a title never renames it. Someone chose it (`/rename`, `set_name`, a name it
+    /// registered with), it came from the conversation's title, or mail went to or from it (a reply goes to the name
+    /// the mail had).
+    pub fn settle_name(&self, key: &str) -> Result<()> {
+        self.db.execute("INSERT OR IGNORE INTO settled_names (key) VALUES (?1)", [key])?;
+        Ok(())
+    }
+
+    pub fn name_settled(&self, key: &str) -> Result<bool> {
+        Ok(self.db.prepare_cached("SELECT 1 FROM settled_names WHERE key = ?1")?.exists([key])?)
     }
 
     pub fn session_by_key(&self, key: &str) -> Result<Option<Remembered>> {
@@ -563,15 +796,94 @@ impl Store {
         Ok(self.db.query_row(&sql, [key], remembered).optional()?)
     }
 
+    /// The session remembered as `name`: by its name, or else by the default name it went by before its title named
+    /// it (`former`), which stays its own while it is remembered.
     pub fn session_by_name(&self, name: &str) -> Result<Option<Remembered>> {
-        let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE name = ?1");
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE name = ?1 OR former = ?1 ORDER BY name = ?1 DESC, last_seen DESC \
+             LIMIT 1"
+        );
         Ok(self.db.query_row(&sql, [name], remembered).optional()?)
+    }
+
+    /// Remembers the default name the session `name` went by before its title named it (`None`: no such name), and
+    /// whether its hooks have told it the name it goes by now.
+    pub fn set_former(&self, name: &str, former: Option<&str>, told: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = ?2, told_renamed = ?3 WHERE name = ?1",
+            params![name, former, former.is_some() && told],
+        )?;
+        Ok(())
+    }
+
+    /// The default name the session `key` went by before its title named it, as remembered, and whether its hooks
+    /// told it its name now.
+    pub fn former(&self, key: &str) -> Result<Option<(String, bool)>> {
+        let sql = "SELECT former, told_renamed FROM sessions WHERE key = ?1 ORDER BY last_seen DESC LIMIT 1";
+        let row: Option<(Option<String>, bool)> =
+            self.db.query_row(sql, [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        Ok(row.and_then(|(f, told)| Some((f?, told))))
+    }
+
+    /// `key` takes `name`: a remembered session that went by it before its title named it, and has not kept it, gives
+    /// it up for good, so it never comes back to that session after a restart.
+    pub fn give_up_former(&self, name: &str, key: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET former = NULL, told_renamed = 0 WHERE former = ?1 AND key <> ?2",
+            params![name, key],
+        )?;
+        Ok(())
+    }
+
+    /// Each remembered session's former default name (see `set_former`), by its name now.
+    pub fn formers(&self) -> Result<HashMap<String, String>> {
+        let mut st = self.db.prepare_cached("SELECT name, former FROM sessions WHERE former IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn sessions(&self) -> Result<Vec<Remembered>> {
         let mut st = self.db.prepare_cached(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY name"))?;
         let rows = st.query_map([], remembered)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `CODEX_HOME` the hooks of the Codex session `key` run with (`None`: the default home).
+    pub fn remember_codex_home(&self, key: &str, home: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE sessions SET codex_home=?2 WHERE key=?1 AND agent='codex'", params![key, home])?;
+        Ok(())
+    }
+
+    pub fn codex_home(&self, key: &str) -> Result<Option<String>> {
+        let sql = "SELECT codex_home FROM sessions WHERE key=?1 AND agent='codex' ORDER BY last_seen DESC LIMIT 1";
+        Ok(self.db.query_row(sql, [key], |r| r.get(0)).optional()?.flatten())
+    }
+
+    pub fn remember_native_app(&self, key: &str, hook_at: Option<i64>, dirs: &[String]) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET native_app=?2,native_hook_at=?3,native_dirs=?4 WHERE key=?1 AND agent='antigravity'",
+            params![key, hook_at.is_some(), hook_at, serde_json::to_string(dirs)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn native_app_roots(&self, key: &str) -> Result<Option<Vec<String>>> {
+        let roots: Option<String> = self
+            .db
+            .query_row(
+                "SELECT native_dirs FROM sessions WHERE key=?1 AND agent='antigravity' AND native_app=1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(roots.map(|value| serde_json::from_str::<Vec<String>>(&value)).transpose()?.filter(|dirs| !dirs.is_empty()))
+    }
+
+    pub fn native_app_sessions(&self, since: i64) -> Result<Vec<(Remembered, i64)>> {
+        let mut statement=self.db.prepare(&format!("SELECT {SESSION_COLS},native_hook_at FROM sessions WHERE native_app=1 AND agent='antigravity' AND last_seen>=?1 AND native_hook_at IS NOT NULL"))?;
+        Ok(statement
+            .query_map([since], |row| Ok((remembered(row)?, row.get(11)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 }
 
@@ -627,6 +939,146 @@ mod tests {
     use super::*;
     use crate::util;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_failed_reclaim_keeps_the_sessions_and_their_unread_mail() {
+        let inbox = temp_inbox();
+        let store = Store::open(Path::new(":memory:"), inbox.clone()).unwrap();
+        for name in ["old", "new"] {
+            store
+                .upsert_session(
+                    &Remembered {
+                        name: name.into(),
+                        key: name.into(),
+                        agent: "codex".into(),
+                        cwd: "~".into(),
+                        repo: None,
+                        branch: None,
+                        doing: None,
+                        tier: Tier::Pull,
+                        last_seen: 0,
+                        attached: name == "new",
+                        mailbox: false,
+                    },
+                    "lars",
+                )
+                .unwrap();
+        }
+        store.insert(&mut message("pending", "lars/old"), false).unwrap();
+        store.insert(&mut with_files("held", "lars/new"), true).unwrap();
+        store.insert(&mut message("already-read", "lars/old"), false).unwrap();
+        store.mark_read(&["already-read".into()], 1).unwrap();
+        for key in ["old", "new"] {
+            store.remember_codex_home(key, Some(key)).unwrap();
+        }
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER fail_rename BEFORE UPDATE OF name ON sessions
+            BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .unwrap();
+        assert!(store.rename("lars", "old", "new", Some("old")).is_err());
+        assert_eq!(store.unread("lars/old").unwrap().len(), 1);
+        assert!(store.unread("lars/new").unwrap().is_empty());
+        assert!(!store.session_by_name("old").unwrap().unwrap().attached);
+        assert_eq!(store.session_by_name("new").unwrap().unwrap().key, "new");
+        assert_eq!(store.held().unwrap()[0].id, "held");
+        store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
+        store.rename("lars", "old", "new", Some("old")).unwrap();
+        assert!(store.unread("lars/old").unwrap().is_empty());
+        assert_eq!(store.unread("lars/new").unwrap().len(), 1);
+        let owner = store.session_by_name("new").unwrap().unwrap();
+        assert_eq!(owner.key, "old");
+        assert!(owner.kept());
+        assert!(store.session_by_key("new").unwrap().is_none());
+        assert_eq!(store.codex_home("old").unwrap().as_deref(), Some("old"));
+        assert_eq!(store.message("already-read").unwrap().unwrap().to, "lars/old");
+        let (released, errors) = store.settle_held(&["held".into()], true).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(released[0].to, "lars/new");
+        assert_eq!(std::fs::read_to_string(folder(&released[0]).join("notes.md")).unwrap(), "# notes\n");
+        std::fs::remove_dir_all(inbox).unwrap();
+    }
+
+    #[test]
+    fn sessions_remembered_from_before_titles_keep_their_names() {
+        let dir = std::env::temp_dir().join(format!("reason-network-store-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("network.db");
+        let session = Remembered {
+            name: "api-claude-3".into(),
+            key: "claude-code:old".into(),
+            agent: "claude-code".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        // A database from an engine before titles named sessions: whether `api-claude-3` was chosen, nothing says.
+        {
+            let store = Store::open(&db, temp_inbox()).unwrap();
+            store.upsert_session(&session, "alex").unwrap();
+            store.db.execute("DROP TABLE settled_names", []).unwrap();
+            // A migration cut short (the engine stopped before the backfill) leaves no table behind to skip it next time.
+            let tx = store.db.unchecked_transaction().unwrap();
+            tx.execute("CREATE TABLE settled_names (key TEXT PRIMARY KEY)", []).unwrap();
+            drop(tx);
+        }
+        let store = Store::open(&db, temp_inbox()).unwrap();
+        assert!(store.name_settled("claude-code:old").unwrap());
+        assert!(!store.name_settled("claude-code:new").unwrap());
+        // Opened again, it settles no more: a session since is the one it was.
+        store
+            .upsert_session(&Remembered { name: "api-claude".into(), key: "claude-code:new".into(), ..session }, "alex")
+            .unwrap();
+        drop(store);
+        assert!(!Store::open(&db, temp_inbox()).unwrap().name_settled("claude-code:new").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_rename_through_upsert_keeps_everything_and_the_store_writes_on() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let r = |name: &str| Remembered {
+            name: name.into(),
+            key: "k".into(),
+            agent: "codex".into(),
+            cwd: "~".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: 0,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&r("old"), "lars").unwrap();
+        store.insert(&mut message("pending", "lars/old"), false).unwrap();
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER fail_rename BEFORE UPDATE OF name ON sessions
+            BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .unwrap();
+        assert!(store.upsert_session(&r("new"), "lars").is_err());
+        assert!(store.db.is_autocommit());
+        assert_eq!(store.unread("lars/old").unwrap().len(), 1);
+        assert!(store.unread("lars/new").unwrap().is_empty());
+        assert_eq!(store.sessions().unwrap().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), ["old"]);
+        // Later writes are their own, not left in an open transaction.
+        store.insert(&mut message("later", "lars/old"), false).unwrap();
+        assert!(store.db.is_autocommit());
+        store.db.execute_batch("DROP TRIGGER fail_rename").unwrap();
+        store.upsert_session(&r("new"), "lars").unwrap();
+        assert_eq!(store.unread("lars/new").unwrap().len(), 2);
+        assert_eq!(store.sessions().unwrap().iter().map(|s| s.name.clone()).collect::<Vec<_>>(), ["new"]);
+    }
 
     #[test]
     #[cfg(unix)]
@@ -731,7 +1183,7 @@ mod tests {
         store.outbox_done("01TAKEN", true).unwrap();
         store.outbox_done("01TAKEN", true).unwrap();
         store.outbox_done("01REFUSED", false).unwrap();
-        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().is_empty());
+        assert!(store.outbox_for("peer", util::now_ms() + 8 * 86_400_000).unwrap().0.is_empty());
         assert_eq!(totals(&store), (1, 0));
         // Received: held, it counts once approved. Dropped, then sent again after a lost answer, it counts once.
         store.insert(&mut with_files("01HELD", "lars/api"), true).unwrap();
@@ -745,6 +1197,31 @@ mod tests {
         store.insert(&mut with_files("01NEW", "lars/api"), false).unwrap();
         assert_eq!(totals(&store), (1, 1));
         std::fs::remove_dir_all(&inbox).unwrap();
+    }
+
+    #[test]
+    fn a_codex_sessions_home_stays_with_it_and_never_goes_to_the_next_session_with_its_name() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let session = |key: &str| Remembered {
+            name: "api-codex".into(),
+            key: key.into(),
+            agent: "codex".into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen: 1,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&session("codex:t1"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap(), None);
+        store.remember_codex_home("codex:t1", Some("/work/.codex-b")).unwrap();
+        store.upsert_session(&Remembered { last_seen: 2, ..session("codex:t1") }, "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t1").unwrap().as_deref(), Some("/work/.codex-b"));
+        store.upsert_session(&session("codex:t2"), "lars").unwrap();
+        assert_eq!(store.codex_home("codex:t2").unwrap(), None);
     }
 
     #[test]
@@ -867,6 +1344,95 @@ mod tests {
     }
 
     #[test]
+    fn receipts_track_remote_refusal_and_only_the_approved_matching_terminal_reply() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let mut outgoing = message("refused", "bob/terminal");
+        outgoing.sent_at = crate::util::now_ms();
+        store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+        store.outbox_add("peer", &outgoing).unwrap();
+        store.outbox_done("refused", false).unwrap();
+        assert_eq!(store.delivery_status("sender", &["refused".into()]).unwrap()[0]["stage"], "rejected");
+        outgoing.id = "accepted".into();
+        store.record_sent("sender", &outgoing, "bob/terminal@laptop", "queued").unwrap();
+        store.outbox_add("peer", &outgoing).unwrap();
+        store.outbox_done("accepted", true).unwrap();
+        let stage = || store.delivery_status("sender", &["accepted".into()]).unwrap()[0]["stage"].clone();
+        let mut reply = message("wrong-machine", &outgoing.from);
+        reply.from = "bob/terminal@desktop".into();
+        reply.reply_to = Some(outgoing.id.clone());
+        store.insert(&mut reply, false).unwrap();
+        assert_eq!(stage(), "accepted");
+        reply.id = "held-reply".into();
+        reply.from = "bob/terminal@laptop".into();
+        store.insert(&mut reply, true).unwrap();
+        assert_eq!(stage(), "accepted");
+        store.settle_held(&[reply.id], true).unwrap();
+        assert_eq!(stage(), "replied");
+        assert_eq!(store.delivery_status("other-session", &["accepted".into()]).unwrap()[0]["stage"], "unknown");
+    }
+
+    #[test]
+    fn an_expired_idempotency_key_gets_a_new_generation() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        let (first, receipt, fresh) = store.begin_send("key", "original", now).unwrap();
+        assert!(!first.is_empty());
+        assert!(fresh);
+        assert!(receipt.is_none());
+        let (pending, receipt, fresh) = store.begin_send("key", "original", now + 1000).unwrap();
+        assert_eq!(pending, first);
+        assert!(!fresh);
+        assert!(receipt.is_none());
+        let saved = crate::proto::SendResult { ids: vec!["message-id".into()], recipients: vec![] };
+        store.finish_send("key", &saved).unwrap();
+        let (cached, receipt, fresh) = store.begin_send("key", "original", now + 2000).unwrap();
+        assert_eq!(cached, first);
+        assert!(!fresh);
+        assert_eq!(serde_json::to_value(receipt.unwrap()).unwrap(), serde_json::to_value(saved).unwrap());
+        assert!(store.begin_send("key", "different", now + 1000).is_err());
+        let (next, receipt, fresh) = store.begin_send("key", "different", now + 8 * 86_400_000).unwrap();
+        assert_ne!(next, first);
+        assert!(fresh);
+        assert!(receipt.is_none());
+    }
+
+    #[test]
+    fn discarded_queues_and_retention_do_not_remain_pending() {
+        let store = Store::open(Path::new(":memory:"), temp_inbox()).unwrap();
+        let now = crate::util::now_ms();
+        let mut pending = message("pending", "sven/recipient");
+        pending.sent_at = now;
+        store.record_sent("sender", &pending, "sven/recipient", "queued").unwrap();
+        store.insert(&mut pending, false).unwrap();
+        let recipient = Remembered {
+            name: "recipient".into(),
+            key: "agent:recipient".into(),
+            agent: "agent".into(),
+            cwd: "/work".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Pull,
+            last_seen: now - 2 * 86_400_000,
+            attached: true,
+            mailbox: false,
+        };
+        store.upsert_session(&recipient, "sven").unwrap();
+        store.forget_session(&recipient, "sven").unwrap();
+        assert!(store.message("pending").unwrap().is_none());
+        assert_eq!(store.delivery_status("sender", &["pending".into()]).unwrap()[0]["stage"], "expired");
+        pending.id = "old".into();
+        pending.sent_at = now - 8 * 86_400_000;
+        store.record_sent("sender", &pending, "sven/recipient", "queued").unwrap();
+        assert_eq!(store.delivery_status("sender", &["old".into()]).unwrap()[0]["stage"], "unknown");
+        assert!(store.db.prepare("SELECT 1 FROM sent_receipts WHERE id='old'").unwrap().exists([]).unwrap());
+        store.begin_send("old-key", "body", now - 8 * 86_400_000).unwrap();
+        store.sweep_files(now).unwrap();
+        assert!(!store.db.prepare("SELECT 1 FROM sent_receipts WHERE id='old'").unwrap().exists([]).unwrap());
+        assert!(!store.db.prepare("SELECT 1 FROM send_keys WHERE key='old-key'").unwrap().exists([]).unwrap());
+    }
+
+    #[test]
     fn a_store_from_before_keeps_the_persons_mailboxes_but_not_the_clis_ask_sessions() {
         let dir = std::env::temp_dir().join(format!("reason-network-mailbox-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -913,7 +1479,7 @@ mod tests {
         let bodies = |ms: Vec<Message>| ms.into_iter().map(|m| m.body).collect::<Vec<_>>();
         assert_eq!(bodies(store.unread("lars/api").unwrap()), ["do X", "never mind X"]);
         assert_eq!(bodies(store.held().unwrap()), ["do X", "never mind X"]);
-        assert_eq!(bodies(store.outbox_for("peer", 1_000).unwrap()), ["do X", "never mind X"]);
+        assert_eq!(bodies(store.outbox_for("peer", 1_000).unwrap().0), ["do X", "never mind X"]);
     }
 
     fn temp_inbox() -> PathBuf {

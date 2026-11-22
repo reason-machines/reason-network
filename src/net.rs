@@ -48,11 +48,28 @@ pub fn default_relays() -> Vec<RelayUrl> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Wire {
-    Hello { team: String, proto: u32 },
-    State { state: Box<TeamState> },
-    Presence { presence: Presence },
-    Msg { msg: Message },
-    Ack { id: String, state: String, note: String },
+    Hello {
+        team: String,
+        proto: u32,
+    },
+    State {
+        state: Box<TeamState>,
+    },
+    Presence {
+        presence: Presence,
+    },
+    Msg {
+        msg: Message,
+    },
+    Ack {
+        id: String,
+        state: String,
+        note: String,
+        /// Where it went, when not to the address it was sent to (see `Daemon::receive_readdressed`). An engine from
+        /// before this leaves it out, and ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
 }
 
 /// What a machine tells its teammates about itself.
@@ -510,7 +527,7 @@ async fn log_relay(endpoint: Endpoint) {
 }
 
 /// Says in the log when a connection to a teammate moves between a direct path and the relay, and the new one's rtt.
-async fn log_paths(conn: Connection) {
+async fn log_paths(conn: Connection, daemon: std::sync::Weak<Daemon>) {
     let peer = conn.remote_id().fmt_short().to_string();
     let kind = |relay: bool| if relay { "relay" } else { "direct" };
     let mut lists = conn.paths_stream();
@@ -522,6 +539,9 @@ async fn log_paths(conn: Connection) {
             && from != relay
         {
             log(&format!("{peer}: path {} -> {} (rtt {} ms)", kind(from), kind(relay), p.rtt().as_millis()));
+            if let Some(d) = daemon.upgrade() {
+                d.usage_transport("path_changed", relay, p.rtt().as_millis() as u64);
+            }
         }
         was = Some(relay);
     }
@@ -1053,7 +1073,8 @@ impl Net {
             links.insert(peer, Link { id, tx: tx.clone(), conn: conn.clone(), dialer, since: Instant::now() });
         }
         log(&format!("connected to {} ({})", peer.fmt_short(), if outgoing { "out" } else { "in" }));
-        let paths = tokio::spawn(log_paths(conn.clone()));
+        daemon.usage_transport("reconnected", false, 0);
+        let paths = tokio::spawn(log_paths(conn.clone(), self.daemon.clone()));
 
         let writer = tokio::spawn(async move {
             while let Some(w) = rx.recv().await {
@@ -1123,17 +1144,14 @@ impl Net {
             }
             Wire::Msg { msg } => {
                 let id = msg.id.clone();
-                let (state, note) = match daemon.receive(peer, msg) {
+                let (state, note, to) = match daemon.receive_readdressed(peer, msg) {
                     Ok(v) => v,
-                    Err(e) => ("refused".into(), format!("{e:#}")),
+                    Err(e) => ("refused".into(), format!("{e:#}"), None),
                 };
-                let _ = tx.send(Wire::Ack { id, state, note });
+                let _ = tx.send(Wire::Ack { id, state, note, to });
             }
-            Wire::Ack { id, state, note } => {
-                // "retry": the other side is busy; keep it in the outbox for the next flush.
-                if state != "retry" {
-                    daemon.outbox_done(&id, state != "refused");
-                }
+            Wire::Ack { id, state, note, to } => {
+                daemon.acked(&peer, &id, &state, to);
                 if let Some(waiter) = self.acks.lock().unwrap().remove(&id) {
                     let _ = waiter.send((state, note));
                 }
@@ -1189,6 +1207,19 @@ fn tidy_presence(mut p: Presence) -> Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ack_says_where_the_message_went_only_when_it_went_elsewhere_and_old_engines_understand_it() {
+        let old = r#"{"t":"ack","id":"m1","state":"queued","note":"ok"}"#;
+        let ack: Wire = serde_json::from_str(old).unwrap();
+        assert!(matches!(ack, Wire::Ack { to: None, .. }));
+        let plain = Wire::Ack { id: "m1".into(), state: "queued".into(), note: "ok".into(), to: None };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), old);
+        let moved =
+            Wire::Ack { id: "m1".into(), state: "queued".into(), note: "ok".into(), to: Some("bob/web-fix".into()) };
+        let json = serde_json::to_string(&moved).unwrap();
+        assert!(matches!(serde_json::from_str(&json).unwrap(), Wire::Ack { to: Some(t), .. } if t == "bob/web-fix"));
+    }
 
     #[test]
     fn the_way_to_relays_is_kept_for_those_relays_only() {
@@ -1283,6 +1314,7 @@ mod tests {
         };
         let p = tidy_presence(Presence { sessions: vec![s], ..Default::default() });
         let d = crate::proto::Directory {
+            config_warning: None,
             team: None,
             person: "alex".into(),
             machine: "mbp".into(),
@@ -1339,7 +1371,7 @@ mod tests {
         assert!(to_c.link.is_none());
         let Wire::State { state: to_a } = for_peer(&w, &a.public()) else { panic!() };
         assert_eq!(*to_a, s);
-        let ack = Wire::Ack { id: "x".into(), state: "stored".into(), note: String::new() };
+        let ack = Wire::Ack { id: "x".into(), state: "stored".into(), note: String::new(), to: None };
         assert!(matches!(for_peer(&ack, &b.public()), Wire::Ack { .. }));
     }
 

@@ -17,15 +17,22 @@ use iroh::EndpointId;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// A hook-only session that hasn't fired a hook for this long is considered gone.
-const HOOK_TTL_MS: i64 = 6 * 3_600_000;
+pub(super) const HOOK_TTL: Duration = Duration::from_secs(6 * 3600);
+const HOOK_TTL_MS: i64 = HOOK_TTL.as_millis() as i64;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
 pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
 const OFF_TURN_MS: i64 = 10 * 60_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rename {
+    Explicit,
+    Automatic,
+}
 
 impl Daemon {
     /// How fast hooks let us reach an agent's session (`push_failed`: its push channel didn't work).
@@ -54,18 +61,35 @@ impl Daemon {
     fn register_quiet(
         &self,
         conn: Option<u64>,
+        reg: SessionReg,
+        git: GitInfo,
+    ) -> Result<(Registered, (String, Vec<Message>))> {
+        self.register_among(conn, reg, git, self.my_names_elsewhere(util::now_ms()))
+    }
+
+    /// `register_quiet`, with `others`, my session names on my other machines.
+    fn register_among(
+        &self,
+        conn: Option<u64>,
         mut reg: SessionReg,
         git: GitInfo,
+        others: Elsewhere,
     ) -> Result<(Registered, (String, Vec<Message>))> {
         // Every session comes in here: one in a folder that is off never does.
         if self.cfg.off_in(&reg.cwd) {
             bail!(OFF_HERE);
         }
         let now = util::now_ms();
-        let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let key = reg.key.clone();
+        if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push {
+            let allowed =
+                g.store.native_app_roots(&key)?.is_some_and(|roots| roots.iter().all(|root| !self.cfg.off_in(root)));
+            if !allowed {
+                bail!("Antigravity App binding is unavailable or includes a disabled workspace");
+            }
+        }
         // Its hooks said its folder is off (an MCP server several sessions share can't know its folder).
         if g.off.contains_key(&key) {
             bail!(OFF_HERE);
@@ -95,30 +119,63 @@ impl Daemon {
             self.moved_on(g, before, now);
         }
         if let Some(l) = g.live.get_mut(&key) {
-            // Known already (e.g. from a hook, now the MCP server connects, or a reconnect).
+            // Known already (e.g. from a hook, now the MCP server connects, or a reconnect). Asking for the name it
+            // has settles it, as asking for any name does.
+            if reg.name.as_deref().map(util::slug).is_some_and(|n| n == l.name) {
+                g.store.settle_name(&key)?;
+            }
             if conn.is_some() {
                 l.conn = conn;
                 l.attached = true;
                 l.mcp_push = reg.tier == Tier::Push;
             }
-            l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+            // A hosted assistant the relay carries stays `pull`, whatever tier it is registered with again.
+            if !l.relayed() {
+                l.reg.tier = if l.push_failed { l.reg.tier.max(Tier::Turn) } else { l.reg.tier.min(reg.tier) };
+            }
             l.attached |= l.reg.tier == Tier::Push;
             if l.last_hook.is_none() {
                 l.reg.cwd = reg.cwd;
                 l.git = git;
             }
             l.reg.pid = reg.pid.or(l.reg.pid);
+            l.reg.claude_dir = reg.claude_dir.or(l.reg.claude_dir.take());
         } else {
             if conn.is_none() {
                 reg.tier = reg.tier.min(self.hook_tier(&reg.agent, false));
             }
             let name = pick_name(g, &reg, &git, &others, &self.person, |r| self.holds(r, now))?;
+            // Its title named it before this daemon started (an update restarts it), or before it went offline: the
+            // default name it went by is still its own (see `Live::former`), unless another session has taken it since.
+            // By its key: also when it comes back under another name (its own was taken on another of my machines).
+            let former = match g.store.former(&key)? {
+                Some((f, told))
+                    if f != name
+                        && g.live_called(&f).is_none()
+                        && g.store.session_by_name(&f)?.is_some_and(|o| o.key == key) =>
+                {
+                    Some((f, told))
+                }
+                _ => None,
+            };
+            if reg.name.is_some() {
+                g.store.settle_name(&key)?;
+            }
             self.take_over(g, &name, &key)?;
             let attached = conn.is_some() || reg.tier == Tier::Push || reg.agent == "cli";
             let mcp_push = conn.is_some() && reg.tier == Tier::Push;
+            self.usage.count(
+                "registered",
+                crate::usage::Dimensions { source: crate::usage::family(&reg.agent), ..Default::default() },
+                1,
+            );
+            if !self.forgetting() && !key.starts_with("proc:") {
+                g.seen_since_start.insert(key.clone());
+            }
             g.live.insert(
                 key.clone(),
                 Live {
+                    through_reason: Some(conn.is_none() && reg.agent == "reason"),
                     reg,
                     name,
                     conn,
@@ -134,7 +191,10 @@ impl Daemon {
                     attached,
                     mcp_push,
                     mailbox: key == TERMINAL,
-                    through_reason: false,
+                    codex_home: None,
+                    introduced: false,
+                    told_renamed: former.as_ref().is_some_and(|(_, told)| *told),
+                    former: former.map(|(f, _)| f),
                 },
             );
             self.presence_changed();
@@ -160,7 +220,9 @@ impl Daemon {
     /// it registered now. (Checked as the terminal is used: each command from it comes through here.) A rename that
     /// fails (another session took the name meanwhile) is logged, and the command goes on: it is tried again next time.
     fn recheck_terminal(&self, others: &Elsewhere) {
-        self.recheck_terminal_with(others, |name| self.set_status(TERMINAL, None, Some(name)).map(drop));
+        self.recheck_terminal_with(others, |name| {
+            self.set_status(TERMINAL, None, Some(name), Rename::Automatic).map(drop)
+        });
     }
 
     /// `recheck_terminal`, renaming with `rename`.
@@ -189,13 +251,13 @@ impl Daemon {
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
     /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
     pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
-        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting(now))
+        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting())
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
     /// registered again (each gets the time a hook-only session has to show it is there).
-    fn forgetting(&self, now: i64) -> bool {
-        now - self.started > HOOK_TTL_MS
+    fn forgetting(&self) -> bool {
+        Instant::now() >= self.startup_grace_ends
     }
 
     /// A live session turned out reachable (mail went to it or came from it): from now on its name is kept for it.
@@ -246,60 +308,133 @@ impl Daemon {
             log(&format!("{} lapsed: a new session takes the name", self.addr(name)));
             g.store.forget_session(&r, &self.person)?;
         }
-        Ok(())
+        g.store.give_up_former(name, key)
     }
 
-    pub(super) fn set_status(&self, key: &str, doing: Option<String>, name: Option<String>) -> Result<Registered> {
+    pub(super) fn set_status(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        rename: Rename,
+    ) -> Result<Registered> {
+        self.set_status_quiet(key, doing, name, rename).map(|(r, _)| r)
+    }
+
+    /// A session still on its default name goes by `name`, from its conversation's title, unless it was named since
+    /// (checked under the same lock as the rename, so a name someone gives it, or an earlier title's, wins). None when
+    /// it is not renamed for that reason.
+    pub(super) fn name_from_title(&self, key: &str, name: String) -> Result<Option<Registered>> {
+        Ok(self.set_status_as(key, None, Some(name), Rename::Automatic, true)?.map(|(r, _)| r))
+    }
+
+    /// Also tells the caller to deliver pending mail after a reclaim, as registering does.
+    /// A push session may never check an inbox or run another hook.
+    pub(super) fn set_status_quiet(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        rename: Rename,
+    ) -> Result<(Registered, bool)> {
+        self.set_status_as(key, doing, name, rename, false)?.ok_or_else(|| anyhow!("this session is not registered"))
+    }
+
+    fn set_status_as(
+        &self,
+        key: &str,
+        doing: Option<String>,
+        name: Option<String>,
+        rename: Rename,
+        from_title: bool,
+    ) -> Result<Option<(Registered, bool)>> {
         let now = util::now_ms();
         let others = self.my_names_elsewhere(now);
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        if from_title && !g.live.get(key).is_some_and(|l| title_may_name(g, key, l).unwrap_or(false)) {
+            return Ok(None);
+        }
         let new_name = name.as_deref().map(util::slug);
+        let mut reclaim = false;
         if let Some(n) = new_name.as_deref() {
             if n.is_empty() {
                 bail!("a name needs letters or digits");
             }
-            if g.live.iter().any(|(k, l)| l.name == n && k != key) || others.live.contains(n) {
+            if g.live.iter().any(|(k, l)| l.goes_by(n) && k != key) || others.live.contains(n) {
                 bail!("'{n}' is taken by a live session");
             }
             if n == self.person {
                 bail!("'{n}' is your person name; pick another session name");
             }
-            // A name kept for a session that is offline stays its own, with its mail: never renamed into.
-            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
-                bail!(
-                    "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
-                    util::ago(r.last_seen, now)
-                );
-            }
             if others.kept.contains(n) {
                 bail!("'{n}' belongs to a session on another of your machines that is offline; pick another name");
             }
+            if let Some(r) = g.store.session_by_name(n)?.filter(|r| r.key != key && self.holds(r, now)) {
+                if rename == Rename::Automatic || r.mailbox || key.starts_with("proc:") || key.starts_with("cli:") {
+                    bail!(
+                        "'{n}' belongs to a session that is offline (last seen {} ago); pick another name",
+                        util::ago(r.last_seen, now)
+                    );
+                }
+                let remaining = self.startup_grace_ends.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() && !g.seen_since_start.contains(&r.key) {
+                    let minutes = remaining.as_nanos().div_ceil(Duration::from_secs(60).as_nanos());
+                    let unit = if minutes == 1 { "minute" } else { "minutes" };
+                    bail!(
+                        "'{n}' has not reconnected since the daemon restart. Resume the original conversation \
+                         so it reconnects, then end it and retry. Otherwise, try again in about {minutes} {unit}."
+                    );
+                }
+                reclaim = true;
+            }
         }
         if let Some(n) = new_name.as_deref()
+            && !reclaim
             && g.live.get(key).is_some_and(|l| l.name != n)
         {
             self.take_over(g, n, key)?;
         }
+        if new_name.is_some() {
+            g.store.settle_name(key)?;
+        }
+        if let Some(n) = new_name.as_deref()
+            && reclaim
+        {
+            // A name reclaimed from a titled session's old one is no longer that session's.
+            g.store.give_up_former(n, key)?;
+        }
         let live = g.live.get_mut(key).ok_or_else(|| anyhow!("this session is not registered"))?;
+        if let Some(n) = new_name
+            && n != live.name
+        {
+            g.store.rename(&self.person, &live.name, &n, reclaim.then_some(key))?;
+            live.attached |= reclaim;
+            let old = std::mem::replace(&mut live.name, n);
+            // Named by its title: the name it was told at its start still reaches it, and its hooks tell it the new one.
+            if from_title {
+                live.former = Some(old);
+                live.told_renamed = false;
+            } else if live.former.as_deref() == Some(live.name.as_str()) {
+                live.former = None;
+            }
+        }
         if let Some(d) = doing {
             let d = crate::team::without_tickets(d.trim());
             live.doing = (!d.is_empty()).then(|| d.chars().take(200).collect());
         }
-        if let Some(n) = new_name
-            && n != live.name
-        {
-            g.store.rename(
-                &live.name,
-                &n,
-                &format!("{}/{}", self.person, live.name),
-                &format!("{}/{n}", self.person),
-            )?;
-            live.name = n;
-        }
         g.store.upsert_session(&remembered(live, now), &self.person)?;
+        g.store.set_former(&live.name, live.former.as_deref(), live.told_renamed)?;
         let address = self.addr(&live.name);
-        Ok(Registered { name: live.name.clone(), unread: g.store.unread_count(&address)?, address })
+        let name = live.name.clone();
+        let unread = if reclaim {
+            self.arrived.notify_waiters();
+            self.presence_changed();
+            g.pending(&address)?.len() as u32
+        } else {
+            g.store.unread_count(&address)?
+        };
+        Ok(Some((Registered { name, unread, address }, reclaim)))
     }
 
     pub(super) fn unread(&self, key: &str) -> Result<Unread> {
@@ -318,14 +453,31 @@ impl Daemon {
 
     /// A hook fired in an agent: keep its session alive, track busy/idle, hand back mail to inject.
     pub(super) async fn hook(self: &Arc<Self>, h: HookCall) -> Result<HookReply> {
-        let HookCall { agent, event, session_id, cwd, pid, mail, transcript, doing, name, dirs, keep, through_reason } =
-            h;
+        let HookCall {
+            agent,
+            event,
+            session_id,
+            cwd,
+            pid,
+            mail,
+            transcript,
+            doing,
+            name,
+            dirs,
+            keep,
+            through_reason,
+            codex_home,
+        } = h;
         let (agent, event) = (agent.as_str(), event.as_str());
         let key = format!("{agent}:{session_id}");
         let now = util::now_ms();
+        let mut native_dirs: Vec<String> = cwd.iter().chain(&dirs).cloned().collect();
         // In a folder that is off, by any folder the agent names: never a session here, only noted as off.
         if cwd.iter().chain(&dirs).any(|d| self.cfg.off_in(d)) {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None, &[])?;
+            }
             if let Some(l) = g.live.remove(&key) {
                 let _ = g.store.touch_session(&l.name, now);
                 self.presence_changed();
@@ -346,8 +498,13 @@ impl Daemon {
         self.inner.lock().unwrap().off.remove(&key);
         if event == "end" {
             let mut g = self.inner.lock().unwrap();
+            if agent == "antigravity" {
+                g.store.remember_native_app(&key, None, &[])?;
+            }
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
-            if g.live.get(&key).is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent))
+            if g.live
+                .get(&key)
+                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);
@@ -372,6 +529,7 @@ impl Daemon {
                 pid,
                 tier: Tier::Pull,
                 name,
+                claude_dir: None,
             };
             self.register_quiet(None, reg, git)?;
         }
@@ -388,13 +546,18 @@ impl Daemon {
         }
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        // A Codex thread that starts again gets another try at `codex queue` once it is offline again.
+        if event == "start" {
+            g.codex_failed.remove(&key);
+        }
         let Some(l) = g.live.get_mut(&key) else { return Ok(HookReply::default()) };
         if let Some(t) = transcript {
             l.transcript = Some(t.into());
         }
-        if through_reason {
-            l.through_reason = true;
-            l.reg.tier = Tier::Pull;
+        // Kept with the session too: mail reaches it through that home while it is offline.
+        if agent == "codex" && l.codex_home != codex_home {
+            l.codex_home = codex_home;
+            g.store.remember_codex_home(&key, l.codex_home.as_deref())?;
         }
         // Only a report: it says nothing about the session's activity or how to reach it.
         if event == "doing" {
@@ -404,10 +567,10 @@ impl Daemon {
             }
             return Ok(HookReply::default());
         }
+        l.through_reason = through_reason;
         l.last_hook = Some(now);
-        if !l.through_reason {
-            l.reg.tier = l.reg.tier.min(self.hook_tier(agent, l.push_failed));
-        }
+        // These hooks are the relay's, not the assistant's: they don't make it any faster to reach.
+        l.reg.tier = if l.relayed() { Tier::Pull } else { l.reg.tier.min(self.hook_tier(agent, l.push_failed)) };
         if pid.is_some() {
             l.reg.pid = pid;
         }
@@ -417,6 +580,15 @@ impl Daemon {
         }
         let address = self.addr(&l.name);
         let agent_kind = l.reg.agent.clone();
+        let native_app = agent == "antigravity"
+            && l.transcript.as_ref().is_some_and(|p| crate::antigravity::app_transcript(&p.to_string_lossy()));
+        if native_app {
+            l.reg.pid = None;
+            if !native_dirs.contains(&l.reg.cwd) {
+                native_dirs.push(l.reg.cwd.clone());
+            }
+            g.store.remember_native_app(&key, Some(now), &native_dirs)?;
+        }
         // Mid-turn, only what should interrupt; at a pause, everything.
         let msgs: Vec<Message> = if mail {
             g.pending(&address)?.into_iter().filter(|m| event != "tool" || m.wake).collect()
@@ -433,8 +605,36 @@ impl Daemon {
         if !ids.is_empty() {
             self.reached(g, &key);
         }
-        let text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
-        Ok(HookReply { address: Some(address), text, ids })
+        let mut text = (!msgs.is_empty()).then(|| render::for_agent(&msgs, Some(&agent_kind), false));
+        // Its title named it since it was told who it is: say the new name once, as it starts a turn (a stop's or a
+        // tool's output may not reach the model, or would keep it going).
+        if matches!(event, "start" | "prompt")
+            && let Some(l) = g.live.get_mut(&key)
+            && let Some(former) = l.former.clone()
+            && !std::mem::replace(&mut l.told_renamed, true)
+        {
+            // Told once, after a restart too.
+            let name = l.name.clone();
+            g.store.set_former(&name, Some(&former), true)?;
+            let note = format!(
+                "Reason Network: you are {address} now, named after what this chat is about. Mail to {} still reaches \
+                 you; give teammates your new address.",
+                self.addr(&former)
+            );
+            text = Some(match text {
+                Some(t) => format!("{note}\n\n{t}"),
+                None => note,
+            });
+        }
+        // Say who it is once: at session start, or for Antigravity (whose start may say nothing) its first invocation.
+        let intro = text.is_none()
+            && if agent == "antigravity" {
+                matches!(event, "start" | "prompt")
+                    && g.live.get_mut(&key).is_some_and(|l| !std::mem::replace(&mut l.introduced, true))
+            } else {
+                event == "start"
+            };
+        Ok(HookReply { address: Some(address), text, ids, intro: Some(intro) })
     }
 
     /// The hook-known session of `agent` that is calling a tool right now, when that is unambiguous: the only
@@ -495,12 +695,24 @@ impl Daemon {
         let now = util::now_ms();
         let mut g = self.inner.lock().unwrap();
         g.conns.remove(&conn);
+        if g.antigravity_conn == Some(conn) {
+            g.antigravity_conn = None;
+        }
         let mine: Vec<String> = g.live.iter().filter(|(_, l)| l.conn == Some(conn)).map(|(k, _)| k.clone()).collect();
         for key in mine {
             let l = g.live.get_mut(&key).expect("listed above");
             // Hooks still vouch for it: keep it, reachable through them.
-            if l.last_hook.is_some() && l.reg.pid.is_some_and(util::pid_alive) {
+            if l.last_hook.is_some()
+                && (l.reg.pid.is_some_and(util::pid_alive)
+                    || l.reg.agent == "antigravity"
+                        && l.reg.pid.is_none()
+                        && l.last_hook.is_some_and(|at| now - at < HOOK_TTL_MS))
+            {
                 l.conn = None;
+                if l.reg.agent == "antigravity" {
+                    l.reg.tier = Tier::Turn;
+                    l.mcp_push = false;
+                }
                 continue;
             }
             if let Some(l) = g.live.remove(&key) {
@@ -530,7 +742,8 @@ impl Daemon {
             }
         }
         g.off.retain(|_, (_, at)| now - *at <= HOOK_TTL_MS);
-        if self.forgetting(now) {
+        if self.forgetting() {
+            g.seen_since_start.clear();
             let live: HashSet<&str> = g.live.values().map(|l| l.name.as_str()).collect();
             let _ = g.store.forget_sessions(now - FORGET_MS, &live, &self.person);
         }
@@ -546,6 +759,42 @@ impl Daemon {
             }
         }
     }
+}
+
+impl Live {
+    /// Whether `name` reaches this session: its name, or the default one it went by before its title named it.
+    pub(super) fn goes_by(&self, name: &str) -> bool {
+        self.name == name || self.former.as_deref() == Some(name)
+    }
+
+    /// A hosted assistant the Reason CLI's relay carries (an app connected through Reason), as its hooks say
+    /// ([`HookCall::through_reason`]). The relay's `check_inbox` waits on it only hand its mail to Reason's inbox,
+    /// where the assistant sees it at its next `check_inbox` (or when its wake webhook starts it). Never one of the
+    /// person's own Reason sessions: those carry the same flag from their registration (see `register_quiet`), but
+    /// their mail is sent into them with `reason session send`.
+    pub(super) fn relayed(&self) -> bool {
+        self.through_reason == Some(true) && self.reg.agent != "reason"
+    }
+}
+
+impl Inner {
+    /// The live session `name` reaches (see [`Live::goes_by`]), its own name first.
+    pub(super) fn live_called(&self, name: &str) -> Option<String> {
+        let (named, former): (Vec<_>, Vec<_>) =
+            self.live.iter().filter(|(_, l)| l.goes_by(name)).partition(|(_, l)| l.name == name);
+        named.into_iter().chain(former).next().map(|(k, _)| k.clone())
+    }
+}
+
+/// Whether a title may still name this session: a Claude Code conversation (whose title Claude Code writes; not one of
+/// the person's mailboxes or a `cli:` one), on the name it got for asking none, and its name is not settled: never named (by someone or by an
+/// earlier title), and no mail went to or from it, since a reply goes to the name the mail had.
+pub(super) fn title_may_name(g: &Inner, key: &str, l: &Live) -> Result<bool> {
+    Ok(l.reg.agent == agent::CLAUDE_CODE
+        && !l.mailbox
+        && !key.starts_with("cli:")
+        && agent::is_default_name(&l.name, &l.reg.agent, &l.reg.cwd, &l.git)
+        && !g.store.name_settled(key)?)
 }
 
 fn remembered(l: &Live, now: i64) -> Remembered {
@@ -625,8 +874,9 @@ fn pick_name(
     let none = Elsewhere::default();
     let elsewhere = if reg.key == TERMINAL && elsewhere.terminals { &none } else { elsewhere };
     // The person's own name is never a session's (`<person>/<person>` would read as the person), as for a rename.
-    let live =
-        |n: &str| n == person || g.live.iter().any(|(k, l)| l.name == n && *k != reg.key) || elsewhere.live.contains(n);
+    let live = |n: &str| {
+        n == person || g.live.iter().any(|(k, l)| l.goes_by(n) && *k != reg.key) || elsewhere.live.contains(n)
+    };
     let free = |n: &str| -> Result<bool> {
         let kept_here = g.store.session_by_name(n)?.is_some_and(|r| r.key != reg.key && holds(&r));
         Ok(!live(n) && !kept_here && !elsewhere.kept.contains(n))
@@ -673,6 +923,7 @@ mod tests {
             pid: None,
             tier: Tier::Push,
             name: None,
+            claude_dir: None,
         }
     }
 
@@ -685,7 +936,19 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: name.map(str::to_string),
+            claude_dir: None,
         }
+    }
+
+    #[test]
+    fn registering_again_without_a_claude_dir_keeps_the_one_it_had() {
+        let d = super::super::test_daemon(Default::default());
+        let b = SessionReg { claude_dir: Some("/home/u/.claude-b".into()), ..claude("b") };
+        d.register_quiet(Some(1), b, GitInfo::default()).unwrap();
+        // A hook or the scan registers it again, knowing nothing of its Claude directory.
+        d.register_quiet(None, claude("b"), GitInfo::default()).unwrap();
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.live["claude-code:b"].reg.claude_dir.as_deref(), Some("/home/u/.claude-b"));
     }
 
     /// Registers a session through an MCP server of its own, as Claude Code runs one per session; a `cli` one as
@@ -713,12 +976,14 @@ mod tests {
 
     /// The daemon restarts: nothing is live until sessions register again.
     fn restart(d: &Daemon) {
-        d.inner.lock().unwrap().live.clear();
+        let mut g = d.inner.lock().unwrap();
+        g.live.clear();
+        g.seen_since_start.clear();
     }
 
     /// Long enough after a start that sessions gone a day are forgotten.
     fn settled(d: &mut Daemon) {
-        d.started -= HOOK_TTL_MS + 1;
+        d.startup_grace_ends = Instant::now();
     }
 
     fn mail(d: &Daemon, id: &str, name: &str) {
@@ -786,9 +1051,10 @@ mod tests {
         let line = crate::invite_line(&l.url);
         // `status <doing>` from an agent's shell; a `doing` hook; a session kept by a build that stored the line.
         join(&d, claude("a"));
-        d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None).unwrap();
+        d.set_status("claude-code:a", Some(format!("{line} then fix CI")), None, Rename::Explicit).unwrap();
         join(&d, claude("b"));
         let doing = HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "doing".into(),
             session_id: "b".into(),
@@ -799,8 +1065,8 @@ mod tests {
             doing: Some(line.clone()),
             name: None,
             dirs: Vec::new(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         };
         d.hook(doing).await.unwrap();
         let old = Remembered {
@@ -838,6 +1104,7 @@ mod tests {
     async fn a_conversation_coming_back_through_its_hooks_gets_its_name_too() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str| HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: "start".into(),
             session_id: id.into(),
@@ -848,8 +1115,8 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         };
         // Its MCP server registered it; then it ends.
         assert_eq!(join(&d, claude("a")).name, "api-claude");
@@ -864,12 +1131,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_antigravity_conversation_hears_who_it_is_once_not_before_every_invocation() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "antigravity".into(),
+            event: event.into(),
+            session_id: "c1".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            codex_home: None,
+            dirs: Vec::new(),
+            keep: false,
+        };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "prompt", "stop", "prompt", "start"] {
+            seen.push(d.hook(call(event)).await.unwrap().intro);
+        }
+        assert_eq!(seen, [Some(true), Some(false), Some(false), Some(false), Some(false), Some(false), Some(false)]);
+        // Mail it is handed is not the introduction, so that doesn't use it up.
+        let call = |event: &str| HookCall { session_id: "c2".into(), ..call(event) };
+        d.hook(call("tool")).await.unwrap();
+        let name = d.inner.lock().unwrap().live["antigravity:c2"].name.clone();
+        mail(&d, "m1", &name);
+        let handed = d.hook(call("prompt")).await.unwrap();
+        assert!(handed.text.is_some());
+        assert_eq!(handed.intro, Some(false));
+        let next = d.hook(call("prompt")).await.unwrap();
+        assert!(next.text.is_none());
+        assert_eq!(next.intro, Some(true));
+        assert_eq!(d.hook(call("prompt")).await.unwrap().intro, Some(false));
+        // Other agents are told at session start, as before.
+        let claude = |event: &str| HookCall { agent: "claude-code".into(), session_id: "c3".into(), ..call(event) };
+        let mut seen = Vec::new();
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            seen.push(d.hook(claude(event)).await.unwrap().intro == Some(true));
+        }
+        assert_eq!(seen, [true, false, false, false, true]);
+    }
+
+    #[tokio::test]
     async fn a_hermes_conversations_hooks_never_promise_delivery_at_its_next_turn() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         // Its plugin registers it pull (wake off), and calls hooks only for activity: they never carry mail.
         join(&d, named("hermes:p:1", "hermes", None));
         for event in ["prompt", "tool", "stop"] {
             d.hook(HookCall {
+                through_reason: Some(false),
                 agent: "hermes".into(),
                 event: event.into(),
                 session_id: "p:1".into(),
@@ -880,8 +1192,8 @@ mod tests {
                 doing: None,
                 name: None,
                 dirs: Vec::new(),
-                through_reason: false,
                 keep: false,
+                codex_home: None,
             })
             .await
             .unwrap();
@@ -920,30 +1232,116 @@ mod tests {
     }
 
     #[test]
-    fn renaming_into_a_name_kept_for_an_offline_session_is_refused() {
+    fn explicit_reclaim_keeps_both_inboxes_for_the_new_conversation() {
+        let d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        mail(&d, "before", "api-claude");
+        // A hook-only conversation with a durable id, not previously reachable.
+        let caller = named("gemini:b", "gemini", None);
+        let target = "api-claude";
+        let own = d.register_quiet(None, caller.clone(), GitInfo::default()).unwrap().0;
+        mail(&d, "own", &own.name);
+        let r = d.set_status(&caller.key, None, Some(target.into()), Rename::Explicit).unwrap();
+        assert_eq!((r.name.as_str(), r.unread), (target, 2));
+        leave(&d, &caller.key, 0);
+        let back = join(&d, claude("a"));
+        assert_ne!(back.name, target);
+        assert_eq!(back.unread, 0);
+        let back = join(&d, caller);
+        assert_eq!((back.name.as_str(), back.unread), (target, 2));
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.session_by_name(target).unwrap().unwrap().kept());
+        let msgs = g.store.unread(&r.address).unwrap();
+        assert_eq!(msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["before", "own"]);
+    }
+
+    #[test]
+    fn reclaim_waits_for_an_unseen_owner_after_restart() {
+        let mut d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        restart(&d);
+        join(&d, claude("b"));
+        let rename = |d: &Daemon| d.set_status("claude-code:b", None, Some("api-claude".into()), Rename::Explicit);
+        d.startup_grace_ends = Instant::now() + Duration::from_secs(17 * 60 + 30);
+        let error = rename(&d).unwrap_err().to_string();
+        assert!(error.contains("try again in about 18 minutes"), "{error}");
+        join(&d, claude("a"));
+        assert!(rename(&d).unwrap_err().to_string().contains("live"));
+        leave(&d, "claude-code:a", 0);
+        restart(&d);
+        join(&d, claude("b"));
+        d.startup_grace_ends = Instant::now() + Duration::from_secs(30);
+        let error = rename(&d).unwrap_err().to_string();
+        assert!(error.ends_with("try again in about 1 minute."), "{error}");
+        settled(&mut d);
+        assert_eq!(rename(&d).unwrap().name, "api-claude");
+    }
+
+    #[test]
+    fn only_a_stable_session_can_reclaim_and_permanent_mailboxes_cannot_be_taken() {
+        let d = super::super::test_daemon(Default::default());
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        join(&d, named("proc:7", "zed", None));
+        assert!(d.set_status("proc:7", None, Some("api-claude".into()), Rename::Explicit).is_err());
+        join(&d, named(TERMINAL, "cli", Some("terminal")));
+        assert!(d.set_status(TERMINAL, None, Some("api-claude".into()), Rename::Explicit).is_err());
+        join(&d, claude("b"));
+        for name in ["terminal", "review"] {
+            let key = format!("cli:{name}");
+            join(&d, named(&key, "cli", Some(name)));
+            leave(&d, &key, 0);
+            assert!(d.set_status("claude-code:b", None, Some(name.into()), Rename::Explicit).is_err());
+        }
+        assert!(d.set_status("claude-code:b", None, Some(d.person.clone()), Rename::Explicit).is_err());
+    }
+
+    #[test]
+    fn automatic_renames_cannot_take_a_held_name() {
         let mut d = super::super::test_daemon(Default::default());
         join(&d, claude("a"));
         leave(&d, "claude-code:a", 3 * 3_600_000);
         mail(&d, "m1", "api-claude");
         join(&d, claude("b"));
-        let e = d.set_status("claude-code:b", None, Some("API Claude".into())).unwrap_err();
+        let e = d.set_status("claude-code:b", None, Some("API Claude".into()), Rename::Automatic).unwrap_err();
         assert_eq!(
             e.to_string(),
             "'api-claude' belongs to a session that is offline (last seen 3h ago); pick another name"
         );
         // A name of its own is fine, and its own mail comes along.
         mail(&d, "m2", "api-claude-2");
-        let r = d.set_status("claude-code:b", None, Some("auth".into())).unwrap();
+        let r = d.set_status("claude-code:b", None, Some("auth".into()), Rename::Explicit).unwrap();
         assert_eq!((r.name.as_str(), r.unread), ("auth", 1));
         // Once the offline one has lapsed, the name can be taken, without that session's mail.
         leave(&d, "claude-code:b", 0);
         join(&d, claude("b"));
         d.inner.lock().unwrap().store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
         settled(&mut d);
-        let r = d.set_status("claude-code:b", None, Some("api-claude".into())).unwrap();
+        let r = d.set_status("claude-code:b", None, Some("api-claude".into()), Rename::Explicit).unwrap();
         assert_eq!(r.name, "api-claude");
         let unread = d.inner.lock().unwrap().store.unread(&r.address).unwrap();
         assert_eq!(unread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m2"]);
+    }
+
+    #[tokio::test]
+    async fn a_relay_rename_without_reclaim_leaves_the_offline_owners_mail_alone() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let owner = SessionReg { name: Some("cursor".into()), ..claude("a") };
+        join(&d, owner.clone());
+        leave(&d, &owner.key, 0);
+        mail(&d, "queued", "cursor");
+
+        let key = "reason:hosted";
+        assert_eq!(join(&d, named(key, "reason", Some("cursor"))).name, "cursor-2");
+        // The Reason relay periodically retries its preferred name with this request.
+        let req =
+            serde_json::from_value(serde_json::json!({"op": "set_status", "key": key, "name": "cursor"})).unwrap();
+        let error = d.handle(conn_of(key), req).await.unwrap_err();
+        assert!(error.to_string().contains("belongs to a session that is offline"), "{error}");
+        assert!(d.inbox(key.into(), 0, true).await.unwrap().messages.is_empty());
+        let back = join(&d, owner);
+        assert_eq!((back.name.as_str(), back.unread), ("cursor", 1));
     }
 
     #[test]
@@ -966,6 +1364,7 @@ mod tests {
         settled(&mut d);
         let d = Arc::new(d);
         let cli = |id: &str, keep: bool| HookCall {
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: id.into(),
@@ -976,8 +1375,8 @@ mod tests {
             doing: None,
             name: Some(id.into()),
             dirs: Vec::new(),
-            through_reason: false,
             keep,
+            codex_home: None,
         };
         // `reason network <who> "…"` waits for its answer at a session of its own; `listen --as review` is a mailbox.
         d.hook(cli("ask-1a2b3c", false)).await.unwrap();
@@ -1124,6 +1523,7 @@ mod tests {
     async fn a_run_only_its_hooks_ever_saw_keeps_no_name() {
         let d = Arc::new(super::super::test_daemon(Default::default()));
         let call = |id: &str, event: &str| HookCall {
+            through_reason: Some(false),
             agent: "claude-code".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1134,8 +1534,8 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         };
         // A headless run: hooks only, never an MCP server, a push channel or a listen.
         assert_eq!(d.hook(call("p", "start")).await.unwrap().address, Some(d.addr("api-claude")));
@@ -1157,6 +1557,7 @@ mod tests {
 
     fn gemini(id: &str, event: &str) -> HookCall {
         HookCall {
+            through_reason: Some(false),
             agent: "gemini".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1167,8 +1568,8 @@ mod tests {
             doing: None,
             name: None,
             dirs: Vec::new(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         }
     }
 
@@ -1181,6 +1582,37 @@ mod tests {
         let id = key.strip_prefix("gemini:").map(str::to_string);
         let reg = SessionReg { agent_session_id: id, pid: Some(pid), ..named(key, "gemini", None) };
         d.register_quiet(Some(conn), reg, GitInfo::default()).unwrap();
+    }
+
+    /// A hook the Reason CLI's relay sends for a hosted assistant it carries (an app connected through Reason).
+    fn relay_hook(id: &str, event: &str) -> HookCall {
+        HookCall { through_reason: Some(true), agent: "grok".into(), ..gemini(id, event) }
+    }
+
+    #[tokio::test]
+    async fn an_app_connected_through_reason_stays_pull_across_its_relays_hooks() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let tier = |key: &str| d.inner.lock().unwrap().live[key].reg.tier;
+        for event in ["start", "prompt", "tool", "stop", "start"] {
+            d.hook(relay_hook("app", event)).await.unwrap();
+            assert_eq!(tier("grok:app"), Tier::Pull, "{event}");
+            // The same agent running here, whose hooks are its own: they show it its mail at its turns.
+            d.hook(HookCall { through_reason: Some(false), ..relay_hook("own", event) }).await.unwrap();
+            assert_eq!(tier("grok:own"), Tier::Turn, "{event}");
+        }
+        // Only reporting what it is doing says nothing of how it is reached, either way.
+        d.hook(HookCall { doing: Some("reading mail".into()), ..relay_hook("app", "doing") }).await.unwrap();
+        assert_eq!(tier("grok:app"), Tier::Pull);
+        // Registered again as faster to reach: still pull, where a session of its own would be raised.
+        for (id, raised) in [("app", Tier::Pull), ("own", Tier::Push)] {
+            let key = format!("grok:{id}");
+            let again = SessionReg { tier: Tier::Push, agent_session_id: Some(id.into()), ..named(&key, "grok", None) };
+            d.register_quiet(Some(conn_of(&key)), again, GitInfo::default()).unwrap();
+            assert_eq!(tier(&key), raised, "{id}");
+        }
+        // And across the relay's hooks after that.
+        d.hook(relay_hook("app", "stop")).await.unwrap();
+        assert_eq!(tier("grok:app"), Tier::Pull);
     }
 
     fn live_sessions(d: &Daemon) -> Vec<(String, String, Tier)> {
@@ -1337,6 +1769,49 @@ mod tests {
         assert!(d.inner.lock().unwrap().store.session_by_name("review-2").unwrap().is_none());
     }
 
+    #[test]
+    fn paused_sessions_and_held_mail_keep_the_normal_expiry() {
+        let mut d =
+            super::super::test_daemon(crate::config::Config { person: Some("alex".into()), ..Default::default() });
+        join(&d, claude("a"));
+        leave(&d, "claude-code:a", 0);
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        d.cfg.unreadable = Some("bad TOML".into());
+        d.cfg.all_folders_off = true;
+        d.cfg.inbound.default = crate::config::Policy::Hold;
+        settled(&mut d);
+        let d = Arc::new(d);
+        let msg = Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr("api-claude"),
+            via: None,
+            reply_to: None,
+            body: "kept while paused".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        assert_eq!(d.receive(bob.public(), msg).unwrap().0, "held");
+        let g = d.inner.lock().unwrap();
+        assert!(g.store.unread(&d.addr("api-claude")).unwrap().is_empty());
+        drop(g);
+        d.inner.lock().unwrap().store.touch_session("api-claude", util::now_ms() - 2 * DAY).unwrap();
+        {
+            let mut g = d.inner.lock().unwrap();
+            d.prune(&mut g);
+        }
+        assert!(d.inner.lock().unwrap().store.session_by_name("api-claude").unwrap().is_none());
+        assert!(d.inner.lock().unwrap().store.held().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn mail_held_for_a_conversation_goes_with_it_and_never_to_the_next_session() {
         let cfg = crate::config::Config {
@@ -1390,6 +1865,417 @@ mod tests {
         assert_eq!(held, [h2]);
         assert_eq!(d.settle(&[], true).unwrap(), 1);
         assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+    }
+
+    /// Alex's daemon, with Bob's machine in the team and mail from teammates held when `hold`.
+    fn with_bob(store: crate::store::Store, hold: bool) -> (Daemon, iroh::SecretKey) {
+        let inbound = if hold {
+            crate::config::Inbound { default: crate::config::Policy::Hold, ..Default::default() }
+        } else {
+            Default::default()
+        };
+        let cfg = crate::config::Config { person: Some("alex".into()), inbound, ..Default::default() };
+        let d = Daemon::with(cfg, store, iroh::SecretKey::generate()).unwrap();
+        let bob = iroh::SecretKey::generate();
+        let mut team = TeamState::found("acme", &d.person, &d.machine, &d.key);
+        team.put_member(&d.key, bob.public(), "bob", "xps", true);
+        d.inner.lock().unwrap().team = Some(team);
+        (d, bob)
+    }
+
+    fn from_bob(d: &Daemon, to: &str) -> Message {
+        Message {
+            id: ulid::Ulid::generate().to_string(),
+            from: "bob/web".into(),
+            from_agent: None,
+            from_repo: None,
+            to: d.addr(to),
+            via: None,
+            reply_to: None,
+            body: "still on the login bug?".into(),
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        }
+    }
+
+    fn memory_store() -> crate::store::Store {
+        let inbox = std::env::temp_dir().join(format!("reason-network-inbox-{}", ulid::Ulid::generate()));
+        crate::store::Store::open(std::path::Path::new(":memory:"), inbox).unwrap()
+    }
+
+    const TITLED: &str = "api-fix-the-login-bug";
+
+    /// Claude Code's hook for the conversation `id`.
+    fn claude_hook(id: &str, event: &str) -> HookCall {
+        HookCall {
+            through_reason: Some(false),
+            agent: agent::CLAUDE_CODE.into(),
+            event: event.into(),
+            session_id: id.into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            keep: false,
+            name: None,
+            dirs: Vec::new(),
+            codex_home: None,
+        }
+    }
+
+    /// Whether the hook for `event` tells the conversation `id` its name now.
+    async fn told(d: &Arc<Daemon>, id: &str, event: &str) -> bool {
+        let reply = d.hook(claude_hook(id, event)).await.unwrap();
+        reply.text.is_some_and(|t| t.contains(&format!("you are {} now", d.addr(TITLED))))
+    }
+
+    #[tokio::test]
+    async fn a_titled_chats_old_name_stays_its_own_after_the_daemon_restarts() {
+        // Restarted before its next hook told it its new name, and after.
+        for told_before in [false, true] {
+            let home = std::env::temp_dir().join(format!("reason-network-restart-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&home).unwrap();
+            let open = || crate::store::Store::open(&home.join("network.db"), home.join("inbox")).unwrap();
+            {
+                let (d, _) = with_bob(open(), false);
+                let d = Arc::new(d);
+                assert_eq!(join(&d, claude("x")).name, "api-claude");
+                assert_eq!(join(&d, claude("a")).name, "api-claude-2");
+                assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+                if told_before {
+                    assert!(told(&d, "a", "prompt").await);
+                }
+            }
+            // An update restarts the daemon, on the same database: a new chat in the folder registers before `a` does.
+            let (d, bob) = with_bob(open(), false);
+            let d = Arc::new(d);
+            assert_eq!(join(&d, claude("x")).name, "api-claude");
+            assert_eq!(join(&d, claude("z")).name, "api-claude-3");
+            assert_eq!(join(&d, claude("a")).name, TITLED);
+            assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude-2"));
+            // Told its new name once: at its next prompt, unless it was told before the restart.
+            assert_eq!(told(&d, "a", "prompt").await, !told_before, "told before: {told_before}");
+            assert!(!told(&d, "a", "prompt").await);
+            // Bob's mail to the name it was told reaches it, not the new chat.
+            let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude-2")).unwrap();
+            assert_ne!(state, "refused");
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-3")).unwrap(), 0);
+            drop(g);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn an_old_name_another_chat_took_never_comes_back_to_the_titled_one_after_a_restart() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        settled(&mut d);
+        let d = Arc::new(d);
+        // Known only from its hooks, so its name isn't kept for it once it ends.
+        let hook_only = || SessionReg { tier: Tier::Turn, ..claude("a") };
+        assert_eq!(d.register_quiet(None, hook_only(), GitInfo::default()).unwrap().0.name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        leave(&d, "claude-code:a", 0);
+        // Its old name is free, and another chat takes it: for good.
+        assert_eq!(join(&d, claude("z")).name, "api-claude");
+        assert_eq!(d.inner.lock().unwrap().store.former("claude-code:a").unwrap(), None);
+        // A restart, and the titled chat comes back first.
+        restart(&d);
+        assert_eq!(d.register_quiet(None, hook_only(), GitInfo::default()).unwrap().0.name, TITLED);
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former, None);
+        // Mail to the name waits for the chat that has it, not the titled one.
+        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude")).unwrap();
+        assert_ne!(state, "refused");
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 1);
+        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_a_titled_chat_to_mail_sent_to_its_old_name_counts_as_the_reply() {
+        let (d, _) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        // Sent here to its old name, while it is live and once it has ended.
+        for live in [true, false] {
+            if !live {
+                leave(&d, "claude-code:a", 0);
+            }
+            let sent = d.send("claude-code:z".into(), "api-claude", "q", None, true, false, None, Vec::new()).await;
+            let id = sent.unwrap().ids[0].clone();
+            if !live {
+                join(&d, claude("a"));
+            }
+            let reply =
+                d.send("claude-code:a".into(), "api-claude-2", "a", Some(id.clone()), true, false, None, Vec::new());
+            reply.await.unwrap();
+            let status = d.inner.lock().unwrap().store.delivery_status("claude-code:z", &[id]).unwrap();
+            assert_eq!(status[0]["stage"], "replied", "live: {live}: {status:?}");
+            assert_eq!(status[0]["recipient"], d.addr(TITLED));
+        }
+    }
+
+    #[test]
+    fn a_teammate_says_where_mail_to_an_old_name_went_and_its_reply_from_there_counts() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        join(&d, claude("z"));
+        let sent = |id: &str| Message {
+            id: id.into(),
+            from: d.addr("api-claude"),
+            to: "bob/web-claude".into(),
+            sent_at: util::now_ms(),
+            ..from_bob(&d, "x")
+        };
+        let reply = |id: &str, from: &str| Message {
+            from: from.into(),
+            to: d.addr("api-claude"),
+            reply_to: Some(id.into()),
+            ..from_bob(&d, "x")
+        };
+        let stage = |id: &str| {
+            let g = d.inner.lock().unwrap();
+            g.store.delivery_status("claude-code:z", &[id.into()]).unwrap()[0]["stage"].as_str().unwrap().to_string()
+        };
+        let (one, other) = ("01JA0000000000000000000001", "01JA0000000000000000000002");
+        for id in [one, other] {
+            d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(id), "bob/web-claude", "queued").unwrap();
+        }
+        // Bob's machine took it for the chat at its name now; nobody else can say so, nor name someone else's session.
+        let carol = iroh::SecretKey::generate();
+        d.readdressed(&carol.public(), one, "bob/web-fix");
+        d.readdressed(&bob.public(), one, "carol/web");
+        d.readdressed(&bob.public(), one, "bob/web-fix");
+        d.receive(bob.public(), reply(one, "bob/web-fix")).unwrap();
+        assert_eq!(stage(one), "replied");
+        // Without word of where it went, a reply from another of Bob's chats is not the one it waits for.
+        d.receive(bob.public(), reply(other, "bob/web-fix")).unwrap();
+        assert_ne!(stage(other), "replied");
+        // The word comes after the reply (Bob's machine flushed its outbox first on a reconnect): the reply counts then.
+        d.readdressed(&bob.public(), other, "bob/web-fix");
+        assert_eq!(stage(other), "replied");
+        // A reply from elsewhere doesn't, whenever the word comes.
+        let late = "01JA0000000000000000000003";
+        d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(late), "bob/web-claude", "queued").unwrap();
+        d.receive(bob.public(), reply(late, "bob/web-other")).unwrap();
+        d.readdressed(&bob.public(), late, "bob/web-fix");
+        assert_ne!(stage(late), "replied");
+    }
+
+    #[test]
+    fn mail_to_an_old_name_that_is_to_be_tried_again_says_nothing_of_where_it_went() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        // Bob has sent all the files this machine takes from him in an hour.
+        let hour = crate::files::QUOTA_SENDER_HOUR;
+        d.inner.lock().unwrap().quota.admit("bob", hour, 0, 0, std::time::Instant::now()).unwrap();
+        let file = crate::proto::Attachment { name: "log.txt".into(), content: "x".into(), path: None };
+        let msg = Message { files: vec![file], ..from_bob(&d, "api-claude") };
+        let (state, note, to) = d.receive_readdressed(bob.public(), msg).unwrap();
+        // Tried again later, when the name may be another chat's: Bob's receipt keeps the name it was sent to.
+        assert_eq!((state.as_str(), to), ("retry", None), "{note}");
+    }
+
+    #[test]
+    fn a_titled_chat_back_under_another_name_keeps_its_old_one() {
+        let (d, bob) = with_bob(memory_store(), false);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        restart(&d);
+        // Its name now is live on another of my machines: it comes back with a suffix, asking for that name.
+        let others = Elsewhere { live: HashSet::from([TITLED.to_string()]), ..Default::default() };
+        let reg = SessionReg { name: Some(TITLED.into()), ..claude("a") };
+        let suffixed = format!("{TITLED}-2");
+        let name = d.register_among(Some(conn_of(&reg.key)), reg, GitInfo::default(), others).unwrap().0.name;
+        assert_eq!(name, suffixed);
+        // Its old name is still its own, live as remembered.
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude"));
+        assert_eq!(
+            d.inner.lock().unwrap().store.former("claude-code:a").unwrap().map(|f| f.0).as_deref(),
+            Some("api-claude")
+        );
+        // Bob's mail to it is taken as mail to the live chat is.
+        let (state, note, to) = d.receive_readdressed(bob.public(), from_bob(&d, "api-claude")).unwrap();
+        assert_eq!(to, Some(d.addr(&suffixed)), "{note}");
+        assert_eq!(d.receive(bob.public(), from_bob(&d, &suffixed)).unwrap().0, state);
+        assert_eq!(d.inner.lock().unwrap().store.unread_count(&d.addr(&suffixed)).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_title_never_takes_an_offline_chats_name_or_its_mail() {
+        let mut d = super::super::test_daemon(Default::default());
+        settled(&mut d);
+        // Someone named this chat by hand, as a title would; it has gone offline with mail waiting.
+        let by_hand = SessionReg { name: Some(TITLED.into()), ..claude("h") };
+        assert_eq!(join(&d, by_hand).name, TITLED);
+        mail(&d, "waiting", TITLED);
+        leave(&d, "claude-code:h", 0);
+        // A new chat titled "Fix the login bug" may not take it, though someone asking for it by name could.
+        assert_eq!(join(&d, claude("n")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:n", TITLED.into()).is_err());
+        let g = d.inner.lock().unwrap();
+        assert_eq!(g.store.session_by_name(TITLED).unwrap().unwrap().key, "claude-code:h");
+        assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+        assert_eq!(g.live["claude-code:n"].name, "api-claude");
+        assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_teammates_ack_moves_the_receipt_to_where_mail_went_only_once_it_was_taken() {
+        let (d, bob) = with_bob(memory_store(), false);
+        join(&d, claude("z"));
+        let sent = |id: &str| Message {
+            id: id.into(),
+            from: d.addr("api-claude"),
+            to: "bob/web-claude".into(),
+            sent_at: util::now_ms(),
+            ..from_bob(&d, "x")
+        };
+        let recipient = |id: &str| d.inner.lock().unwrap().store.receipt_recipient(id).unwrap().unwrap();
+        let (busy, refused) = ("01JA0000000000000000000011", "01JA0000000000000000000012");
+        for id in [busy, refused] {
+            d.inner.lock().unwrap().store.record_sent("claude-code:z", &sent(id), "bob/web-claude", "queued").unwrap();
+        }
+        // Turned away for now, or for good: the receipt keeps the address it was sent to.
+        d.acked(&bob.public(), busy, "retry", Some("bob/web-fix".into()));
+        d.acked(&bob.public(), refused, "refused", Some("bob/web-fix".into()));
+        assert_eq!((recipient(busy), recipient(refused)), ("bob/web-claude".into(), "bob/web-claude".into()));
+        // Taken, at the name its chat goes by now: the receipt waits for a reply from there.
+        d.acked(&bob.public(), busy, "queued", Some("bob/web-fix".into()));
+        assert_eq!(recipient(busy), "bob/web-fix");
+    }
+
+    #[test]
+    fn an_explicit_reclaim_of_an_ended_titled_chats_old_name_takes_it_for_good() {
+        let mut d = super::super::test_daemon(Default::default());
+        settled(&mut d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        mail(&d, "titled", TITLED);
+        leave(&d, "claude-code:a", 0);
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        // Asked for by name, as `set_name` does: the ended chat's old name is taken, its own mail stays with it.
+        let r = d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Explicit).unwrap();
+        assert_eq!((r.name.as_str(), r.unread), ("api-claude", 0));
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.session_by_name("api-claude").unwrap().unwrap().key, "claude-code:z");
+            assert_eq!(g.store.former("claude-code:a").unwrap(), None);
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+        }
+        // The titled chat comes back to its name now, without the old one.
+        leave(&d, "claude-code:z", 0);
+        restart(&d);
+        assert_eq!(join(&d, claude("a")).name, TITLED);
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former, None);
+    }
+
+    #[test]
+    fn mail_sent_again_to_an_old_name_says_where_it_went_then_not_who_has_the_name_now() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        settled(&mut d);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        // Bob's mail to the old name reaches the titled chat; word of where it went gets lost on the way back.
+        let first = from_bob(&d, "api-claude");
+        assert_eq!(d.receive_readdressed(bob.public(), first.clone()).unwrap().2, Some(d.addr(TITLED)));
+        // The titled chat ends, and another asks for the old name by name and gets it.
+        leave(&d, "claude-code:a", 0);
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Explicit).unwrap();
+        // Bob's machine sends it again: not delivered twice, and it went to the titled chat, where its reply comes from.
+        let (state, note, to) = d.receive_readdressed(bob.public(), first.clone()).unwrap();
+        assert_eq!((state.as_str(), note.as_str(), to), ("queued", "already delivered", Some(d.addr(TITLED))));
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+        }
+        // The same id from another of Bob's chats is not Bob's mail sent again: it says nothing of where that went.
+        let other = Message { from: "bob/other".into(), ..first };
+        assert_eq!(d.receive_readdressed(bob.public(), other).unwrap().2, None);
+    }
+
+    #[tokio::test]
+    async fn a_titled_chats_old_name_is_kept_for_it_once_it_ends_until_it_is_forgotten() {
+        let (mut d, bob) = with_bob(memory_store(), false);
+        // Long after the daemon started: sessions gone a day are forgotten.
+        settled(&mut d);
+        let d = Arc::new(d);
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+        leave(&d, "claude-code:a", 0);
+        // A new chat in the folder doesn't get the name the ended one was told, nor can take it.
+        assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+        assert!(d.set_status("claude-code:z", None, Some("api-claude".into()), Rename::Automatic).is_err());
+        let presence = d.presence_of(Vec::new());
+        assert!(presence.kept.contains(&"api-claude".to_string()), "{:?}", presence.kept);
+        // Bob's mail to it (say from his outbox, while Alex was offline) waits for the ended chat, at its name now.
+        let (state, _) = d.receive(bob.public(), from_bob(&d, "api-claude")).unwrap();
+        assert_ne!(state, "refused");
+        {
+            let g = d.inner.lock().unwrap();
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), 1);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+        }
+        // Mail sent here to it goes the same way.
+        let sent = d.send("claude-code:z".into(), "api-claude", "me too", None, true, false, None, Vec::new()).await;
+        assert_eq!(sent.unwrap().recipients[0].address, d.addr(TITLED));
+        // It comes back to its name and the old one, with that mail.
+        let back = join(&d, claude("a"));
+        assert_eq!((back.name.as_str(), back.unread), (TITLED, 2));
+        assert_eq!(d.inner.lock().unwrap().live["claude-code:a"].former.as_deref(), Some("api-claude"));
+        // Once it is forgotten, both names are free again.
+        leave(&d, "claude-code:a", 2 * DAY);
+        assert_eq!(join(&d, claude("y")).name, "api-claude");
+        assert!(d.inner.lock().unwrap().store.session_by_name(TITLED).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_teammates_mail_to_a_titled_chats_old_name_reaches_it_held_or_not() {
+        for hold in [false, true] {
+            let (d, bob) = with_bob(memory_store(), hold);
+            let d = Arc::new(d);
+            assert_eq!(join(&d, claude("a")).name, "api-claude");
+            assert!(d.name_from_title("claude-code:a", TITLED.into()).unwrap().is_some());
+            assert_eq!(join(&d, claude("z")).name, "api-claude-2");
+            let msg = from_bob(&d, "api-claude");
+            let id = msg.id.clone();
+            let (state, note, to) = d.receive_readdressed(bob.public(), msg).unwrap();
+            assert_ne!(state, "refused", "{note}");
+            // Bob's machine hears where it went, which the reply comes from.
+            assert_eq!(to, Some(d.addr(TITLED)), "hold: {hold}");
+            let mut ids = vec![id.clone()];
+            if hold {
+                assert_eq!(state, "held");
+                assert_eq!(d.settle(std::slice::from_ref(&id), true).unwrap(), 1);
+            } else {
+                // Taken as mail to the live chat at its name now is (not left waiting as for an offline one).
+                let to_now = from_bob(&d, TITLED);
+                ids.push(to_now.id.clone());
+                assert_eq!(d.receive(bob.public(), to_now).unwrap(), (state, note));
+            }
+            let g = d.inner.lock().unwrap();
+            let unread = g.store.unread(&d.addr(TITLED)).unwrap();
+            assert_eq!(unread.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids, "hold: {hold}");
+            assert!(unread.iter().all(|m| m.to == d.addr(TITLED)));
+            assert_eq!(g.store.unread_count(&d.addr(TITLED)).unwrap(), ids.len() as u32);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude-2")).unwrap(), 0);
+            assert_eq!(g.store.unread_count(&d.addr("api-claude")).unwrap(), 0);
+        }
     }
 
     #[test]
@@ -1496,6 +2382,7 @@ mod tests {
         assert_eq!(d.inner.lock().unwrap().live[TERMINAL].name, "terminal");
         // The terminal's commands go on as before.
         let call = HookCall {
+            through_reason: Some(false),
             agent: "cli".into(),
             event: "stop".into(),
             session_id: "terminal".into(),
@@ -1506,8 +2393,8 @@ mod tests {
             doing: None,
             name: Some("terminal".into()),
             dirs: Vec::new(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         };
         assert_eq!(d.hook(call).await.unwrap().address, Some(d.addr("terminal")));
     }
@@ -1607,6 +2494,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         let err = d.register_quiet(None, reg("codex:1", "/work/private/notes"), GitInfo::default()).unwrap_err();
         assert_eq!(err.to_string(), OFF_HERE);
@@ -1628,6 +2516,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         // Claude Code's `/clear`: its MCP server now registers the new conversation.
         assert_eq!(
@@ -1672,6 +2561,7 @@ mod tests {
         };
         let d = Arc::new(super::super::test_daemon(cfg));
         let call = |id: &str, event: &str, dirs: &[&str]| HookCall {
+            through_reason: Some(false),
             agent: "cursor".into(),
             event: event.into(),
             session_id: id.into(),
@@ -1682,8 +2572,8 @@ mod tests {
             doing: None,
             name: None,
             dirs: dirs.iter().map(|d| d.to_string()).collect(),
-            through_reason: false,
             keep: false,
+            codex_home: None,
         };
         // Working in /work/api, with /work/private open too.
         let e = d.hook(call("c1", "prompt", &["/work/private"])).await.unwrap_err();
@@ -1698,6 +2588,7 @@ mod tests {
             pid: None,
             tier: Tier::Pull,
             name: None,
+            claude_dir: None,
         };
         assert_eq!(d.register_quiet(Some(1), reg, GitInfo::default()).unwrap_err().to_string(), OFF_HERE);
         // Another session, mid-turn: while c1 is mid-turn too, a call naming no session can't be handed its key.
@@ -1708,5 +2599,43 @@ mod tests {
         // Once its folders are all on again, it is a session like any other.
         assert!(d.hook(call("c1", "prompt", &[])).await.unwrap().address.is_some());
         assert!(d.inner.lock().unwrap().live.contains_key("cursor:c1"));
+    }
+
+    /// MCP servers of earlier releases drop a session refused on reconnect only when the refusal is exactly `OFF_HERE`.
+    /// Any other text fails their whole reconnect, and they keep retrying it, so it stays exactly that, whatever part
+    /// of the config file can't be read.
+    #[tokio::test]
+    async fn a_daemon_refuses_a_folder_that_is_off_with_exactly_the_old_text_even_when_the_file_is_unreadable() {
+        let off: std::collections::BTreeMap<_, _> = [("/work/private".to_string(), "off".to_string())].into();
+        for cfg in [
+            // The whole file: every folder is off.
+            crate::config::Config { unreadable: Some("bad TOML".into()), all_folders_off: true, ..Default::default() },
+            // Another setting.
+            crate::config::Config {
+                folders: off.clone(),
+                unreadable: Some("port: invalid type".into()),
+                ..Default::default()
+            },
+            // The folder's own entry.
+            crate::config::Config {
+                folders: off.clone(),
+                unreadable_folders: vec!["/work/private".into()],
+                unreadable: Some("folders./work/private: expected \"off\"".into()),
+                ..Default::default()
+            },
+        ] {
+            let d = Arc::new(super::super::test_daemon(cfg));
+            let private = SessionReg { cwd: "/work/private".into(), ..named("cursor:c1", "cursor", None) };
+            let in_private = HookCall { dirs: vec!["/work/private".into()], ..gemini("c2", "prompt") };
+            let said = [
+                d.register_quiet(Some(1), private, GitInfo::default()).unwrap_err(),
+                d.hook(in_private).await.unwrap_err(),
+                // Its hooks said it is in a folder that is off; its MCP server doesn't know.
+                d.register_quiet(Some(2), named("gemini:c2", "gemini", None), GitInfo::default()).unwrap_err(),
+            ];
+            for e in said {
+                assert_eq!(e.to_string(), OFF_HERE);
+            }
+        }
     }
 }
