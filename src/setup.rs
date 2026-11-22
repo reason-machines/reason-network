@@ -75,6 +75,22 @@ pub fn shell_cmd(exe: &Path, args: &str) -> String {
     format!("{quoted} {args}")
 }
 
+/// The command line for an agent that runs hooks with `sh -c` on Unix but `cmd /c` on Windows (Antigravity). Unix is
+/// [`shell_cmd`]; on Windows the path goes in double quotes, which cmd.exe reads and PowerShell's `& '…'` form breaks.
+pub fn cmd_shell_cmd(exe: &Path, args: &str) -> String {
+    if cfg!(windows) { format!("{} {args}", cmd_quote(&exe.display().to_string())) } else { shell_cmd(exe, args) }
+}
+
+/// A Windows path for cmd.exe: as is when it needs no quotes, otherwise in double quotes. A Windows path can't hold `"`,
+/// so nothing inside needs escaping. cmd.exe still expands `%NAME%` inside the quotes.
+fn cmd_quote(p: &str) -> String {
+    if p.chars().all(|c| c.is_ascii_alphanumeric() || r"\:._-".contains(c)) {
+        p.to_string()
+    } else {
+        format!("\"{p}\"")
+    }
+}
+
 fn home() -> PathBuf {
     paths::user_home()
 }
@@ -1878,6 +1894,38 @@ mod tests {
     fn quoting() {
         assert_eq!(shell_cmd(Path::new("/usr/local/bin/reason-network"), "mcp"), "/usr/local/bin/reason-network mcp");
         assert_eq!(shell_cmd(Path::new("/Users/a b/reason-network"), "mcp"), "'/Users/a b/reason-network' mcp");
+    }
+
+    #[test]
+    fn cmd_quoting() {
+        assert_eq!(
+            cmd_quote(r"C:\Users\alex\.local\bin\reason-network.exe"),
+            r"C:\Users\alex\.local\bin\reason-network.exe"
+        );
+        assert_eq!(
+            cmd_quote(r"C:\Users\Alex Smith\.local\bin\reason-network.exe"),
+            r#""C:\Users\Alex Smith\.local\bin\reason-network.exe""#
+        );
+        assert_eq!(
+            cmd_quote(r"C:\Users\Alex O'Neil\reason-network.exe"),
+            r#""C:\Users\Alex O'Neil\reason-network.exe""#
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cmd_shell_quoting() {
+        assert_eq!(
+            cmd_shell_cmd(Path::new(r"C:\Users\Alex Smith\reason-network.exe"), "hook antigravity stop"),
+            r#""C:\Users\Alex Smith\reason-network.exe" hook antigravity stop"#
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cmd_shell_quoting() {
+        let exe = Path::new("/Users/a b/reason-network");
+        assert_eq!(cmd_shell_cmd(exe, "hook antigravity stop"), shell_cmd(exe, "hook antigravity stop"));
     }
 
     #[test]
