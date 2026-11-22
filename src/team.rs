@@ -15,6 +15,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+mod anchor;
+pub use anchor::AnchorSelection;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Signed<T> {
     pub body: T,
@@ -100,6 +103,9 @@ pub struct TeamState {
     /// out of the signed entries, and builds that don't know it pass the rest of the state on unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attestations: BTreeMap<String, String>,
+    /// Explicit choices signed by each selecting machine; proof-only members cannot replace another signer's choice.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub anchors: BTreeMap<String, Signed<AnchorSelection>>,
 }
 
 /// A join refused because one of the person's own computers should let this one in (another computer of the same
@@ -145,6 +151,7 @@ impl TeamState {
             invites: BTreeMap::new(),
             link: None,
             attestations: BTreeMap::new(),
+            anchors: BTreeMap::new(),
         };
         state.put_member(key, key.public(), person, machine, true);
         state.new_link(key);
@@ -494,6 +501,18 @@ impl TeamState {
             }
         }
         self.attestations.retain(|k, _| self.members.contains_key(k));
+        for (key, entry) in &other.anchors {
+            if *key == entry.by.to_string()
+                && admitted.contains(&entry.by)
+                && plausible(entry.body.ts)
+                && entry.verify(&self.id, "anchor")
+                && (entry.body.endpoint.is_none() || entry.body.authority.is_none())
+                && newer(entry.body.ts, &entry.sig, self.anchors.get(key).map(|e| (e.body.ts, e.sig.as_str())))
+            {
+                self.anchors.insert(key.clone(), entry.clone());
+                changed = true;
+            }
+        }
         Ok(changed || self.attestations != proofs_before)
     }
 
@@ -508,6 +527,7 @@ impl TeamState {
             invites: BTreeMap::new(),
             link: None,
             attestations: BTreeMap::new(),
+            anchors: BTreeMap::new(),
         };
         s.merge(other)?;
         let admitted = s.admitted();

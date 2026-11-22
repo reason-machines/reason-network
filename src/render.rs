@@ -222,6 +222,9 @@ pub fn team(t: &TeamInfo) -> String {
     let mut out = String::new();
     let relay = t.relay.clone().unwrap_or_else(default_relays);
     let _ = writeln!(out, "team {} · relay: {relay}", crate::team::shown_name(&t.name));
+    for line in &t.anchor {
+        let _ = writeln!(out, "  {line}");
+    }
     let pw = t.machines.iter().map(|m| person(m).chars().count()).max().unwrap_or(0);
     let mw = t.machines.iter().map(|m| m.machine.chars().count()).max().unwrap_or(0);
     for m in &t.machines {
@@ -458,6 +461,7 @@ mod tests {
             machine: "mbp".into(),
             machines: Vec::new(),
             features: Vec::new(),
+            anchor: Vec::new(),
             messages: Vec::new(),
             udp: None,
         };
