@@ -138,7 +138,7 @@ or keys. It's off by default; see [DESIGN.md](DESIGN.md#troubleshooting).
 ## Uninstall
 
 ```sh
-reason-network leave && reason-network setup --remove && rm -rf ~/.reason/network ~/.local/bin/reason-network
+reason-network leave; reason-network setup --remove && rm -rf ~/.reason/network ~/.local/bin/reason-network
 rm -f ~/.local/bin/tincan   # if you came from tincan
 ```
 
