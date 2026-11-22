@@ -1,5 +1,5 @@
 //! The local API between the daemon and its clients (`reason network mcp`, the CLI, hooks): one JSON object per line
-//! over `~/.Reason Network/Reason Network.sock`. Requests carry an `id` and get a [`Reply`] with the same id; a connection that
+//! over `~/.reason/network/network.sock`. Requests carry an `id` and get a [`Reply`] with the same id; a connection that
 //! registered sessions also receives [`Event`]s for them.
 
 use serde::{Deserialize, Serialize};
@@ -554,7 +554,8 @@ pub struct SendResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipient {
     pub address: String,
-    /// `pushed`, `queued` or `inbox`.
+    /// What became of it: `delivered`, `pushed`, `queued`, `held`, `retry`, `refused` or `accepted`, and
+    /// `notified` or `not notified` for a pop-up to the person.
     pub state: String,
     pub note: String,
 }
