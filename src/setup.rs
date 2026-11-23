@@ -83,8 +83,15 @@ fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".codex"))
 }
 
+/// Gemini CLI's settings folder. `GEMINI_CLI_HOME` stands in for the user's home folder, as Gemini CLI reads it (unset
+/// or empty, it is the user's home): the folder is `.gemini` inside it, not the variable's value itself. (`CODEX_HOME`,
+/// above, does name the folder.)
 fn gemini_home() -> PathBuf {
-    std::env::var_os("GEMINI_CLI_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".gemini"))
+    gemini_dir_in(std::env::var_os("GEMINI_CLI_HOME"), home())
+}
+
+fn gemini_dir_in(gemini_cli_home: Option<std::ffi::OsString>, user_home: PathBuf) -> PathBuf {
+    gemini_cli_home.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or(user_home).join(".gemini")
 }
 
 fn opencode_home() -> PathBuf {
@@ -1715,6 +1722,17 @@ mod tests {
         assert!(doc.to_string().contains("MCPTool(reason-network__*)"));
         grok_allow(&mut doc, true);
         assert_eq!(doc.to_string(), "");
+    }
+
+    #[test]
+    fn gemini_cli_home_is_the_home_the_gemini_folder_is_in() {
+        let user = PathBuf::from("/home/alex");
+        assert_eq!(gemini_dir_in(None, user.clone()), user.join(".gemini"));
+        // Gemini CLI keeps its settings in `.gemini` inside the folder `GEMINI_CLI_HOME` names, not in that folder.
+        let set = std::ffi::OsString::from("/srv/gemini-state");
+        assert_eq!(gemini_dir_in(Some(set), user.clone()), PathBuf::from("/srv/gemini-state").join(".gemini"));
+        // An empty value counts as unset, as it does for Gemini CLI.
+        assert_eq!(gemini_dir_in(Some(std::ffi::OsString::new()), user.clone()), user.join(".gemini"));
     }
 
     /// Makes `link` a symlink to `target`; false where this account may not make one (Windows without developer mode).
