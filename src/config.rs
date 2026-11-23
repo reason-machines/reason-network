@@ -64,7 +64,8 @@ pub struct Inbound {
     pub people: BTreeMap<String, Policy>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// In order of how much they hold back, so the larger of two is the stricter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
     #[default]
@@ -264,8 +265,19 @@ impl Config {
             .unwrap_or_else(|| "me".into())
     }
 
+    /// What to do with a message from `person`, a name as the team has it. A name under `[inbound.people]` counts as
+    /// that name, written the way `person` is read above (`Alice` is `alice`, `Alice Smith` is `alice-smith`), so an
+    /// entry isn't passed over for its capitals. A name written exactly as `person` counts too, since a team's names
+    /// aren't always what `slug` gives back (`a--b`, `alex-`, one over 40 characters). Entries that come to the same
+    /// name: the strictest holds.
     pub fn policy_for(&self, person: &str) -> Policy {
-        self.inbound.people.get(person).copied().unwrap_or(self.inbound.default)
+        let mut named = self
+            .inbound
+            .people
+            .iter()
+            .filter(|(name, _)| name.as_str() == person || util::slug(name) == person)
+            .map(|(_, p)| *p);
+        named.next().map_or(self.inbound.default, |first| named.fold(first, Policy::max))
     }
 
     pub fn lan(&self) -> bool {
@@ -505,6 +517,31 @@ mod tests {
         assert_eq!(policy("accept"), Policy::Hold);
         assert_eq!(policy("hold"), Policy::Hold);
         assert_eq!(policy("refuse"), Policy::Refuse);
+    }
+
+    #[test]
+    fn a_person_is_found_under_the_name_the_team_has_for_them() {
+        // The team's names are lowercase and plain; an entry written with capitals or spaces is still that person's.
+        let cfg =
+            Config::read_private("[inbound.people]\nAlice = \"refuse\"\n\"Bob Smith\" = \"hold\"\ncarol = \"hold\"\n");
+        assert_eq!(cfg.policy_for("alice"), Policy::Refuse);
+        assert_eq!(cfg.policy_for("bob-smith"), Policy::Hold);
+        assert_eq!(cfg.policy_for("carol"), Policy::Hold);
+        assert_eq!(cfg.policy_for("dave"), Policy::Accept, "nobody else is affected");
+        // Entries that come to one name: the strictest holds, whatever their order.
+        for text in ["alice = \"accept\"\nALICE = \"refuse\"\n", "ALICE = \"refuse\"\nalice = \"accept\"\n"] {
+            let cfg = Config::read_private(&format!("[inbound.people]\n{text}"));
+            assert_eq!(cfg.policy_for("alice"), Policy::Refuse, "{text}");
+        }
+        // A team name `slug` would change (`plain_names` lets these through) is still found by its exact spelling.
+        let long = "a".repeat(41);
+        let cfg = Config::read_private(&format!(
+            "[inbound.people]\na--b = \"refuse\"\nalex- = \"hold\"\n{long} = \"refuse\"\n"
+        ));
+        assert_eq!(cfg.policy_for("a--b"), Policy::Refuse);
+        assert_eq!(cfg.policy_for("alex-"), Policy::Hold);
+        assert_eq!(cfg.policy_for(&long), Policy::Refuse);
+        assert_eq!(cfg.policy_for("dave"), Policy::Accept, "nobody else is affected");
     }
 
     #[test]
