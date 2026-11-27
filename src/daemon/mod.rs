@@ -161,6 +161,8 @@ struct Inner {
     team: Option<TeamState>,
     /// Messages handed to a push channel or a hook and not yet confirmed; hidden from inbox and hooks meanwhile.
     in_flight: HashMap<String, Instant>,
+    /// Attempts to enqueue directly into Claude Code without an enqueue acknowledgment, keyed by message id.
+    claude_push_attempts: HashMap<String, u8>,
     /// Sessions waiting in `check_inbox` right now (they get new mail there instead of a push).
     polling: HashMap<String, usize>,
     /// Recent agent-to-agent message times per (from, to), for the loop guard.
@@ -294,6 +296,7 @@ impl Daemon {
                 next_conn: 0,
                 team,
                 in_flight: HashMap::new(),
+                claude_push_attempts: HashMap::new(),
                 polling: HashMap::new(),
                 pairs: HashMap::new(),
                 swept: 0,
@@ -449,7 +452,14 @@ impl Daemon {
             }
             Request::Delivered { key, ids } => {
                 let mut g = self.inner.lock().unwrap();
-                let changed = g.store.mark_read(&ids, util::now_ms())?;
+                // Older Claude clients send Delivered immediately after writing to the socket. That only proves an
+                // injection was attempted, so leave those messages pending for the bounded retry/fallback path.
+                let legacy_ids: Vec<_> =
+                    ids.iter().filter(|id| !g.claude_push_attempts.contains_key(*id)).cloned().collect();
+                let changed = g.store.mark_read(&legacy_ids, util::now_ms())?;
+                for id in legacy_ids {
+                    g.claude_push_attempts.remove(&id);
+                }
                 // Hosted relays acknowledge a handover to a server inbox, not agent consumption.
                 let handed_to_agent = g.live.get(&key).is_some_and(|l| l.through_reason == Some(false));
                 for id in &changed {
@@ -458,11 +468,29 @@ impl Daemon {
                     }
                 }
                 for id in &ids {
-                    g.in_flight.remove(id);
+                    if !g.claude_push_attempts.contains_key(id) {
+                        g.in_flight.remove(id);
+                    }
                 }
                 if handed_to_agent {
                     g.store.handoff(&changed, util::now_ms())?;
                 }
+                if let Some(l) = g.live.get_mut(&key) {
+                    l.retry = None;
+                }
+                Value::Null
+            }
+            Request::Enqueued { key, ids } => {
+                let mut g = self.inner.lock().unwrap();
+                let changed = g.store.mark_read(&ids, util::now_ms())?;
+                for id in &ids {
+                    g.in_flight.remove(id);
+                    g.claude_push_attempts.remove(id);
+                }
+                for id in &changed {
+                    self.usage.stage(id, "delivered");
+                }
+                g.store.handoff(&changed, util::now_ms())?;
                 if let Some(l) = g.live.get_mut(&key) {
                     l.retry = None;
                 }

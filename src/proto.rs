@@ -169,8 +169,14 @@ pub enum Request {
     StopWaiting {
         key: String,
     },
-    /// The client injected these messages into its agent's conversation.
+    /// The client showed these messages from its inbox to its agent. Direct Claude socket injections use Enqueued
+    /// instead, because a successful write alone doesn't confirm the message was accepted by the conversation.
     Delivered {
+        key: String,
+        ids: Vec<String>,
+    },
+    /// The Claude-side client confirms these socket-injected messages were enqueued in this session.
+    Enqueued {
         key: String,
         ids: Vec<String>,
     },
@@ -348,7 +354,8 @@ pub fn error_code(error: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    /// Inject `text` into the conversation of session `key`, then acknowledge with [`Request::Delivered`].
+    /// Inject `text` into the conversation of session `key`, then acknowledge with [`Request::Enqueued`] once the
+    /// message is observed by the session. Until then it remains pending and may be retried with the same ids.
     Deliver { key: String, ids: Vec<String>, text: String },
 }
 

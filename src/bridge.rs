@@ -169,6 +169,7 @@ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<V
         | Request::Ask { key, .. }
         | Request::StopWaiting { key }
         | Request::Delivered { key, .. }
+        | Request::Enqueued { key, .. }
         | Request::PushFailed { key, .. } => key.clone(),
         Request::Send { from, .. } => from.clone(),
         Request::Hook(hook) => format!("{}:{}", hook.agent, hook.session_id),
@@ -178,7 +179,8 @@ async fn dispatch(link: &Arc<Link>, sessions: &Sessions, call: Call) -> Result<V
     let cwd = {
         let sessions = sessions.lock().await;
         let Some(session) = sessions.get(&key) else { bail!("register this session first") };
-        if let Request::Delivered { ids, .. } | Request::PushFailed { ids, .. } = &request
+        if let Request::Delivered { ids, .. } | Request::Enqueued { ids, .. } | Request::PushFailed { ids, .. } =
+            &request
             && ids.iter().any(|id| !session.received.contains(id))
         {
             bail!("only acknowledge messages received by this session");

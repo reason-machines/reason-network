@@ -344,8 +344,11 @@ no process, so nothing ends it but its own server. The server pushes into the in
 (`CLAUDE_CODE_MESSAGING_SOCKET`: Claude Code drops an inherited one when it starts and sets its own once its inbox
 listens), else the one its own process's entry names, never another's (an inherited `CLAUDE_PID` can be the parent's).
 Claude Code may list its inbox after starting the server: the server registers as `push` once it knows the inbox, and
-until then the daemon posts into the one the registry lists, or leaves the mail for `check_inbox` and says so. A server
-asked to push with no inbox says so, and the mail is unread again: nobody is told it was delivered.
+until then the daemon posts into the one the registry lists, or leaves the mail for `check_inbox` and says so. A socket
+write is only an injection attempt: the Claude-side MCP tool acknowledges the message id after it appears in the
+conversation. Until then the daemon retries with the same id up to three times, 90 seconds apart; if no acknowledgement
+arrives, it stops pushing and leaves the message unread for `check_inbox`. Older clients' immediate `Delivered` after
+a socket write is treated as no acknowledgement, so the fallback is bounded rather than a permanent retry.
 
 ## Getting messages into agents
 
@@ -357,7 +360,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 
 | Agent | Tier | Mechanism |
 |---|---|---|
-| Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
+| Claude Code | push | MCP child posts to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`, `{"type":"user",…}` frame): delivered between tool calls, starts a turn if idle. The session acknowledges by message id after observing it; a socket write alone is not read. Up to three attempts are made 90 seconds apart, then mail stays unread and `check_inbox` remains available. Fallbacks: `asyncRewake` hook (documented idle wake), channels (`notifications/claude/channel`, needs a dev flag until allowlisted). |
 | Codex | push | While a turn runs (its rollout, the transcript its hooks name, records `task_started` and no end yet), however long: `PostToolUse` `additionalContext` at the next tool call, or Stop `decision:block`. If the turn ends without Stop (interrupted or failed), mail no hook took goes to `codex queue` within seconds. Otherwise (idle, or no rollout known): `codex queue --thread <id>` / app-server `turn/start` (default daemon mode). Limit: if the daemon restarts while mail waits for a running turn, and the turn then ends without Stop before any of its hooks runs, the mail waits until the next prompt. Offline (a resumed thread fires no hook until its first turn) and seen within the last day, at send time: wake mail goes to `codex queue --thread <id>` too, which starts a turn when the thread is resumed; that turn's SessionStart registers it, and the mail counts as delivered once `codex queue` takes it (if that fails, the hooks show it, and its later offline mail waits for them until its next SessionStart or a `codex queue` that works). `codex queue` and thread names use the `CODEX_HOME` the session's hooks ran with. Hooks need one-time approval in `/hooks`. |
 | opencode | push | Plugin (one file for 1.x and 2.x): `client.session.promptAsync` (1.x), `ctx.session.prompt` (2.x, where busy/idle come from `session.execution.*` events). |
 | pi | push | Extension (`~/.pi/agent/extensions/reason-network.ts`): registers the MCP server per session (`deferred`, with `REASON_NETWORK_SESSION`), `sendUserMessage` (`deliverAs: "steer"` mid-run, a new turn when idle), busy/idle from `agent_start`/`agent_settled`, the session name as `doing`. |
@@ -501,7 +504,7 @@ Or paste the invite line into any agent.
 
 ## Milestones
 
-- **M0, one machine** (done): daemon, socket API, SQLite, MCP server with the four tools, CLI, Claude push
+- **M0, one machine** (done): daemon, socket API, SQLite, MCP server with five tools, CLI, Claude push
   delivery, passive Claude discovery, pull delivery for everything else.
 - **M1, the team** (done): iroh endpoint, signed roster, `init`/`invite`/`join`/`remove`/`leave`, presence
   sync, routing with acks and outbox, hold/refuse policies, rate limit, mDNS, custom relay.
