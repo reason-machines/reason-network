@@ -367,10 +367,8 @@ impl Daemon {
         let mut lines = BufReader::new(rd).lines();
         // Inbox long-polls end with their connection; anything else finishes (a half-done `leave` would not).
         let mut waits = tokio::task::JoinSet::new();
-        let mut others = tokio::task::JoinSet::new();
         while let Ok(Some(line)) = lines.next_line().await {
             while waits.try_join_next().is_some() {}
-            while others.try_join_next().is_some() {}
             let f = match serde_json::from_str::<Frame<Request>>(&line) {
                 Ok(f) => f,
                 Err(e) => {
@@ -391,12 +389,10 @@ impl Daemon {
             if wait {
                 waits.spawn(task);
             } else {
-                others.spawn(task);
+                tokio::spawn(task);
             }
         }
         waits.abort_all();
-        // A registration still under way would otherwise land after its connection is dropped, and stay live.
-        while others.join_next().await.is_some() {}
         self.drop_conn(conn);
         writer.abort();
     }
