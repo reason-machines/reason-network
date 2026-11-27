@@ -82,6 +82,15 @@ impl Daemon {
         let now = util::now_ms();
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
+        // Its connection hung up while it was under way (a `git` lookup can take a while): `drop_conn` has run and
+        // would never see it, so it would stay live. Connections get their ids in order, so one at or below
+        // `next_conn` that isn't in `conns` is gone.
+        if let Some(c) = conn
+            && c <= g.next_conn
+            && !g.conns.contains_key(&c)
+        {
+            bail!("the connection that registered this session has closed");
+        }
         let key = reg.key.clone();
         if reg.agent == "antigravity" && conn.is_some() && reg.tier == Tier::Push {
             let allowed =
@@ -1631,6 +1640,37 @@ mod tests {
             .unwrap();
         child.wait().unwrap();
         child.id()
+    }
+
+    #[test]
+    fn a_registration_on_a_connection_that_has_closed_is_refused() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        // Connection 1 was handed out and has hung up since.
+        d.inner.lock().unwrap().next_conn = 1;
+        assert!(d.register(Some(1), claude("a"), GitInfo::default()).is_err());
+        assert!(!d.inner.lock().unwrap().live.contains_key("claude-code:a"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_registration_that_lands_after_its_client_hung_up_does_not_stay_live() {
+        use tokio::io::AsyncWriteExt;
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let serving = tokio::spawn(d.clone().serve(server));
+        // An MCP server registers on its agent's first tool call, and the agent exits before the answer comes.
+        let reg = SessionReg { pid: Some(gone_pid()), ..claude("a") };
+        let line = serde_json::to_string(&Frame { id: 1, body: Request::Register { session: reg } }).unwrap();
+        let (rd, mut wr) = client.into_split();
+        wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        drop((rd, wr));
+        serving.await.unwrap();
+        // Give a registration still under way time to land, as it would on its own task.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut g = d.inner.lock().unwrap();
+        d.prune(&mut g);
+        assert!(!g.live.contains_key("claude-code:a"), "its process is gone, but the session stays live");
     }
 
     #[tokio::test]
