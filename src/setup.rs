@@ -1749,6 +1749,20 @@ mod tests {
         dir.join(name)
     }
 
+    #[test]
+    fn removing_from_a_toml_config_that_never_existed_writes_nothing() {
+        let mut r = Report::default();
+        let missing = std::env::temp_dir().join(format!("reason-setup-{}", ulid::Ulid::generate())).join("config.toml");
+        // What removing Reason Network leaves of a config that was never there.
+        assert!(!r.write_toml(&missing, "", false).unwrap());
+        assert!(!missing.exists());
+        assert_eq!(r.lines, [changed(&missing, false)]);
+        // A config that is there is still written, even when nothing is left in it.
+        let path = file("config.toml", "[mcp_servers.reason-network]\ncommand = \"rn\"\n");
+        assert!(r.write_toml(&path, "", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
     fn codex_config(exe: &Path, home: &str) -> String {
         format!(
             "[mcp_servers.reason-network]\ncommand = '{}'\nargs = [\"mcp\"]\nenv = {{ REASON_NETWORK_AGENT = \"codex\", REASON_NETWORK_HOME = \"{home}\" }}\ntool_timeout_sec = 660\n\n[mcp_servers.other]\ncommand = \"/bin/echo\"\n",
