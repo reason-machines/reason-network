@@ -127,7 +127,7 @@ impl Daemon {
             if conn.is_some() {
                 l.conn = conn;
                 l.attached = true;
-                l.mcp_push = reg.tier == Tier::Push;
+                l.mcp_push = reg.tier == Tier::Push && !l.push_failed;
             }
             // A hosted assistant the relay carries stays `pull`, whatever tier it is registered with again.
             if !l.relayed() {

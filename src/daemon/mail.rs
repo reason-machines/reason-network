@@ -32,6 +32,8 @@ const LOOP_LIMIT: usize = 12;
 const LOOP_WINDOW: Duration = Duration::from_secs(600);
 /// A push or hook not confirmed within this long is shown through the inbox and hooks again.
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(90);
+/// Direct Claude socket writes are retried at most twice; without an enqueue ack, mail falls back to check_inbox.
+const CLAUDE_ENQUEUE_ATTEMPTS: u8 = 3;
 /// How often a Codex session's rollout is checked while mail waits for a hook of its turn.
 const CODEX_TURN_POLL: Duration = Duration::from_secs(2);
 /// An offline Codex thread seen within this long gets its wake mail through `codex queue`, so the first message starts
@@ -568,6 +570,22 @@ impl Daemon {
         }
         // Mail reached it: it is a session teammates talk to, whose name stays its own.
         self.reached(g, key);
+        let fallback = g.live.get(key).is_some_and(|l| {
+            l.reg.agent == agent::CLAUDE_CODE
+                && msgs
+                    .iter()
+                    .any(|m| g.claude_push_attempts.get(&m.id).copied().unwrap_or_default() >= CLAUDE_ENQUEUE_ATTEMPTS)
+        });
+        if fallback {
+            if let Some(l) = g.live.get_mut(key) {
+                l.push_failed = true;
+                l.mcp_push = false;
+                l.reg.tier = Tier::Pull;
+            }
+            for m in &msgs {
+                g.claude_push_attempts.remove(&m.id);
+            }
+        }
         let l = &g.live[key];
         if !wake {
             return ("queued".into(), "queued as FYI: it reads it at its next natural pause".into());
@@ -632,10 +650,12 @@ impl Daemon {
                 };
                 let ev = Event::Deliver { key: key.to_string(), ids: ids.clone(), text };
                 let _ = tx.send(serde_json::to_string(&ev).expect("event serializes"));
+                self.retry_claude_after_timeout(key);
                 for id in ids {
+                    *g.claude_push_attempts.entry(id.clone()).or_default() += 1;
                     g.in_flight.insert(id, Instant::now());
                 }
-                ("pushed".into(), "accepted by the delivery adapter; waiting for its handoff acknowledgment".into())
+                ("pushed".into(), "injection attempted; awaiting Claude Code's enqueue acknowledgment".into())
             }
             Channel::Command(bin, args, codex_home) => {
                 // One command line carries only so much: a long batch goes in several commands, in order.
@@ -657,11 +677,14 @@ impl Daemon {
             }
             Channel::ClaudeDirect(sock) => {
                 for id in &ids {
+                    *g.claude_push_attempts.entry(id.clone()).or_default() += 1;
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
                 self.post_direct(key.to_string(), sock, ids, text);
-                let note = claude::held_note(claude_session.as_deref())
-                    .unwrap_or("delivered into the session: it reads it between tool calls, or wakes up if idle");
+                self.retry_claude_after_timeout(key);
+                let note = claude::held_note(claude_session.as_deref()).unwrap_or(
+                    "injection attempted; awaiting an enqueue acknowledgment, then it remains unread for check_inbox",
+                );
                 ("pushed".into(), note.into())
             }
             Channel::Hook => {
@@ -777,26 +800,37 @@ impl Daemon {
         self.arrived.notify_waiters();
     }
 
-    /// Posts into a Claude Code session's messaging socket; read once it took it.
+    /// Retries a Claude socket injection after the in-flight window unless the session acknowledged its ids.
+    fn retry_claude_after_timeout(self: &Arc<Self>, key: &str) {
+        let (this, key) = (self.clone(), key.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(IN_FLIGHT_TTL).await;
+            let mut g = this.inner.lock().unwrap();
+            let Some(name) = g.live.get(&key).map(|l| l.name.clone()) else { return };
+            let address = this.addr(&name);
+            let waiting: Vec<_> = g.pending(&address).unwrap_or_default().into_iter().filter(|m| m.wake).collect();
+            if !waiting.is_empty() {
+                this.deliver(&mut g, &key, waiting, true);
+            }
+        });
+    }
+
+    /// Posts into a Claude Code session's messaging socket; read only after its enqueue acknowledgment.
     fn post_direct(self: &Arc<Self>, key: String, sock: agent::ClaudeSocket, ids: Vec<String>, text: String) {
         let this = self.clone();
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await;
             let mut g = this.inner.lock().unwrap();
-            for id in &ids {
-                g.in_flight.remove(id);
-            }
             if !matches!(res, Ok(Ok(()))) {
+                for id in &ids {
+                    g.in_flight.remove(id);
+                }
                 this.arrived.notify_waiters();
             }
             match res {
-                Ok(Ok(())) => {
-                    let changed = g.store.mark_read(&ids, util::now_ms()).unwrap_or_default();
-                    let _ = g.store.handoff(&changed, util::now_ms());
-                    for id in &changed {
-                        this.usage.stage(id, "delivered");
-                    }
-                }
+                // A successful write is only an injection attempt. Leave the message unread and in flight until the
+                // Claude-side MCP client acknowledges it, or until the bounded retry path falls back to check_inbox.
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
                 Err(e) => log(&format!("delivering to Claude session {}: {e}", this.logged(&g, &key))),
             }
@@ -2323,7 +2357,7 @@ mod tests {
         assert!(text.contains("waiting message") && !text.contains("for a natural pause"));
         d.handle(9, rename()).await.unwrap();
         assert!(rx.try_recv().is_err());
-        d.handle(7, Request::Delivered { key: key.into(), ids }).await.unwrap();
+        d.handle(7, Request::Enqueued { key: key.into(), ids }).await.unwrap();
         let inbox = d.inbox(key.into(), 0, false).await.unwrap();
         assert_eq!(inbox.messages.into_iter().map(|m| m.id).collect::<Vec<_>>(), fyi.ids);
     }
@@ -2371,6 +2405,87 @@ mod tests {
         assert_eq!(unread, ["one", "two"]);
         let r = send("three").await.unwrap();
         assert_eq!((r.recipients[0].state.as_str(), rx.try_recv().is_err()), ("queued", true));
+    }
+
+    #[tokio::test]
+    async fn claude_socket_write_stays_pending_until_enqueue_ack_and_ack_is_idempotent() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex("claude-code:ack") };
+        let to = d.register(Some(7), reg, crate::git::GitInfo::default()).unwrap().address;
+        let sent = d.send("codex:sender".into(), &to, "please review", None, true, false, None, vec![]).await.unwrap();
+        let ids = sent.ids.clone();
+        let _: Event = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            d.inner.lock().unwrap().store.unread(&to).unwrap().iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            ids
+        );
+
+        // The older client acknowledgement means only that it wrote to the socket, not that Claude enqueued it.
+        d.handle(7, Request::Delivered { key: "claude-code:ack".into(), ids: ids.clone() }).await.unwrap();
+        assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
+        assert!(d.inner.lock().unwrap().in_flight.contains_key(&ids[0]));
+
+        let ack = Request::Enqueued { key: "claude-code:ack".into(), ids: ids.clone() };
+        d.handle(7, ack.clone()).await.unwrap();
+        d.handle(7, ack).await.unwrap();
+        assert!(d.inner.lock().unwrap().store.unread(&to).unwrap().is_empty());
+        assert!(!d.inner.lock().unwrap().in_flight.contains_key(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn reconnect_retries_the_same_claude_message_id() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex("claude-code:reconnect") };
+        let to = d.register(Some(7), reg.clone(), crate::git::GitInfo::default()).unwrap().address;
+        d.send("codex:sender".into(), &to, "backlog", None, true, false, None, vec![]).await.unwrap();
+        let Event::Deliver { ids: first, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        d.drop_conn(7);
+        {
+            let mut g = d.inner.lock().unwrap();
+            g.in_flight.insert(first[0].clone(), Instant::now() - IN_FLIGHT_TTL);
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(8, tx);
+        d.register(Some(8), reg, crate::git::GitInfo::default()).unwrap();
+        let Event::Deliver { ids: second, .. } = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn claude_push_without_enqueue_ack_falls_back_to_unread_inbox_after_bounded_attempts() {
+        let d = Arc::new(super::super::test_daemon(crate::config::Config::default()));
+        d.register(Some(1), codex("codex:sender"), crate::git::GitInfo::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.inner.lock().unwrap().conns.insert(7, tx);
+        let reg = SessionReg { agent: agent::CLAUDE_CODE.into(), tier: Tier::Push, ..codex("claude-code:old") };
+        let to = d.register(Some(7), reg, crate::git::GitInfo::default()).unwrap().address;
+        let sent = d.send("codex:sender".into(), &to, "legacy client", None, true, false, None, vec![]).await.unwrap();
+        let id = sent.ids[0].clone();
+        let _: Event = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        for _ in 1..CLAUDE_ENQUEUE_ATTEMPTS {
+            let mut g = d.inner.lock().unwrap();
+            g.in_flight.insert(id.clone(), Instant::now() - IN_FLIGHT_TTL);
+            let retry = g.pending(&to).unwrap();
+            d.deliver(&mut g, "claude-code:old", retry, true);
+            drop(g);
+            let _: Event = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        }
+        {
+            let mut g = d.inner.lock().unwrap();
+            g.in_flight.insert(id.clone(), Instant::now() - IN_FLIGHT_TTL);
+            let retry = g.pending(&to).unwrap();
+            assert_eq!(d.deliver(&mut g, "claude-code:old", retry, true).0, "queued");
+            assert!(rx.try_recv().is_err(), "bounded fallback must stop pushing");
+            assert_eq!(g.live["claude-code:old"].reg.tier, Tier::Pull);
+            assert!(g.store.unread(&to).unwrap().iter().any(|m| m.id == id));
+        }
+        assert_eq!(d.inbox("claude-code:old".into(), 0, false).await.unwrap().messages[0].id, id);
     }
 
     #[tokio::test]

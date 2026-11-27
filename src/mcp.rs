@@ -36,7 +36,9 @@ const SKILL: &str = include_str!("skill.md");
 fn instructions() -> String {
     // Windows checkouts may have turned the file's line ends into \r\n.
     let rules = SKILL.split_once("## How to behave").map_or(String::new(), |(_, r)| r.trim().replace('\r', ""));
-    format!("Reason Network connects you with your teammates' coding agents.\n\n{rules}")
+    format!(
+        "Reason Network connects you with your teammates' coding agents.\n\n{rules}\n\nWhen a pushed `<reason-message>` appears, acknowledge its `id` with `acknowledge_delivery` after you see it in this conversation. Retried messages keep the same id."
+    )
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -250,6 +252,24 @@ impl ReasonNetworkMcp {
         Ok(self.finish(&key, res, true).await)
     }
 
+    #[tool(
+        description = "Acknowledge pushed messages after they appear in this Claude Code conversation. Pass the id attribute from each <reason-message>; repeated acknowledgements are safe."
+    )]
+    async fn acknowledge_delivery(
+        &self,
+        Parameters(a): Parameters<DeliveryArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = match self.session_for(&ctx, a.session_id.as_deref()).await {
+            Ok(k) => k,
+            Err(e) => return Ok(failure(e)),
+        };
+        let count = a.ids.len();
+        let req = Request::Enqueued { key: key.clone(), ids: a.ids };
+        let res = self.link.call::<Value>(req).await.map(|_| format!("Acknowledged {count} message(s)."));
+        Ok(self.finish(&key, res, false).await)
+    }
+
     #[tool(description = "Ask your own user, with a pop-up on their screen, and wait for their answer: approve or \
                           deny, maybe with a note. For when a teammate's agent asks you for something only your user \
                           can OK and they may not be watching. The answer is theirs, given in the pop-up.")]
@@ -325,12 +345,11 @@ impl ServerHandler for ReasonNetworkMcp {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        ctx: RequestContext<RoleServer>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools = self.tool_router.list_all();
-        if self.pushed(self.agent(&ctx.peer, None)) {
-            tools.retain(|t| t.name != "check_inbox");
-        }
+        let tools = self.tool_router.list_all();
+        // Keep the pull path available: older clients lack the enqueue-acknowledgement tool, and after bounded
+        // retries the daemon leaves their mail pending for check_inbox rather than pushing forever.
         Ok(ListToolsResult::with_all_items(tools))
     }
 }
@@ -493,9 +512,9 @@ impl ReasonNetworkMcp {
             return;
         };
         match tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await {
-            Ok(Ok(())) => {
-                let _ = self.link.call::<Value>(Request::Delivered { key, ids }).await;
-            }
+            // Writing the socket is only an injection attempt. Claude acknowledges by id after the message appears
+            // in its conversation; until then the daemon keeps it in flight and retries it with the same id.
+            Ok(Ok(())) => {}
             Ok(Err(e)) => eprintln!("reason-network: delivering to Claude Code: {e}"),
             Err(e) => eprintln!("reason-network: delivering to Claude Code: {e}"),
         }
