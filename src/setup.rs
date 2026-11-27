@@ -266,6 +266,15 @@ impl Report {
         self.write(path, &(serde_json::to_string_pretty(v)? + "\n"), dry)
     }
 
+    fn write_toml(&mut self, path: &Path, content: &str, dry: bool) -> Result<bool> {
+        // As in `write_json`: removing Reason Network from a config that never existed leaves nothing to write.
+        if !path.exists() && content.trim().is_empty() {
+            self.lines.push(changed(path, false));
+            return Ok(false);
+        }
+        self.write(path, content, dry)
+    }
+
     /// A change that is no file's.
     fn did(&mut self, line: String) {
         self.lines.push(line);
@@ -449,7 +458,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         t["default_tools_approval_mode"] = toml_edit::value("approve");
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
-    r.write(&cfg_path, &doc.to_string(), dry)?;
+    r.write_toml(&cfg_path, &doc.to_string(), dry)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut v = read_json(&hooks_path)?;
@@ -517,7 +526,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
     grok_allow(&mut doc, remove);
-    r.write(&cfg_path, &doc.to_string(), dry)?;
+    r.write_toml(&cfg_path, &doc.to_string(), dry)?;
 
     let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
     let mut v = read_json(&hooks_path)?;
@@ -600,7 +609,10 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
 
     let hooks_path = dir.join("hooks.json");
     let mut v = read_json(&hooks_path)?;
-    obj(&mut v)?.entry("version").or_insert(json!(1));
+    // Only when wiring: on its own it would make a hooks.json that never existed look worth writing on remove.
+    if !remove {
+        obj(&mut v)?.entry("version").or_insert(json!(1));
+    }
     let hooks = obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?;
     let entry = |event: &str| json!({ "command": shell_cmd(exe, &format!("hook cursor {event}")), "timeout": 10 });
     let mut ours = vec![
@@ -1735,6 +1747,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), text).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn removing_from_a_toml_config_that_never_existed_writes_nothing() {
+        let mut r = Report::default();
+        let missing = std::env::temp_dir().join(format!("reason-setup-{}", ulid::Ulid::generate())).join("config.toml");
+        // What removing Reason Network leaves of a config that was never there.
+        assert!(!r.write_toml(&missing, "", false).unwrap());
+        assert!(!missing.exists());
+        assert_eq!(r.lines, [changed(&missing, false)]);
+        // A config that is there is still written, even when nothing is left in it.
+        let path = file("config.toml", "[mcp_servers.reason-network]\ncommand = \"rn\"\n");
+        assert!(r.write_toml(&path, "", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     fn codex_config(exe: &Path, home: &str) -> String {
