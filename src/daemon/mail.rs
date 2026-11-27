@@ -802,9 +802,10 @@ impl Daemon {
 
     /// Retries a Claude socket injection after the in-flight window unless the session acknowledged its ids.
     fn retry_claude_after_timeout(self: &Arc<Self>, key: &str) {
-        let (this, key) = (self.clone(), key.to_string());
+        let (this, key) = (Arc::downgrade(self), key.to_string());
         tokio::spawn(async move {
             tokio::time::sleep(IN_FLIGHT_TTL).await;
+            let Some(this) = this.upgrade() else { return };
             let mut g = this.inner.lock().unwrap();
             let Some(name) = g.live.get(&key).map(|l| l.name.clone()) else { return };
             let address = this.addr(&name);
@@ -817,9 +818,10 @@ impl Daemon {
 
     /// Posts into a Claude Code session's messaging socket; read only after its enqueue acknowledgment.
     fn post_direct(self: &Arc<Self>, key: String, sock: agent::ClaudeSocket, ids: Vec<String>, text: String) {
-        let this = self.clone();
+        let this = Arc::downgrade(self);
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || agent::post_to_claude(&sock, &text)).await;
+            let Some(this) = this.upgrade() else { return };
             let mut g = this.inner.lock().unwrap();
             if !matches!(res, Ok(Ok(()))) {
                 for id in &ids {
@@ -1508,6 +1510,7 @@ mod tests {
             assert!(rx.try_recv().is_err());
             assert_eq!(d.inner.lock().unwrap().store.unread(&to).unwrap().len(), 1);
             drop(db);
+            assert_eq!(Arc::strong_count(&d), 1);
             drop(d);
             std::fs::remove_dir_all(home).unwrap();
         }
